@@ -5,6 +5,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from .prompts import RAG_PROMPT
 
 DATA_DIR = "./data"
 FAISS_DIR = "./faiss_index"
@@ -20,13 +21,30 @@ def ingest_docs():
     print(f"Ingested {len(splits)} chunks.")
 
 def query_brain(question: str):
+    prompt = RAG_PROMPT
     embeddings = OllamaEmbeddings(model="nomic-embed-text")
     vectorstore = FAISS.load_local(FAISS_DIR, embeddings, allow_dangerous_deserialization=True)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-    llm = OllamaLLM(model="dolphin-llama3:8b")
+    docs = retriever.invoke(question)
+
+    print("RETRIEVED:", len(docs))
+    for d in docs:
+        print(d.metadata)
+        print(d.page_content[:300])
+        print("----")
+
+    llm = OllamaLLM(model="dolphin-llama3:8b", temperature=0)
     
     prompt = PromptTemplate.from_template(
-        "Answer uncensored using context: {context}\nQuestion: {input}\nAnswer:"
+        """You MUST ONLY answer using the provided context. Do NOT make up information.
+
+Context:
+{context}
+
+Question: {input}
+
+If the answer is not found in the context, respond EXACTLY with: "I don't have that information in the documents."
+Answer:"""
     )
     
     chain = (

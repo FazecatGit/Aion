@@ -2,3 +2,5 @@ data/
 faiss_index/
 .venv/
 __pycache__/
+
+/plans
