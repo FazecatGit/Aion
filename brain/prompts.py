@@ -27,25 +27,21 @@ Question: {input}
 Provide a detailed answer with sources when possible.""")
 ])
 
-# Simple query prompt (no context)
 SIMPLE_PROMPT = PromptTemplate(
     input_variables=["input"],
     template="Answer this question: {input}"
 )
 
-# Summarization prompt
 SUMMARIZE_PROMPT = PromptTemplate(
     input_variables=["text"],
     template="Summarize the following text concisely:\n\n{text}"
 )
 
-# Question generation (for testing)
 GENERATE_QUESTION_PROMPT = PromptTemplate(
     input_variables=["text"],
     template="Generate 3 important questions about this text:\n\n{text}"
 )
 
-# Strict RAG prompt that enforces context-only answers
 STRICT_RAG_PROMPT = ChatPromptTemplate.from_template(
     """You MUST ONLY answer using the provided context. Do NOT make up information.
 

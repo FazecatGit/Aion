@@ -1,4 +1,3 @@
-"""Configuration settings for RAG brain system."""
 import os
 from pathlib import Path
 
