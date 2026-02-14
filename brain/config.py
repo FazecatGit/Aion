@@ -5,6 +5,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = os.getenv("RAG_DATA_DIR", str(BASE_DIR / "data"))
 FAISS_DIR = os.getenv("RAG_FAISS_DIR", str(BASE_DIR / "faiss_index"))
+INDEX_META_PATH = os.getenv("RAG_INDEX_META_PATH", str(Path(FAISS_DIR) / "index_meta.json"))
 
 # Embedding model settings
 EMBEDDING_MODEL = os.getenv("RAG_EMBEDDING_MODEL", "nomic-embed-text")
