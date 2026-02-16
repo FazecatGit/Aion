@@ -237,6 +237,27 @@ def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None =
     
     return fused_docs[:k]
 
+def _is_likely_hallucination(context: str, question: str, answer: str) -> bool:
+    """Check if answer appears to be hallucinated (not grounded in context)"""
+    # If context is empty, definitely hallucinated
+    if not context.strip():
+        return True
+    
+    # Check if answer contains explicit "I don't have" - that's honest
+    if "don't have" in answer.lower() or "not found" in answer.lower():
+        return False
+    
+    # Very basic check: if NO word from question appears in context, likely hallucinated
+    question_words = set(w.lower() for w in question.split() if len(w) > 3)
+    context_lower = context.lower()
+    
+    matching_words = sum(1 for word in question_words if word in context_lower)
+    coverage = matching_words / len(question_words) if question_words else 0
+    
+    # If less than 20% of question keywords in context, likely hallucinated
+    return coverage < 0.2
+
+
 def query_brain(question: str, verbose: bool = False, fusion_mode: str = None, alpha: float = None, k_param: int = None):
     fusion_mode = fusion_mode or FUSION_MODE
     alpha = alpha if alpha is not None else FUSION_ALPHA
@@ -255,8 +276,17 @@ def query_brain(question: str, verbose: bool = False, fusion_mode: str = None, a
     
     context = "\n\n".join([doc.page_content for doc in docs])
     
+    if verbose:
+        print("\nCONTEXT PASSED TO LLM:")
+        print(context[:500])
+        print("\n---\n")
+    
     result = STRICT_RAG_PROMPT.invoke({"context": context, "input": question})
     llm_output = llm.invoke(result.to_string())
+    
+    # Detect hallucinations
+    if _is_likely_hallucination(context, question, llm_output):
+        return "I don't have that information in the documents."
     
     return llm_output
 
@@ -266,12 +296,17 @@ if __name__ == "__main__":
     if choice == "1":
         ingest_docs()
     else:
-        print("Query mode. Type 'quit' to exit.\n")
+        print("Query mode. Type 'quit' to exit.\nType 'verbose' to toggle debug info.\n")
+        verbose = False
         while True:
             q = input("Ask: ").strip()
             if q.lower() == "quit":
                 print("Goodbye!")
                 break
+            if q.lower() == "verbose":
+                verbose = not verbose
+                print(f"Verbose mode: {verbose}")
+                continue
             if q:
-                result = query_brain(q)
+                result = query_brain(q, verbose=verbose)
                 print(f"\nAnswer: {result}\n")

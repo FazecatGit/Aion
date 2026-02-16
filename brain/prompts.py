@@ -45,11 +45,13 @@ GENERATE_QUESTION_PROMPT = PromptTemplate(
 STRICT_RAG_PROMPT = ChatPromptTemplate.from_template(
     """You MUST ONLY answer using the provided context. Do NOT make up information.
 
+If the context does NOT contain relevant information to answer the question, you MUST respond EXACTLY with:
+"I don't have that information in the documents."
+
 Context:
 {context}
 
 Question: {input}
 
-If the answer is not found in the context, respond EXACTLY with: "I don't have that information in the documents."
 Answer:"""
 )

@@ -11,7 +11,7 @@ INDEX_META_PATH = os.getenv("RAG_INDEX_META_PATH", str(Path(FAISS_DIR) / "index_
 EMBEDDING_MODEL = os.getenv("RAG_EMBEDDING_MODEL", "nomic-embed-text")
 
 # LLM settings
-LLM_MODEL = os.getenv("RAG_LLM_MODEL", "dolphin-llama3:8b")
+LLM_MODEL = os.getenv("RAG_LLM_MODEL", "mistral")
 LLM_TEMPERATURE = float(os.getenv("RAG_LLM_TEMPERATURE", "0"))
 
 # Retrieval settings
