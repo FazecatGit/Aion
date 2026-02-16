@@ -1,6 +1,8 @@
 import json
 from datetime import datetime
 from pathlib import Path
+from functools import reduce
+from operator import itemgetter
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
@@ -17,6 +19,15 @@ from .config import (
 from .keyword_search import search_documents
 from .pdf_utils import load_pdfs
 
+def compose(*fns):
+    """Compose functions left-to-right: compose(f, g)(x) = g(f(x))"""
+    return reduce(lambda f, g: lambda x: g(f(x)), fns, lambda x: x)
+
+
+def pipe(value, *fns):
+    """Pipe value through sequence of functions"""
+    return reduce(lambda x, f: f(x), fns, value)
+
 def _write_index_metadata(doc_count: int) -> None:
     metadata = {
         "embedding_model": EMBEDDING_MODEL,
@@ -24,7 +35,7 @@ def _write_index_metadata(doc_count: int) -> None:
         "chunk_overlap": CHUNK_OVERLAP,
         "data_dir": DATA_DIR,
         "doc_count": doc_count,
-        "created_at": datetime.isoformat() + "Z",
+        "created_at": datetime.now().isoformat() + "Z",
     }
     with open(INDEX_META_PATH, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, sort_keys=True)
@@ -63,44 +74,26 @@ def _doc_key(doc: Document) -> tuple:
     return (source, page, doc.page_content[:200])
 
 
-def _filter_docs(docs: list[Document], filters: dict | None) -> list[Document]:
+def _match_filters(filters: dict | None) -> callable:
     if not filters:
-        return docs
-    sources = set(filters.get("source", [])) if filters.get("source") else None
-    pages = set(filters.get("page", [])) if filters.get("page") else None
-    filtered = []
-    for doc in docs:
+        return lambda doc: True
+    
+    allowed_sources = set(filters.get("source", [])) if filters.get("source") else None
+    allowed_pages = set(filters.get("page", [])) if filters.get("page") else None
+    
+    def predicate(doc: Document) -> bool:
         meta = doc.metadata or {}
-        if sources is not None and meta.get("source") not in sources:
-            continue
-        if pages is not None and meta.get("page") not in pages:
-            continue
-        filtered.append(doc)
-    return filtered
+        if allowed_sources is not None and meta.get("source") not in allowed_sources:
+            return False
+        if allowed_pages is not None and meta.get("page") not in allowed_pages:
+            return False
+        return True
+    
+    return predicate
 
 
-def _rrf_fusion(semantic_docs: list[Document], keyword_docs: list[Document], k_param: int = 60) -> list[Document]:
-    rrf_scores = {} 
-    doc_map = {} 
-    
-    for rank, doc in enumerate(semantic_docs, start=1):
-        key = _doc_key(doc)
-        score = 1.0 / (k_param + rank)
-        rrf_scores[key] = rrf_scores.get(key, 0) + score
-        if key not in doc_map:
-            doc_map[key] = doc
-    
-    for rank, doc in enumerate(keyword_docs, start=1):
-        key = _doc_key(doc)
-        score = 1.0 / (k_param + rank)
-        rrf_scores[key] = rrf_scores.get(key, 0) + score
-        if key not in doc_map:
-            doc_map[key] = doc
-    
-    sorted_keys = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-    fused_docs = [doc_map[key] for key, score in sorted_keys]
-    
-    return fused_docs
+def _filter_docs(docs: list[Document], filters: dict | None) -> list[Document]:
+    return list(filter(_match_filters(filters), docs))
 
 
 def _normalize_scores(scores: list[float]) -> list[float]:
@@ -110,89 +103,139 @@ def _normalize_scores(scores: list[float]) -> list[float]:
     max_score = max(scores)
     if max_score == min_score:
         return [1.0] * len(scores)
-    return [(s - min_score) / (max_score - min_score) for s in scores]
+    range_val = max_score - min_score
+    return [(s - min_score) / range_val for s in scores]
+
+
+def _assign_rank_scores(docs: list[Document], k_param: int = 60) -> dict:
+    return {
+        _doc_key(doc): 1.0 / (k_param + rank)
+        for rank, doc in enumerate(docs, start=1)
+    }
+
+
+def _merge_score_dicts(*score_dicts) -> dict:
+    result = {}
+    for scores in score_dicts:
+        for key, score in scores.items():
+            result[key] = result.get(key, 0) + score
+    return result
+
+
+def _rrf_fusion(semantic_docs: list[Document], keyword_docs: list[Document], k_param: int = 60) -> list[Document]:
+    semantic_scores = _assign_rank_scores(semantic_docs, k_param)
+    keyword_scores = _assign_rank_scores(keyword_docs, k_param)
+    rrf_scores = _merge_score_dicts(semantic_scores, keyword_scores)
+    
+    doc_map = {_doc_key(doc): doc for doc in semantic_docs + keyword_docs}
+    sorted_keys = sorted(rrf_scores.items(), key=itemgetter(1), reverse=True)
+    
+    return [doc_map[key] for key, _ in sorted_keys]
 
 
 def _weighted_fusion(semantic_docs: list[Document], keyword_docs: list[Document], alpha: float = 0.5) -> list[Document]:
-    semantic_scores = list(range(len(semantic_docs), 0, -1)) 
-    keyword_scores = list(range(len(keyword_docs), 0, -1))
+    semantic_scores = _normalize_scores(list(range(len(semantic_docs), 0, -1)))
+    keyword_scores = _normalize_scores(list(range(len(keyword_docs), 0, -1)))
     
-    norm_semantic = _normalize_scores(semantic_scores)
-    norm_keyword = _normalize_scores(keyword_scores)
+    semantic_map = {
+        _doc_key(doc): (doc, semantic_scores[i])
+        for i, doc in enumerate(semantic_docs)
+    }
+    keyword_map = {
+        _doc_key(doc): (doc, keyword_scores[i])
+        for i, doc in enumerate(keyword_docs)
+    }
     
-    doc_map = {}
+    all_keys = set(semantic_map.keys()) | set(keyword_map.keys())
+    blended = {
+        key: (
+            semantic_map[key][0] if key in semantic_map else keyword_map[key][0],
+            alpha * semantic_map.get(key, (None, 0.0))[1] + (1 - alpha) * keyword_map.get(key, (None, 0.0))[1]
+        )
+        for key in all_keys
+    }
     
-    for i, doc in enumerate(semantic_docs):
+    sorted_items = sorted(blended.items(), key=lambda x: x[1][1], reverse=True)
+    return [doc for _, (doc, _) in sorted_items]
+
+
+def _build_keyword_docs(keyword_results: list[dict]) -> list[Document]:
+    return [
+        Document(page_content=doc['content'], metadata=doc['metadata'])
+        for doc in keyword_results
+    ]
+
+
+def _select_fusion(fusion_mode: str):
+    return {
+        "rrf": _rrf_fusion,
+        "weighted": _weighted_fusion,
+    }.get(fusion_mode)
+
+
+def _fuse_results(semantic_docs: list[Document], keyword_docs: list[Document], mode: str, **kwargs) -> list[Document]:
+    fusion_fn = _select_fusion(mode)
+    if fusion_fn:
+
+        if mode == "rrf":
+            return fusion_fn(semantic_docs, keyword_docs, k_param=kwargs.get("k_param", 60))
+        else:
+            return fusion_fn(semantic_docs, keyword_docs, alpha=kwargs.get("alpha", 0.5))
+    
+    seen = set()
+    result = []
+    for doc in semantic_docs + keyword_docs:
         key = _doc_key(doc)
-        if key not in doc_map:
-            doc_map[key] = (doc, 0.0)
-        _, prev_score = doc_map[key]
-        blended = alpha * norm_semantic[i] + (1 - alpha) * 0.0 
-        doc_map[key] = (doc, blended)
-    
-    for i, doc in enumerate(keyword_docs):
-        key = _doc_key(doc)
-        if key not in doc_map:
-            doc_map[key] = (doc, 0.0)
-        current_doc, prev_semantic_score = doc_map[key]
-        blended = prev_semantic_score + (1 - alpha) * norm_keyword[i]
-        doc_map[key] = (current_doc, blended)
-    
-    sorted_items = sorted(doc_map.items(), key=lambda x: x[1][1], reverse=True)
-    fused_docs = [doc for key, (doc, score) in sorted_items]
-    
-    return fused_docs
+        if key not in seen:
+            result.append(doc)
+            seen.add(key)
+    return result
 
 
 def ingest_docs():
     loader = DirectoryLoader(DATA_DIR, glob="**/*.pdf", loader_cls=PyPDFLoader)
-    docs = loader.load()
     splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    splits = splitter.split_documents(docs)
     embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+    
+    splits = pipe(
+        loader.load(),
+        lambda docs: splitter.split_documents(docs)
+    )
+    
     vectorstore = FAISS.from_documents(splits, embeddings)
     vectorstore.save_local(FAISS_DIR)
     _write_index_metadata(len(splits))
     print(f"Ingested {len(splits)} chunks.")
 
-def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None = None, fusion_mode: str = "rrf", alpha: float = 0.5, k_param: int = 60):
 
+def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None = None, 
+                     fusion_mode: str = "rrf", alpha: float = 0.5, k_param: int = 60) -> list[Document]:
+    
     _validate_index_metadata()
     embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
     vectorstore = FAISS.load_local(FAISS_DIR, embeddings, allow_dangerous_deserialization=True)
-    semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": max(k * 3, k)})
-    semantic_docs = semantic_retriever.invoke(question)
-    semantic_docs = _filter_docs(semantic_docs, filters)
     
-
-    pdf_docs = load_pdfs(DATA_DIR)
-    keyword_docs = search_documents(question, pdf_docs, n_results=max(k * 3, k))
+    # Pipeline: retrieve → filter → fuse → truncate
+    semantic_docs = pipe(
+        vectorstore.as_retriever(search_kwargs={"k": max(k * 3, k)}).invoke(question),
+        lambda docs: _filter_docs(docs, filters)
+    )
     
-    keyword_docs_obj = [
-        Document(page_content=doc['content'], metadata=doc['metadata'])
-        for doc in keyword_docs
-    ]
+    keyword_docs = pipe(
+        load_pdfs(DATA_DIR),
+        lambda docs: search_documents(question, docs, n_results=max(k * 3, k)),
+        _build_keyword_docs
+    )
     
-
-    if fusion_mode == "rrf":
-        combined = _rrf_fusion(semantic_docs, keyword_docs_obj, k_param=k_param)
-    elif fusion_mode == "weighted":
-        combined = _weighted_fusion(semantic_docs, keyword_docs_obj, alpha=alpha)
-    else:
-        seen = set()
-        combined = []
-        for doc in semantic_docs:
-            key = _doc_key(doc)
-            if key not in seen:
-                combined.append(doc)
-                seen.add(key)
-        for doc in keyword_docs_obj:
-            key = _doc_key(doc)
-            if key not in seen:
-                combined.append(doc)
-                seen.add(key)
+    fused_docs = _fuse_results(
+        semantic_docs, 
+        keyword_docs, 
+        fusion_mode,
+        alpha=alpha,
+        k_param=k_param
+    )
     
-    return combined[:k]
+    return fused_docs[:k]
 
 def query_brain(question: str, verbose: bool = False, fusion_mode: str = None, alpha: float = None, k_param: int = None):
     fusion_mode = fusion_mode or FUSION_MODE
