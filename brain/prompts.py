@@ -55,3 +55,33 @@ Question: {input}
 
 Answer:"""
 )
+
+
+QUERY_SPELL_CORRECTION_PROMPT = """Correct spelling mistakes in this user question for document retrieval.
+Return only the corrected question text, no explanations.
+
+Question: {query}"""
+
+
+QUERY_REWRITE_PROMPT = """Rewrite this question to improve retrieval quality against internal PDFs.
+Preserve intent and keep it concise. Return only the rewritten question.
+
+Question: {query}"""
+
+
+QUERY_EXPANSION_PROMPT = """Expand this question with a few short related terms and synonyms for retrieval.
+Keep it focused and under 20 extra words. Return only expanded query text.
+
+Question: {query}"""
+
+
+def build_spell_correction_prompt(query: str) -> str:
+    return QUERY_SPELL_CORRECTION_PROMPT.format(query=query)
+
+
+def build_query_rewrite_prompt(query: str) -> str:
+    return QUERY_REWRITE_PROMPT.format(query=query)
+
+
+def build_query_expansion_prompt(query: str) -> str:
+    return QUERY_EXPANSION_PROMPT.format(query=query)

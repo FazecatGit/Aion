@@ -7,17 +7,17 @@ from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
 from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
-from .prompts import RAG_PROMPT, STRICT_RAG_PROMPT
+from .prompts import STRICT_RAG_PROMPT
 from .config import (
     DATA_DIR, FAISS_DIR, INDEX_META_PATH, EMBEDDING_MODEL, LLM_MODEL, LLM_TEMPERATURE,
-    RETRIEVAL_K, CHUNK_SIZE, CHUNK_OVERLAP, FUSION_MODE, FUSION_ALPHA, FUSION_K_PARAM
+    RETRIEVAL_K, CHUNK_SIZE, CHUNK_OVERLAP, FUSION_MODE, FUSION_ALPHA, FUSION_K_PARAM,
+    ENABLE_QUERY_SPELL_CORRECTION, ENABLE_QUERY_REWRITE, ENABLE_QUERY_EXPANSION,
+    RETRIEVAL_CANDIDATE_MULTIPLIER, RERANK_METHOD, CROSS_ENCODER_MODEL
 )
 from .keyword_search import search_documents
 from .pdf_utils import load_pdfs
+from .query_pipeline import enhance_query_for_retrieval, rerank_documents
 
 def compose(*fns):
     """Compose functions left-to-right: compose(f, g)(x) = g(f(x))"""
@@ -27,6 +27,7 @@ def compose(*fns):
 def pipe(value, *fns):
     """Pipe value through sequence of functions"""
     return reduce(lambda x, f: f(x), fns, value)
+
 
 def _write_index_metadata(doc_count: int) -> None:
     metadata = {
@@ -208,22 +209,34 @@ def ingest_docs():
     print(f"Ingested {len(splits)} chunks.")
 
 
-def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None = None, 
-                     fusion_mode: str = "rrf", alpha: float = 0.5, k_param: int = 60) -> list[Document]:
+def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None = None,
+                     fusion_mode: str = "rrf", alpha: float = 0.5, k_param: int = 60,
+                     rerank_method: str = RERANK_METHOD, verbose: bool = False) -> list[Document]:
     
     _validate_index_metadata()
     embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
     vectorstore = FAISS.load_local(FAISS_DIR, embeddings, allow_dangerous_deserialization=True)
     
-    # Pipeline: retrieve → filter → fuse → truncate
+    effective_question = enhance_query_for_retrieval(
+        query=question,
+        llm_model=LLM_MODEL,
+        enable_spell_correction=ENABLE_QUERY_SPELL_CORRECTION,
+        enable_rewrite=ENABLE_QUERY_REWRITE,
+        enable_expansion=ENABLE_QUERY_EXPANSION,
+        verbose=verbose,
+    )
+    candidate_multiplier = max(1, RETRIEVAL_CANDIDATE_MULTIPLIER)
+    candidate_k = max(k * candidate_multiplier, k)
+
+    # Pipeline: enhance query -> retrieve -> filter -> fuse -> rerank -> truncate
     semantic_docs = pipe(
-        vectorstore.as_retriever(search_kwargs={"k": max(k * 3, k)}).invoke(question),
+        vectorstore.as_retriever(search_kwargs={"k": candidate_k}).invoke(effective_question),
         lambda docs: _filter_docs(docs, filters)
     )
     
     keyword_docs = pipe(
         load_pdfs(DATA_DIR),
-        lambda docs: search_documents(question, docs, n_results=max(k * 3, k)),
+        lambda docs: search_documents(effective_question, docs, n_results=candidate_k),
         _build_keyword_docs
     )
     
@@ -234,36 +247,30 @@ def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None =
         alpha=alpha,
         k_param=k_param
     )
-    
-    return fused_docs[:k]
 
-def _is_likely_hallucination(context: str, question: str, answer: str) -> bool:
-    """Check if answer appears to be hallucinated (not grounded in context)"""
-    # If context is empty, definitely hallucinated
-    if not context.strip():
-        return True
+    reranked_docs = rerank_documents(
+        docs=fused_docs,
+        query=effective_question,
+        method=rerank_method,
+        cross_encoder_model=CROSS_ENCODER_MODEL,
+        verbose=verbose,
+    )
     
-    # Check if answer contains explicit "I don't have" - that's honest
-    if "don't have" in answer.lower() or "not found" in answer.lower():
-        return False
-    
-    # Very basic check: if NO word from question appears in context, likely hallucinated
-    question_words = set(w.lower() for w in question.split() if len(w) > 3)
-    context_lower = context.lower()
-    
-    matching_words = sum(1 for word in question_words if word in context_lower)
-    coverage = matching_words / len(question_words) if question_words else 0
-    
-    # If less than 20% of question keywords in context, likely hallucinated
-    return coverage < 0.2
-
+    return reranked_docs[:k]
 
 def query_brain(question: str, verbose: bool = False, fusion_mode: str = None, alpha: float = None, k_param: int = None):
     fusion_mode = fusion_mode or FUSION_MODE
     alpha = alpha if alpha is not None else FUSION_ALPHA
     k_param = k_param if k_param is not None else FUSION_K_PARAM
     
-    docs = hybrid_retrieval(question, fusion_mode=fusion_mode, alpha=alpha, k_param=k_param)
+    docs = hybrid_retrieval(
+        question,
+        fusion_mode=fusion_mode,
+        alpha=alpha,
+        k_param=k_param,
+        rerank_method=RERANK_METHOD,
+        verbose=verbose,
+    )
 
     if verbose:
         print("RETRIEVED:", len(docs))
@@ -276,17 +283,8 @@ def query_brain(question: str, verbose: bool = False, fusion_mode: str = None, a
     
     context = "\n\n".join([doc.page_content for doc in docs])
     
-    if verbose:
-        print("\nCONTEXT PASSED TO LLM:")
-        print(context[:500])
-        print("\n---\n")
-    
     result = STRICT_RAG_PROMPT.invoke({"context": context, "input": question})
     llm_output = llm.invoke(result.to_string())
-    
-    # Detect hallucinations
-    if _is_likely_hallucination(context, question, llm_output):
-        return "I don't have that information in the documents."
     
     return llm_output
 
@@ -303,10 +301,6 @@ if __name__ == "__main__":
             if q.lower() == "quit":
                 print("Goodbye!")
                 break
-            if q.lower() == "verbose":
-                verbose = not verbose
-                print(f"Verbose mode: {verbose}")
-                continue
             if q:
                 result = query_brain(q, verbose=verbose)
                 print(f"\nAnswer: {result}\n")

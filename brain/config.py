@@ -1,6 +1,10 @@
 import os
 from pathlib import Path
 
+
+def _env_bool(name: str, default: str = "0") -> bool:
+	return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
 # Directory paths
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = os.getenv("RAG_DATA_DIR", str(BASE_DIR / "data"))
@@ -25,3 +29,15 @@ CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "200"))
 FUSION_MODE = os.getenv("RAG_FUSION_MODE", "rrf")  # "rrf" or "weighted"
 FUSION_ALPHA = float(os.getenv("RAG_FUSION_ALPHA", "0.5"))  # For weighted mode: 1.0 = semantic, 0.0 = keyword
 FUSION_K_PARAM = int(os.getenv("RAG_FUSION_K_PARAM", "60"))  # For RRF mode: higher = more conservative
+
+# Query enhancement settings
+ENABLE_QUERY_SPELL_CORRECTION = _env_bool("RAG_ENABLE_QUERY_SPELL_CORRECTION", "1")
+ENABLE_QUERY_REWRITE = _env_bool("RAG_ENABLE_QUERY_REWRITE", "0")
+ENABLE_QUERY_EXPANSION = _env_bool("RAG_ENABLE_QUERY_EXPANSION", "0")
+
+# Retrieval depth settings
+RETRIEVAL_CANDIDATE_MULTIPLIER = int(os.getenv("RAG_RETRIEVAL_CANDIDATE_MULTIPLIER", "3"))
+
+# Reranking settings
+RERANK_METHOD = os.getenv("RAG_RERANK_METHOD", "keyword")  # "none", "keyword", "cross_encoder"
+CROSS_ENCODER_MODEL = os.getenv("RAG_CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
