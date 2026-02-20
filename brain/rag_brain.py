@@ -19,6 +19,7 @@ from .keyword_search import search_documents
 from .pdf_utils import load_pdfs
 from .query_pipeline import enhance_query_for_retrieval, rerank_documents
 
+
 def compose(*fns):
     """Compose functions left-to-right: compose(f, g)(x) = g(f(x))"""
     return reduce(lambda f, g: lambda x: g(f(x)), fns, lambda x: x)
@@ -289,18 +290,46 @@ def query_brain(question: str, verbose: bool = False, fusion_mode: str = None, a
     return llm_output
 
 if __name__ == "__main__":
-    print("1: Ingest | 2: Query")
-    choice = input("Choose: ")
+    print("=" * 50)
+    print("Brain RAG System")
+    print("=" * 50)
+    print("\n1: Ingest Documents")
+    print("2: Query (Comprehensive)")
+    print("\nChoose mode: ")
+    
+    choice = input().strip()
+    
     if choice == "1":
         ingest_docs()
-    else:
-        print("Query mode. Type 'quit' to exit.\nType 'verbose' to toggle debug info.\n")
+    elif choice == "2":
+        print("\nQuery mode. Type 'quit' to exit.\nType 'verbose' to toggle debug info.\n")
         verbose = False
+        
         while True:
             q = input("Ask: ").strip()
             if q.lower() == "quit":
                 print("Goodbye!")
                 break
+            if q.lower() == "verbose":
+                verbose = not verbose
+                print(f"Verbose mode: {verbose}\n")
+                continue
+            
             if q:
-                result = query_brain(q, verbose=verbose)
-                print(f"\nAnswer: {result}\n")
+                from .augmented_generation import query_brain_comprehensive
+                print("\n" + "=" * 50)
+                results = query_brain_comprehensive(q, verbose=verbose)
+                print("\n DIRECT ANSWER\n")
+                print(results['answer'])
+                print("\n SUMMARY\n")
+                print(results['summary'])
+                print("\n KEY CITATIONS\n")
+                print(results['citations'])
+                print("\n DETAILED EXPLANATION\n")
+                print(results['detailed'])
+                print("\n" + "=" * 50 + "\n")
+    else:
+        print("Invalid choice")
+
+
+
