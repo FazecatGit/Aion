@@ -91,3 +91,4 @@ def fast_topic_search(query: str, documents: list):
     results = search_documents(query, relevant_chunks, n_results=5)
         
     return results
+
