@@ -23,8 +23,8 @@ LLM_TEMPERATURE = float(os.getenv("RAG_LLM_TEMPERATURE", "0"))
 RETRIEVAL_K = int(os.getenv("RAG_RETRIEVAL_K", "5"))
 
 # Text splitting settings
-CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "1000"))
-CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "200"))
+CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "512"))
+CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "64"))
 
 # Hybrid fusion settings
 FUSION_MODE = os.getenv("RAG_FUSION_MODE", "rrf")  # "rrf" or "weighted"
@@ -46,5 +46,5 @@ CROSS_ENCODER_MODEL = os.getenv("RAG_CROSS_ENCODER_MODEL", "cross-encoder/ms-mar
 # ChromaDB config
 CHROMA_PERSIST_DIR = CHROMA_DIR		      # where vectors live
 CHROMA_COLLECTION_NAME = "aion-code"     # collection for code docs
-CHROMA_CHUNK_SIZE = 1000                 # optional, for new ingest
-CHROMA_CHUNK_OVERLAP = 100               # optional for new ingest
+CHROMA_CHUNK_SIZE = 512                 # optional, for new ingest
+CHROMA_CHUNK_OVERLAP = 64               # optional for new ingest

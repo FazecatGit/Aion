@@ -6,14 +6,22 @@ from .config import LLM_MODEL, DATA_DIR
 
 _KEYWORD_CACHE = None
 
+KEYWORD_CACHE_PATH = os.path.join(os.path.dirname(DATA_DIR), "cache", "keyword_map.json")
+
 def build_keyword_map(topic_map: dict) -> dict:
     global _KEYWORD_CACHE
     if _KEYWORD_CACHE is not None:
         return _KEYWORD_CACHE
-    
+
+    if os.path.exists(KEYWORD_CACHE_PATH):
+        with open(KEYWORD_CACHE_PATH, "r", encoding="utf-8") as f:
+            _KEYWORD_CACHE = json.load(f)
+            print(f"[DEBUG] Keyword map loaded from cache.")
+            return _KEYWORD_CACHE
+
     llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
     filenames = list(topic_map.values())
-    
+
     prompt = f"""You are a keyword mapping assistant.
 For each document filename below, output a JSON dictionary where:
 - The key is the document filename (exact, unchanged)
@@ -35,7 +43,12 @@ OUTPUT ONLY THE JSON DICTIONARY:"""
         if response.startswith("```json"):
             response = response.strip("```json").strip("```").strip()
         _KEYWORD_CACHE = json.loads(response)
-        print(f"[DEBUG] Keyword map built: {list(_KEYWORD_CACHE.keys())}")
+
+        os.makedirs(os.path.dirname(KEYWORD_CACHE_PATH), exist_ok=True)
+        with open(KEYWORD_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(_KEYWORD_CACHE, f, indent=2)
+
+        print(f"[DEBUG] Keyword map built and saved to cache.")
         return _KEYWORD_CACHE
     except Exception as e:
         print(f"[DEBUG] Keyword map failed: {e}")

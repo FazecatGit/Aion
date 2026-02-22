@@ -171,8 +171,9 @@ def _fuse_results(semantic_docs: list[Document], keyword_docs: list[Document], m
 
 def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None = None,
                      fusion_mode: str = "rrf", alpha: float = 0.5, k_param: int = 60,
-                     rerank_method: str = RERANK_METHOD, verbose: bool = False) -> list[Document]:
-    
+                     rerank_method: str = RERANK_METHOD, verbose: bool = False, raw_docs: list[dict] | None = None) -> list[Document]:
+    if raw_docs is None:
+        raw_docs = load_pdfs(DATA_DIR) 
     _validate_index_metadata()
     embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
     vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
@@ -216,8 +217,7 @@ def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None =
     
     if verbose:
         print(f"[DEBUG] semantic_docs count: {len(semantic_docs)}")
-    
-    raw_docs = load_pdfs(DATA_DIR)
+
     dict_docs = [{"content": d['content'], "metadata": d['metadata']} for d in raw_docs]
     
     if verbose:
@@ -246,7 +246,6 @@ def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None =
         k_param=k_param
     )
 
-    #currenly using semantic_docs due to some failures with reranking. Will investigate and re-enable full reranking in next iteration
     reranked_docs = rerank_documents(
         docs=fused_docs,
         query=eq_str,
@@ -255,7 +254,7 @@ def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None =
         verbose=verbose,
     )
     
-    return semantic_docs[:k]
+    return reranked_docs[:k]
 
 def query_brain(question: str, verbose: bool = False, fusion_mode: str = None, alpha: float = None, k_param: int = None):
     fusion_mode = fusion_mode or FUSION_MODE

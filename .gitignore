@@ -4,10 +4,8 @@ faiss_index/
 __pycache__/
 
 /plans
-
 rag-search-engine/
 
 cache/
 db/
-data/
 *.sqlite3

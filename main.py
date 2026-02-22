@@ -1,11 +1,17 @@
+import warnings
+
 from brain.ingest import ingest_docs
 from brain.config import DATA_DIR, LLM_MODEL
 from agent.code_agent import CodeAgent
 from langchain_ollama import OllamaLLM
 from brain.augmented_generation_query import query_brain_comprehensive, _last_filters
+from brain.pdf_utils import load_pdfs
 
+warnings.filterwarnings("ignore", message=".*Odd-length string.*")
+warnings.filterwarnings("ignore", message=".*invalid hex string.*")
 
 def main():
+    raw_docs = None
     while True:
         print("Aion RAG System")
         print("=" * 50)
@@ -19,6 +25,7 @@ def main():
         if choice == "1":
             # topic_index not neeeded yet - just load topic synonyms as part of ingest_docs
             documents, topic_synonyms = ingest_docs()
+            raw_docs = load_pdfs(DATA_DIR)
             print("\nIngestion complete. Topics loaded:")
             print("Available topics:", list(topic_synonyms.keys()))
             print("Returning to main menu...")
@@ -39,7 +46,7 @@ def main():
                     continue
 
                 if q:
-                    results = query_brain_comprehensive(q, verbose=verbose)
+                    results = query_brain_comprehensive(q, verbose=verbose, raw_docs=raw_docs)
                     print("\n" + "=" * 50)
                     print("\n DIRECT ANSWER\n")
                     print(results["answer"])

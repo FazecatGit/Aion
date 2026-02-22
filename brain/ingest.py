@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 from pathlib import Path
+from unittest import loader
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings
