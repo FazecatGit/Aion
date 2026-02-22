@@ -1,3 +1,5 @@
+
+
 from typing import Optional
 import json
 
@@ -12,10 +14,14 @@ from .prompts import (
 )
 
 
-def _safe_llm_invoke(llm: OllamaLLM, prompt: str) -> Optional[str]:
+_cross_encoder_cache: dict = {}
+
+def _safe_llm_invoke(llm: OllamaLLM, prompt: str, verbose: bool = False) -> Optional[str]:
     try:
         output = llm.invoke(prompt)
     except Exception:
+        if verbose:
+            print(f"[DEBUG] LLM invoke failed for prompt: {prompt[:100]}...")
         return None
 
     if output is None:
@@ -53,6 +59,9 @@ def enhance_query_for_retrieval(
     if not any([enable_spell_correction, enable_rewrite, enable_expansion]):
         return query
 
+    if len(query.split()) <= 2:
+        return query
+    
     llm = _build_query_llm(llm_model)
     enhanced_query = query
 
@@ -102,8 +111,10 @@ def _cross_encoder_rerank_documents(
         return _keyword_rerank_documents(docs, query)
 
     try:
-        model = CrossEncoder(cross_encoder_model)
-        pairs = [(query, (doc.page_content or "")[:2000]) for doc in docs]
+        if cross_encoder_model not in _cross_encoder_cache:
+            _cross_encoder_cache[cross_encoder_model] = CrossEncoder(cross_encoder_model)
+        model = _cross_encoder_cache[cross_encoder_model]
+        pairs  = [(query, (doc.page_content or "")[:2000]) for doc in docs]
         scores = model.predict(pairs)
         ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
         return [doc for _, doc in ranked]
@@ -176,7 +187,7 @@ Return ONLY the scores as a JSON list, nothing else. For example: [3, 1, 2, 0]""
                     json_str = response_text[response_text.find("["):response_text.rfind("]")+1]
                     scores = json.loads(json_str)
                     if isinstance(scores, list) and len(scores) == len(docs):
-                        return [int(s) for s in scores if 0 <= int(s) <= 3]
+                        return [max(0, min(3, int(s))) for s in scores]
             except (json.JSONDecodeError, ValueError):
                 if verbose:
                     print("Failed to parse LLM scores as JSON")

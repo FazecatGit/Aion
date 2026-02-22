@@ -3,9 +3,9 @@ from langchain_ollama import OllamaLLM
 from brain.router import extract_dynamic_filters
 
 from .config import LLM_MODEL, LLM_TEMPERATURE, DATA_DIR
-from .pdf_utils import load_pdfs
 from .ingest import fast_topic_search
 from .rag_brain import hybrid_retrieval
+from .query_pipeline import evaluate_documents_with_llm
 from pathlib import Path
 
 session_chat_history = []
@@ -157,6 +157,14 @@ def query_brain_comprehensive(query: str, llm_model: str = None, verbose: bool =
             'citations': "None",
             'detailed' : error_msg
         }
+
+    scores  = evaluate_documents_with_llm(query, results, llm_model, verbose=verbose)
+    results = [doc for doc, score in zip(results, scores) if score >= 2]
+
+    if not results:
+        if verbose:
+            print("[DEBUG] All chunks filtered by relevance threshold, using top 2 unfiltered")
+        results = hybrid_retrieval(query, k=2, filters=dynamic_filters, raw_docs=raw_docs)
 
     formatted_docs = _format_search_results_for_prompt(results)
 
