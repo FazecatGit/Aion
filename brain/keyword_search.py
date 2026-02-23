@@ -37,28 +37,32 @@ class InvertedIndex:
         self.doc_lengths_path = CACHE_PATH / "doc_lengths.pkl"
 
     def _add_document(self, doc_id, text):
-        tokens = tokenize_text(text)
+        tokens = tokenize_bm25(text)  # Consistent raw tokens
         for t in set(tokens):
             self.index[t].add(doc_id)
         self.term_frequencies[doc_id].update(tokens)
-        self.doc_lengths[doc_id] = len(tokens)  # Track document length
+        self.doc_lengths[doc_id] = len(tokens)
 
     def get_documents(self, term):
         return sorted(list(self.index[term]))
 
     def get_tf(self, doc_id, term):
-        tokens = tokenize_text(term)
-        if len(tokens) != 1:
-            raise ValueError("Term should be a single token")
-        return self.term_frequencies[doc_id][tokens[0]]
+        if not isinstance(term, str) or not term.strip():
+            return 0.0
+        
+        term = term.strip().lower()
+        if not term.isalnum() or len(term) < 2:
+            return 0.0
+        
+        return self.term_frequencies[doc_id].get(term, 0)
         
     def get_idf(self, term):
-        tokens = tokenize_text(term)
-        if len(tokens) != 1:
-            raise ValueError("Term should be a single token")
-        token = tokens[0]
+        term = term.strip().lower()
+        if not term.isalnum() or len(term) < 2:
+            return 0.0
+        
         total_doc_count = len(self.docmap)
-        term_match_doc_count = len(self.index[token])
+        term_match_doc_count = len(self.index.get(term, set()))
         return math.log((total_doc_count + 1) / (term_match_doc_count + 1))
 
     def get_tfidf(self, doc_id, term):
@@ -85,13 +89,12 @@ class InvertedIndex:
         return (tf * (k1 + 1)) / (tf + k1 * length_norm)
     
     def get_bm25_idf(self, term: str) -> float:
-        tokens = tokenize_text(term)
-        if len(tokens) != 1:
-            raise ValueError("Term should be a single token")
-        token = tokens[0]
-        total_doc_count = len(self.docmap)
-        term_match_doc_count = len(self.index[token])
+        term = term.strip().lower()
+        if not term.isalnum() or len(term) < 2:
+            return 0.0
         
+        total_doc_count = len(self.docmap)
+        term_match_doc_count = len(self.index.get(term, set()))
         return math.log((total_doc_count - term_match_doc_count + 0.5) / (term_match_doc_count + 0.5) + 1)
     
     def get_bm25_tfidf(self, doc_id, term, k1=BM25_K1, b=BM25_B):
@@ -139,6 +142,11 @@ def clean_text(text: str) -> str:
     text = text.translate(str.maketrans("", "", string.punctuation))
     return text
 
+def tokenize_bm25(text: str) -> list[str]:
+    cleaned = clean_text(text)
+    return [t for t in cleaned.split() 
+            if t and t.isalnum() and 2 <= len(t) <= 20]
+
 def tokenize_text(text: str) -> list[str]:
     text = clean_text(text)
     stopwords = set(nltk_stopwords.words('english'))
@@ -146,14 +154,20 @@ def tokenize_text(text: str) -> list[str]:
 
     def _filter(tok):
         tok = tok.strip()
-        if tok and tok not in stopwords:
+        if (tok and 
+            tok not in stopwords and 
+            tok.isalnum() and 
+            len(tok) > 1 and  
+            len(tok) <= 20): 
             return True
         return False
 
     for tok in text.split():
         if _filter(tok):
-            tok = stemmer.stem(tok)
-            res.append(tok)     
+            stemmed = stemmer.stem(tok)
+            if stemmed.isalnum() and 1 < len(stemmed) <= 20:
+                res.append(stemmed)
+    
     return res
 
 def has_matching_token(query_tokens: list[str], doc_tokens: list[str]) -> bool:
@@ -177,15 +191,20 @@ def search_documents(query: str, documents: list[dict], n_results: int = 5, use_
     else:
         index.build(documents)
         index.save()
+
+    query_tokens = tokenize_bm25(query)
+    if not query_tokens:
+        return []
     
-    query_tokens = tokenize_text(query)
     scores = {}
     
     for doc_id in range(len(documents)):
         if use_bm25:
-            score = sum(index.get_bm25_tfidf(doc_id, token) for token in query_tokens)
+            valid_tokens = [t for t in query_tokens if len(t) <= 20]  # Reasonable token length
+            score = sum(index.get_bm25_tfidf(doc_id, token) for token in valid_tokens)
         else:
             score = sum(index.get_tfidf(doc_id, token) for token in query_tokens)
+        
         if score > 0:
             scores[doc_id] = score
     
