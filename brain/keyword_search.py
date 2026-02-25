@@ -1,3 +1,5 @@
+# A simple keyword search implementation using an inverted index and BM25 scoring.
+
 import string
 import nltk
 import math
@@ -213,3 +215,5 @@ def search_documents(query: str, documents: list[dict], n_results: int = 5, use_
     
     ranked_ids = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [index.docmap[doc_id] for doc_id, _ in ranked_ids[:n_results]]
+
+# file not being used elsewhere; will review and integrate into router.py or route_execution.py as needed

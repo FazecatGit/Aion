@@ -61,7 +61,9 @@ def fast_topic_search(query: str, return_scores: bool = False):
     for i in sorted_indices:
         if i < len(all_chunks):
             doc = all_chunks[i]
-            doc.metadata["score"] = float(scores[i]) 
+            doc.metadata["bm25_score"] = float(scores[i])
+            if "source" not in doc.metadata:
+                doc.metadata["source"] = "Unknown" 
             results.append(doc)
     
     return results

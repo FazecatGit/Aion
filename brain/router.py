@@ -119,4 +119,4 @@ OUTPUT ONLY THE JSON LIST:"""
     if verbose:
         print(f"[DEBUG] Filter paths: {full_paths}")
     
-    return {"source": {"$in": full_paths}}
+    return {"source": {"$in": full_paths}} 
