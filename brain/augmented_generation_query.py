@@ -183,7 +183,9 @@ Cite using [1], [2], [3] after relevant sentences."""
     answer = await llm.ainvoke(prompt)
     
     summary = (answer.split('.')[0] + "..." if '.' in answer else answer[:100] + "...")
-    detailed = f"BM25 top: {results[0].metadata.get('score', 'N/A'):.1f}, {len(results)} chunks"
+    score = results[0].metadata.get('score', 0.0)
+    detailed = f"BM25 top: {score:.1f}, {len(results)} chunks"
+
 
     return {
         "answer": answer,
