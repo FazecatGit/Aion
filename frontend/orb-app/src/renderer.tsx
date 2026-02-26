@@ -11,13 +11,7 @@ function App() {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  // orbScale no longer needed; size computed purely from window dimensions
-  // compute initial base size immediately so orb is visible
   const computeSize = () => {
-    // inverse relationship: bigger windows produce smaller orb.
-    // we take a constant and divide by the larger dimension, then clamp
-    // to a reasonable range so it never disappears entirely or becomes
-    // absurdly huge on tiny windows.
     const maxDim = Math.max(window.innerWidth, window.innerHeight);
     const raw = 2000 / maxDim;           // 2000 is arbitrary scale factor
     return Math.min(Math.max(raw, 200), 1200); // clamp between 200 and 1200px
@@ -159,9 +153,9 @@ return (
                 borderRadius: '18px',
                 border: '1px solid rgba(255, 255, 255, 0.1)',
                 color: 'rgba(255, 255, 255, 0.95)',
-                textShadow: '0 1px 2px rgba(0,0,0,0.5)',  // Readability
-                maxWidth: '85%',  // Prevent full-width
-                alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',  // Left/right align
+                textShadow: '0 1px 2px rgba(0,0,0,0.5)', 
+                maxWidth: '85%', 
+                alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',
             }}
             >
             {m.text}
