@@ -40,7 +40,7 @@ def _format_search_results_for_prompt(results: list) -> str:
 
 
 async def answer_question(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
-    llm    = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
+    llm = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
 
     recent_history = "\n".join([
         f"{msg['role'].upper()}: {msg['content'][:200]}..."
@@ -68,7 +68,7 @@ Answer:"""
 
 
 async def summarize_documents(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
-    llm    = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
+    llm  = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
 
     recent_history = "\n".join([
         f"{msg['role'].upper()}: {msg['content'][:200]}..."
@@ -97,7 +97,7 @@ Summary:"""
     return await llm.ainvoke(prompt)
 
 async def cite_documents(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
-    llm    = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
+    llm  = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
 
     recent_history = "\n".join([
         f"{msg['role'].upper()}: {msg['content'][:200]}..."
@@ -123,7 +123,7 @@ Citations:"""
 
 
 async def detailed_answer(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
-    llm            = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
+    llm  = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
     recent_history = session_chat_history[-5:] if session_chat_history else []
 
     history_str = []
@@ -183,7 +183,8 @@ Cite using [1], [2], [3] after relevant sentences."""
     answer = await llm.ainvoke(prompt)
     
     summary = (answer.split('.')[0] + "..." if '.' in answer else answer[:100] + "...")
-    score = results[0].metadata.get('score', 0.0)
+
+    score = results[0].metadata.get('bm25_score', 0.0)
     detailed = f"BM25 top: {score:.1f}, {len(results)} chunks"
 
 
@@ -257,12 +258,14 @@ async def query_brain_comprehensive(
     llm_model: str = None,
     verbose: bool = False,
     raw_docs: list[dict] | None = None,
-    session_chat_history: list[dict] | None = None
+    session_chat_history: list[dict] | None = None,
+    mode_override: str | None = None  # 'auto','fast','deep','both'
 ) -> dict:
 
     llm_model = llm_model or LLM_MODEL
 
-    mode = route_execution_mode(query)
+    # allow explicit override; otherwise let router choose
+    mode = mode_override or route_execution_mode(query)
 
     if verbose:
         print(f"[ROUTER] Execution mode: {mode}")
@@ -270,6 +273,18 @@ async def query_brain_comprehensive(
     if mode == "fast":
         return await fast_pipeline(query, llm_model)
 
+    if mode == "both":
+        fast_res = await fast_pipeline(query, llm_model)
+        deep_res = await deep_pipeline(
+            query=query,
+            llm_model=llm_model,
+            verbose=verbose,
+            raw_docs=raw_docs,
+            session_chat_history=session_chat_history,
+        )
+        return {"fast": fast_res, "deep": deep_res}
+
+    # deep (default)
     return await deep_pipeline(
         query=query,
         llm_model=llm_model,

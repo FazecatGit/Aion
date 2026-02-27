@@ -19,9 +19,10 @@ def probe_confidence(query: str) -> float:
     results = fast_topic_search(query)
     print(f"[DEBUG] BM25 results count: {len(results)}")
     if results:
-        print(f"[DEBUG] Top score: {results[0].metadata.get('score', 'N/A')}")
+        print(f"[DEBUG] Top score: {results[0].metadata.get('bm25_score', 'N/A')}")
     
-    scores = [r.metadata.get("score", 0) for r in results[:5]]
+    # compute confidence based on the BM25 scores
+    scores = [r.metadata.get("bm25_score", 0) for r in results[:5]]
     print(f"[DEBUG] All scores: {scores}")
     
     top = scores[0] if scores else 0
@@ -31,6 +32,7 @@ def probe_confidence(query: str) -> float:
     
     _update_confidence(confidence)
     return confidence
+
 def route_execution_mode(query: str) -> str:
     confidence = probe_confidence(query)
     threshold = _dynamic_threshold()

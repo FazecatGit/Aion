@@ -10,6 +10,7 @@ function App() {
   const [mode, setMode] = useState<OrbMode>('idle');
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
+  const [queryMode, setQueryMode] = useState<'auto'|'fast'|'deep'|'both'>('auto');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const computeSize = () => {
     const maxDim = Math.max(window.innerWidth, window.innerHeight);
@@ -44,14 +45,35 @@ const handleSubmit = async (e: React.FormEvent) => {
     const res = await fetch('http://localhost:8000/query', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question: userMsg }),
+      body: JSON.stringify({ question: userMsg, mode: queryMode }),
     });
     const data = await res.json();
 
-    setMessages(prev => [...prev, { 
-      role: 'ai', 
-      text: data.answer  // or data.summary, data.detailed etc.
-    }]);
+    if (data.fast && data.deep) {
+      // both mode – show all fields for each
+      setMessages(prev => [
+        ...prev,
+        { role: 'ai', text: `[FAST] ${data.fast.answer}` },
+        { role: 'ai', text: `[FAST SUMMARY] ${data.fast.summary}` },
+        { role: 'ai', text: `[FAST CITATIONS] ${data.fast.citations}` },
+        { role: 'ai', text: `[FAST DETAILED] ${data.fast.detailed}` },
+        { role: 'ai', text: `[DEEP] ${data.deep.answer}` },
+        { role: 'ai', text: `[DEEP SUMMARY] ${data.deep.summary}` },
+        { role: 'ai', text: `[DEEP CITATIONS] ${data.deep.citations}` },
+        { role: 'ai', text: `[DEEP DETAILED] ${data.deep.detailed}` },
+      ]);
+    } else {
+      // regular single-mode response
+      setMessages(prev => [...prev, { role: 'ai', text: data.answer }]);
+      if (queryMode === 'deep') {
+        setMessages(prev => [
+          ...prev,
+          { role: 'ai', text: `[SUMMARY] ${data.summary}` },
+          { role: 'ai', text: `[CITATIONS] ${data.citations}` },
+          { role: 'ai', text: `[DETAILED] ${data.detailed}` },
+        ]);
+      }
+    }
   } catch (err) {
     setMessages(prev => [...prev, { role: 'ai', text: 'Error connecting to Aion.' }]);
   }
@@ -79,6 +101,36 @@ return (
     >
       {/* Top spacer (for nicer vertical balance) */}
       <div style={{ flex: 1 }} />
+
+      {/* toolbar: ingest button + mode selector */}
+      <div style={{ position: 'fixed', top: '20px', left: '20px', zIndex: 50, display: 'flex', gap: '8px' }}>
+        <button
+          onClick={async () => {
+            try {
+              const res = await fetch('http://localhost:8000/ingest', { method: 'POST' });
+              const data = await res.json();
+              setMessages(prev => [...prev, { role: 'ai', text: `Ingest completed. Topics: ${data.topics.join(', ')}` }]);
+            } catch {
+              setMessages(prev => [...prev, { role: 'ai', text: 'Ingest failed.' }]);
+            }
+          }}
+          style={{ padding: '6px 10px', borderRadius: '6px', backgroundColor: '#5533ff', color: '#fff', border: 'none' }}
+          disabled={mode === 'querying'}
+        >
+          Ingest
+        </button>
+        <select
+          value={queryMode}
+          onChange={e => setQueryMode(e.target.value as any)}
+          disabled={mode === 'querying'}
+          style={{ padding: '6px', borderRadius: '6px', backgroundColor: '#111', color: '#fff', border: '1px solid #333' }}
+        >
+          <option value="auto">Auto</option>
+          <option value="fast">Fast</option>
+          <option value="deep">Deep</option>
+          <option value="both">Both</option>
+        </select>
+      </div>
 
       {/* Orb + Idle label (fixed center) */}
       <div
