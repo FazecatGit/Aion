@@ -162,37 +162,25 @@ Detailed Explanation:"""
 
 
 async def fast_pipeline(query: str, llm_model: str):
+    # Use the same top-k retrieval as fast search
     results = fast_topic_search(query)
     top_docs = results[:3]
     formatted_docs = _format_search_results_for_prompt(top_docs)
 
-    citations_list = [f"[{i+1}] {doc.metadata.get('source', 'Unknown')}" 
-                     for i, doc in enumerate(top_docs)]
-    citations = " | ".join(citations_list)
+    coros = [
+        answer_question(query, formatted_docs, llm_model, None),
+        summarize_documents(query, formatted_docs, llm_model, None),
+        cite_documents(query, formatted_docs, llm_model, None),
+        detailed_answer(query, formatted_docs, llm_model, None),
+    ]
 
-    llm = OllamaLLM(model=llm_model, temperature=0)
-    
-    prompt = f"""Answer concisely (max 4 sentences). Include code example if relevant.
-
-Documents:
-{formatted_docs}
-
-Question: {query}
-Cite using [1], [2], [3] after relevant sentences."""
-    
-    answer = await llm.ainvoke(prompt)
-    
-    summary = (answer.split('.')[0] + "..." if '.' in answer else answer[:100] + "...")
-
-    score = results[0].metadata.get('bm25_score', 0.0)
-    detailed = f"BM25 top: {score:.1f}, {len(results)} chunks"
-
+    answer, summary, citations, detailed = await asyncio.gather(*coros)
 
     return {
         "answer": answer,
         "summary": summary,
-        "citations": citations, 
-        "detailed": detailed
+        "citations": citations,
+        "detailed": detailed,
     }
 
 async def deep_pipeline(

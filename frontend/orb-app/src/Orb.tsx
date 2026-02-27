@@ -17,6 +17,22 @@ export default function Orb({
   backgroundColor = '#000000'
 }: OrbProps) {
   const ctnDom = useRef<HTMLDivElement>(null);
+  const rendererRef = useRef<any>(null);
+  const programRef = useRef<any>(null);
+  const meshRef = useRef<any>(null);
+  const rafRef = useRef<number | null>(null);
+  const rotateOnHoverRef = useRef<boolean>(rotateOnHover);
+  const forceHoverStateRef = useRef<boolean>(forceHoverState);
+  const rotSpeedRef = useRef<number>(0);
+  const targetHueRef = useRef<number>(hue);
+  const targetHoverIntensityRef = useRef<number>(hoverIntensity);
+  const targetBackgroundRef = useRef<Vec3>(hexToVec3(backgroundColor));
+  const enterTimerRef = useRef<any>(null);
+  const leaveTimerRef = useRef<any>(null);
+  const enterPendingRef = useRef<boolean>(false);
+  // delays (ms) before starting transitions to avoid instant-feel
+  const ENTER_DELAY = 700; // delay before animating into processing (increased)
+  const LEAVE_DELAY = 800; // delay before animating back to idle
 
   const vert = /* glsl */ `
     precision highp float;
@@ -192,6 +208,7 @@ export default function Orb({
   `;
 
   useEffect(() => {
+    // Initialize GL renderer once on mount; keep refs to update uniforms later
     const container = ctnDom.current;
     if (!container) return;
 
@@ -219,15 +236,19 @@ export default function Orb({
 
     const mesh = new Mesh(gl, { geometry, program });
 
+    rendererRef.current = renderer;
+    programRef.current = program;
+    meshRef.current = mesh;
+
     function resize() {
-      if (!container) return;
+      if (!container || !rendererRef.current) return;
       const dpr = window.devicePixelRatio || 1;
       const width = container.clientWidth;
       const height = container.clientHeight;
-      renderer.setSize(width * dpr, height * dpr);
+      rendererRef.current.setSize(width * dpr, height * dpr);
       gl.canvas.style.width = width + 'px';
       gl.canvas.style.height = height + 'px';
-      program.uniforms.iResolution.value.set(gl.canvas.width, gl.canvas.height, gl.canvas.width / gl.canvas.height);
+      programRef.current.uniforms.iResolution.value.set(gl.canvas.width, gl.canvas.height, gl.canvas.width / gl.canvas.height);
     }
     window.addEventListener('resize', resize);
     resize();
@@ -263,37 +284,103 @@ export default function Orb({
     container.addEventListener('mousemove', handleMouseMove);
     container.addEventListener('mouseleave', handleMouseLeave);
 
-    let rafId: number;
     const update = (t: number) => {
-      rafId = requestAnimationFrame(update);
+      rafRef.current = requestAnimationFrame(update);
       const dt = (t - lastTime) * 0.001;
       lastTime = t;
-      program.uniforms.iTime.value = t * 0.001;
-      program.uniforms.hue.value = hue;
-      program.uniforms.hoverIntensity.value = hoverIntensity;
+      if (!programRef.current || !rendererRef.current || !meshRef.current) return;
+      programRef.current.uniforms.iTime.value = t * 0.001;
 
-      const effectiveHover = forceHoverState ? 1 : targetHover;
-      program.uniforms.hover.value += (effectiveHover - program.uniforms.hover.value) * 0.1;
+      // Smoothly interpolate uniforms toward target values for animated state changes (slower)
+      const curHue = programRef.current.uniforms.hue.value;
+      const targetHue = targetHueRef.current;
+      programRef.current.uniforms.hue.value = curHue + (targetHue - curHue) * 0.02;
 
-      if (rotateOnHover && effectiveHover > 0.5) {
-        currentRot += dt * rotationSpeed;
-      }
-      program.uniforms.rot.value = currentRot;
-      program.uniforms.backgroundColor.value = hexToVec3(backgroundColor);
+      const curHoverInt = programRef.current.uniforms.hoverIntensity.value;
+      const targetHoverInt = targetHoverIntensityRef.current;
+      programRef.current.uniforms.hoverIntensity.value = curHoverInt + (targetHoverInt - curHoverInt) * 0.04;
 
-      renderer.render({ scene: mesh });
+      // Background color interpolation (vec3)
+      const curBg: Vec3 = programRef.current.uniforms.backgroundColor.value;
+      const tgtBg: Vec3 = targetBackgroundRef.current;
+      curBg.x += (tgtBg.x - curBg.x) * 0.02;
+      curBg.y += (tgtBg.y - curBg.y) * 0.02;
+      curBg.z += (tgtBg.z - curBg.z) * 0.02;
+      programRef.current.uniforms.backgroundColor.value = curBg;
+
+      const effectiveHover = enterPendingRef.current ? 0 : (forceHoverStateRef.current ? 1 : targetHover);
+      // Easing: faster when entering hover, slower when leaving for a smooth fade
+      const hoverNow = programRef.current.uniforms.hover.value;
+      const easeIn = 0.05;   // slower ramp up
+      const easeOut = 0.02;  // slower ramp down
+      const lerpFactor = effectiveHover > hoverNow ? easeIn : easeOut;
+      programRef.current.uniforms.hover.value += (effectiveHover - hoverNow) * lerpFactor;
+
+      // Smooth rotation: interpolate rotation speed towards target, then apply
+      const targetRotSpeed = rotateOnHoverRef.current ? rotationSpeed * effectiveHover : 0;
+      rotSpeedRef.current += (targetRotSpeed - rotSpeedRef.current) * 0.04;
+      currentRot += dt * rotSpeedRef.current;
+      programRef.current.uniforms.rot.value = currentRot;
+
+      rendererRef.current.render({ scene: meshRef.current });
     };
-    rafId = requestAnimationFrame(update);
+
+    rafRef.current = requestAnimationFrame(update);
 
     return () => {
-      cancelAnimationFrame(rafId);
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
       window.removeEventListener('resize', resize);
       container.removeEventListener('mousemove', handleMouseMove);
       container.removeEventListener('mouseleave', handleMouseLeave);
-      container.removeChild(gl.canvas);
-      gl.getExtension('WEBGL_lose_context')?.loseContext();
+      if (rendererRef.current) {
+        const gl = rendererRef.current.gl;
+        try { container.removeChild(gl.canvas); } catch (e) {}
+        gl.getExtension('WEBGL_lose_context')?.loseContext();
+      }
     };
-  }, [hue, hoverIntensity, rotateOnHover, forceHoverState, backgroundColor]);
+  }, []);
+
+  // Keep certain dynamic props in refs to avoid remounting renderer
+  useEffect(() => { rotateOnHoverRef.current = rotateOnHover; }, [rotateOnHover]);
+  useEffect(() => { forceHoverStateRef.current = forceHoverState; }, [forceHoverState]);
+  // Update simple uniforms when props change without re-creating GL
+  useEffect(() => {
+    // Instead of jumping to new props immediately, schedule target updates
+    // with a slight delay so the user perceives a transition phase.
+    if (enterTimerRef.current) { clearTimeout(enterTimerRef.current); enterTimerRef.current = null; }
+    if (leaveTimerRef.current) { clearTimeout(leaveTimerRef.current); leaveTimerRef.current = null; }
+
+    const applyTargets = () => {
+      targetHueRef.current = hue;
+      targetHoverIntensityRef.current = hoverIntensity;
+      targetBackgroundRef.current = hexToVec3(backgroundColor);
+    };
+
+    // If currently forcing hover (processing), delay slightly before applying "enter" targets.
+    if (forceHoverStateRef.current) {
+      // mark enter pending so visuals (hover) don't snap until delay passes
+      enterPendingRef.current = true;
+      enterTimerRef.current = setTimeout(() => {
+        applyTargets();
+        enterPendingRef.current = false;
+        enterTimerRef.current = null;
+      }, ENTER_DELAY);
+    } else {
+      // Leaving processing: delay longer so output feels like a distinct phase
+      leaveTimerRef.current = setTimeout(() => {
+        applyTargets();
+        leaveTimerRef.current = null;
+      }, LEAVE_DELAY);
+    }
+  }, [hue, hoverIntensity, backgroundColor]);
+
+  // cleanup timers on unmount
+  useEffect(() => {
+    return () => {
+      if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
+      if (leaveTimerRef.current) clearTimeout(leaveTimerRef.current);
+    };
+  }, []);
 
   return <div ref={ctnDom} style={{ width: '100%', height: '100%' }} />;
 }

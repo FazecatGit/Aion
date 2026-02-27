@@ -12,12 +12,14 @@ function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [queryMode, setQueryMode] = useState<'auto'|'fast'|'deep'|'both'>('auto');
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [lastUserQuery, setLastUserQuery] = useState<string | null>(null);
   const computeSize = () => {
     const maxDim = Math.max(window.innerWidth, window.innerHeight);
     const raw = 2000 / maxDim;           // 2000 is arbitrary scale factor
     return Math.min(Math.max(raw, 200), 1200); // clamp between 200 and 1200px
   };
   const [baseSize, setBaseSize] = useState(computeSize());
+  const [detailsContent, setDetailsContent] = useState<string | null>(null);
 
   // update baseSize whenever window resizes so orb scales with window size
   useEffect(() => {
@@ -49,29 +51,25 @@ const handleSubmit = async (e: React.FormEvent) => {
     });
     const data = await res.json();
 
+    // store last user query for potential dislike feedback
+    setLastUserQuery(userMsg);
+
     if (data.fast && data.deep) {
-      // both mode – show all fields for each
+      // both mode – show concise answers + summaries, stash full details
       setMessages(prev => [
         ...prev,
         { role: 'ai', text: `[FAST] ${data.fast.answer}` },
         { role: 'ai', text: `[FAST SUMMARY] ${data.fast.summary}` },
-        { role: 'ai', text: `[FAST CITATIONS] ${data.fast.citations}` },
-        { role: 'ai', text: `[FAST DETAILED] ${data.fast.detailed}` },
         { role: 'ai', text: `[DEEP] ${data.deep.answer}` },
         { role: 'ai', text: `[DEEP SUMMARY] ${data.deep.summary}` },
-        { role: 'ai', text: `[DEEP CITATIONS] ${data.deep.citations}` },
-        { role: 'ai', text: `[DEEP DETAILED] ${data.deep.detailed}` },
       ]);
+      setDetailsContent(`FAST CITATIONS:\n${data.fast.citations}\n\nFAST DETAILED:\n${data.fast.detailed}\n\nDEEP CITATIONS:\n${data.deep.citations}\n\nDEEP DETAILED:\n${data.deep.detailed}`);
     } else {
-      // regular single-mode response
+      // regular single-mode response: show answer + summary for deep mode
       setMessages(prev => [...prev, { role: 'ai', text: data.answer }]);
       if (queryMode === 'deep') {
-        setMessages(prev => [
-          ...prev,
-          { role: 'ai', text: `[SUMMARY] ${data.summary}` },
-          { role: 'ai', text: `[CITATIONS] ${data.citations}` },
-          { role: 'ai', text: `[DETAILED] ${data.detailed}` },
-        ]);
+        setMessages(prev => [...prev, { role: 'ai', text: `[SUMMARY] ${data.summary}` }]);
+        setDetailsContent(`CITATIONS:\n${data.citations}\n\nDETAILED:\n${data.detailed}`);
       }
     }
   } catch (err) {
@@ -102,23 +100,76 @@ return (
       {/* Top spacer (for nicer vertical balance) */}
       <div style={{ flex: 1 }} />
 
-      {/* toolbar: ingest button + mode selector */}
+      {/* toolbar: upload + mode selector */}
       <div style={{ position: 'fixed', top: '20px', left: '20px', zIndex: 50, display: 'flex', gap: '8px' }}>
         <button
           onClick={async () => {
             try {
-              const res = await fetch('http://localhost:8000/ingest', { method: 'POST' });
-              const data = await res.json();
-              setMessages(prev => [...prev, { role: 'ai', text: `Ingest completed. Topics: ${data.topics.join(', ')}` }]);
-            } catch {
-              setMessages(prev => [...prev, { role: 'ai', text: 'Ingest failed.' }]);
+              const res = await fetch('http://localhost:8000/open_data_folder', { method: 'POST' });
+              const json = await res.json();
+              if (json.status === 'opened') {
+                setMessages(prev => [...prev, { role: 'ai', text: `Opened data folder: ${json.path}` }]);
+              } else {
+                setMessages(prev => [...prev, { role: 'ai', text: `Open failed: ${json.error}` }]);
+              }
+            } catch (e) {
+              setMessages(prev => [...prev, { role: 'ai', text: 'Open data folder failed.' }]);
             }
           }}
-          style={{ padding: '6px 10px', borderRadius: '6px', backgroundColor: '#5533ff', color: '#fff', border: 'none' }}
+          style={{ padding: '6px 10px', borderRadius: '6px', backgroundColor: '#333', color: '#fff', border: 'none' }}
           disabled={mode === 'querying'}
         >
-          Ingest
+          Open Data Folder
         </button>
+
+        <input id="pdf-upload" type="file" accept="application/pdf" style={{ display: 'none' }} onChange={async (e) => {
+          const f = (e.target as HTMLInputElement).files?.[0];
+          if (!f) return;
+          setMode('querying');
+          try {
+            const anyF = f as any;
+            if (anyF.path) {
+              const res = await fetch('http://localhost:8000/ingest_file', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: anyF.path })
+              });
+              const j = await res.json();
+              if (j.status === 'ingested') {
+                setMessages(prev => [...prev, { role: 'ai', text: `Ingested ${j.filename || f.name}. Topics: ${j.topics?.join(', ') || ''}` }]);
+              } else if (j.status === 'exists') {
+                setMessages(prev => [...prev, { role: 'ai', text: `File already ingested: ${f.name}` }]);
+              } else {
+                setMessages(prev => [...prev, { role: 'ai', text: `Ingest failed: ${j.error || JSON.stringify(j)}` }]);
+              }
+            } else {
+              const form = new FormData();
+              form.append('file', f, f.name);
+              const res = await fetch('http://localhost:8000/upload_and_ingest', { method: 'POST', body: form });
+              const j = await res.json();
+              if (j.status === 'ingested') {
+                setMessages(prev => [...prev, { role: 'ai', text: `Uploaded and ingested ${j.filename}. Topics: ${j.topics?.join(', ') || ''}` }]);
+              } else if (j.status === 'exists') {
+                setMessages(prev => [...prev, { role: 'ai', text: `File already exists on server: ${j.filename}` }]);
+              } else {
+                setMessages(prev => [...prev, { role: 'ai', text: `Upload failed: ${j.error || JSON.stringify(j)}` }]);
+              }
+            }
+          } catch (err) {
+            setMessages(prev => [...prev, { role: 'ai', text: 'Upload/ingest failed.' }]);
+          }
+          setMode('idle');
+          (document.getElementById('pdf-upload') as HTMLInputElement).value = '';
+        }} />
+
+        <button
+          onClick={() => (document.getElementById('pdf-upload') as HTMLInputElement).click()}
+          style={{ padding: '6px 10px', borderRadius: '6px', backgroundColor: '#228822', color: '#fff', border: 'none' }}
+          disabled={mode === 'querying'}
+        >
+          Upload PDF
+        </button>
+
         <select
           value={queryMode}
           onChange={e => setQueryMode(e.target.value as any)}
@@ -210,7 +261,48 @@ return (
                 alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',
             }}
             >
-            {m.text}
+            <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.5, wordBreak: 'break-word' }}>{m.text}</div>
+            {m.role === 'ai' && i === messages.length - 1 && lastUserQuery && (
+              <div style={{ marginTop: 6 }}>
+                <button
+                  onClick={async () => {
+                    if (!lastUserQuery) return;
+                    setMode('querying');
+                    try {
+                      const res = await fetch('http://localhost:8000/feedback', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ question: lastUserQuery, prev_mode: queryMode })
+                      });
+                      const deep = await res.json();
+                      // append deep answer and summary
+                      setMessages(prev => [
+                        ...prev,
+                        { role: 'ai', text: `[DEEP RETRY] ${deep.answer}` },
+                        { role: 'ai', text: `[SUMMARY] ${deep.summary}` }
+                      ]);
+                      // stash detailed for Show Details
+                      setDetailsContent(`CITATIONS:\n${deep.citations}\n\nDETAILED:\n${deep.detailed}`);
+                      setLastUserQuery(null);
+                    } catch (e) {
+                      setMessages(prev => [...prev, { role: 'ai', text: 'Feedback failed.' }]);
+                    }
+                    setMode('idle');
+                  }}
+                  style={{
+                    marginLeft: 8,
+                    padding: '6px 8px',
+                    borderRadius: 8,
+                    backgroundColor: '#aa2222',
+                    color: '#fff',
+                    border: 'none',
+                    cursor: 'pointer'
+                  }}
+                >
+                  Dislike — Ask Deep
+                </button>
+              </div>
+            )}
             </div>
         ))}
         <div ref={messagesEndRef} />
@@ -231,6 +323,27 @@ return (
           zIndex: 20,      // ensure input sits above orb
         }}
       >
+        {detailsContent && (
+          <button
+            type="button"
+            onClick={() => {
+              setMessages(prev => [...prev, { role: 'ai', text: detailsContent }]);
+              setDetailsContent(null);
+            }}
+            disabled={mode === 'querying'}
+            style={{
+              marginRight: '8px',
+              padding: '10px 12px',
+              borderRadius: '12px',
+              border: 'none',
+              backgroundColor: '#444',
+              color: '#fff',
+              cursor: 'pointer'
+            }}
+          >
+            Show Details
+          </button>
+        )}
         <input
           type="text"
           value={input}
