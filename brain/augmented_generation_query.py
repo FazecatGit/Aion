@@ -241,13 +241,77 @@ async def deep_pipeline(
         "detailed": detailed
     }
 
+async def deep_semantic_pipeline(
+    query,
+    llm_model,
+    verbose=False,
+    raw_docs=None,
+    session_chat_history=None
+):
+    """
+    Deep retrieval using semantic (cross-encoder) reranking.
+    Best for complex questions requiring high-quality result ordering.
+    """
+    global _last_filters
+
+    dynamic_filters = extract_dynamic_filters(query, verbose=verbose)
+
+    if not dynamic_filters and _last_filters:
+        dynamic_filters = _last_filters
+        if verbose:
+            print(f"[DEBUG] No filter found, reusing last: {dynamic_filters}")
+    else:
+        _last_filters = dynamic_filters
+
+    if verbose:
+        print(f"[DEBUG] Running semantic retrieval for: '{query}'")
+
+    raw_docs = raw_docs or load_pdfs(DATA_DIR)
+
+    results = await query_brain(
+        question=query,
+        k=5,
+        filters=dynamic_filters,
+        raw_docs=raw_docs,
+        verbose=verbose,
+        rerank_method="cross_encoder",
+        force_semantic_chroma=True
+    )
+
+    if not results:
+        error_msg = "I don't have enough information in the provided documents."
+        return {
+            "answer": error_msg,
+            "summary": error_msg,
+            "citations": "None",
+            "detailed": error_msg
+        }
+
+    formatted_docs = _format_search_results_for_prompt(results)
+
+    coros = [
+        answer_question(query, formatted_docs, llm_model, session_chat_history),
+        summarize_documents(query, formatted_docs, llm_model, session_chat_history),
+        cite_documents(query, formatted_docs, llm_model, session_chat_history),
+        detailed_answer(query, formatted_docs, llm_model, session_chat_history)
+    ]
+
+    answer, summary, citations, detailed = await asyncio.gather(*coros)
+
+    return {
+        "answer": answer,
+        "summary": summary,
+        "citations": citations,
+        "detailed": detailed
+    }
+
 async def query_brain_comprehensive(
     query: str,
     llm_model: str = None,
     verbose: bool = False,
     raw_docs: list[dict] | None = None,
     session_chat_history: list[dict] | None = None,
-    mode_override: str | None = None  # 'auto','fast','deep','both'
+    mode_override: str | None = None  # 'auto','fast','deep','deep_semantic','both'
 ) -> dict:
 
     llm_model = llm_model or LLM_MODEL
@@ -260,6 +324,15 @@ async def query_brain_comprehensive(
 
     if mode == "fast":
         return await fast_pipeline(query, llm_model)
+
+    if mode == "deep_semantic":
+        return await deep_semantic_pipeline(
+            query=query,
+            llm_model=llm_model,
+            verbose=verbose,
+            raw_docs=raw_docs,
+            session_chat_history=session_chat_history
+        )
 
     if mode == "both":
         fast_res = await fast_pipeline(query, llm_model)

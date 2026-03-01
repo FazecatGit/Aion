@@ -206,6 +206,7 @@ async def hybrid_retrieval(
     batch_size: int = RERANK_BATCH_SIZE,
     verbose: bool = False,
     raw_docs: list[dict] | None = None,
+    force_semantic_chroma: bool = False,
 ) -> list[Document]:
     if raw_docs is None:
         raw_docs = load_pdfs(DATA_DIR) 
@@ -215,7 +216,7 @@ async def hybrid_retrieval(
     print(f"[DEBUG] Running fast topic pre-filter")
     bm25_results = fast_topic_search(question)
     
-    if len(bm25_results) >= 5:
+    if len(bm25_results) >= 5 and not force_semantic_chroma:
         print("[DEBUG] BM25 sufficient - skipping Chroma!")
         reranked_docs = rerank_documents(
             docs=bm25_results[:k*2],
@@ -333,10 +334,13 @@ async def query_brain(
     filters: dict | None = None,
     raw_docs: list[dict] | None = None,
     debug_relevant: list[str] | None = None,
+    rerank_method: str = None,
+    force_semantic_chroma: bool = False,
 ) -> list[Document]:
     fusion_mode = fusion_mode or FUSION_MODE
     alpha       = alpha    if alpha    is not None else FUSION_ALPHA
     k_param     = k_param  if k_param  is not None else FUSION_K_PARAM
+    rerank_method = rerank_method or RERANK_METHOD
 
     docs = await hybrid_retrieval(
         question,
@@ -346,10 +350,11 @@ async def query_brain(
         fusion_mode=fusion_mode,
         alpha=alpha,
         k_param=k_param,
-        rerank_method=RERANK_METHOD,
+        rerank_method=rerank_method,
         cross_encoder_model=CROSS_ENCODER_MODEL,
         batch_size=RERANK_BATCH_SIZE,
         verbose=verbose,
+        force_semantic_chroma=force_semantic_chroma,
     )
 
     if verbose:

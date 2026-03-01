@@ -70,10 +70,15 @@ def build_runtime_error_notes(
     return runtime_error_note
 
 
-def build_rag_context(instruction: str, use_rag: bool) -> str:
+def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cross_encoder") -> str:
     """
     Build RAG (Retrieval-Augmented Generation) context from code search.
     Returns reference docs string (empty if use_rag is False or search fails).
+    
+    Args:
+        instruction: The editing instruction to search for
+        use_rag: Whether to enable RAG
+        rerank_method: Reranking method - "cross_encoder" (default), "keyword", or "none"
     """
     rag_context = ""
     
@@ -82,7 +87,7 @@ def build_rag_context(instruction: str, use_rag: bool) -> str:
     
     print("\n[FAST_SEARCH] BM25 for code context...")
     try:
-        results = fast_topic_search(instruction)
+        results = fast_topic_search(instruction, rerank_method=rerank_method)
         if results:
             rag_context = "REFERENCE DOCS (Guide your edit):\n"
             for i, doc in enumerate(results[:3]):
@@ -148,14 +153,18 @@ def build_all_contexts(
     instruction: str,
     use_rag: bool,
     session_chat_history: Optional[List[Dict[str, str]]],
-    edit_log: dict
+    edit_log: dict,
+    rerank_method: str = "cross_encoder"
 ) -> tuple[str, str, str, str]:
     """
     Build all context types at once.
     Returns tuple of (runtime_error_note, rag_context, history_context, edit_history_text).
+    
+    Args:
+        rerank_method: Reranking method for RAG - "cross_encoder", "keyword", or "none"
     """
     runtime_error_note = build_runtime_error_notes(path, ext, is_python, file_lines)
-    rag_context = build_rag_context(instruction, use_rag)
+    rag_context = build_rag_context(instruction, use_rag, rerank_method=rerank_method)
     history_context = build_history_context(session_chat_history)
     edit_history_text = build_edit_history(edit_log, path)
     

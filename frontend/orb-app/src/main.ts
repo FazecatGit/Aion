@@ -15,6 +15,7 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      sandbox: false,       // Required for file.path to expose full OS path in <input type="file">
       webSecurity: false,  // Allows localhost:8000
       preload: MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY,
     },

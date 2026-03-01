@@ -3,16 +3,20 @@ import { createRoot } from 'react-dom/client';
 import Orb from './Orb';
 import './index.css';
 
-type Message = { role: 'user' | 'ai'; text: string };
-type OrbMode = 'idle' | 'querying';
+type Message = { role: 'user' | 'ai'; text: string; isDiff?: boolean };
+type OrbMode = 'idle' | 'querying' | 'agent-processing';
+type ActiveMode = 'query' | 'agent';
 
 function App() {
   const [mode, setMode] = useState<OrbMode>('idle');
+  const [activeMode, setActiveMode] = useState<ActiveMode>('query');
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
-  const [queryMode, setQueryMode] = useState<'auto'|'fast'|'deep'|'both'>('auto');
+  const [queryMode, setQueryMode] = useState<'auto'|'fast'|'deep'|'deep_semantic'|'both'>('auto');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [lastUserQuery, setLastUserQuery] = useState<string | null>(null);
+  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
+  const [pendingAgentEdit, setPendingAgentEdit] = useState<{ instruction: string; output: string; filePath: string } | null>(null);
   const computeSize = () => {
     const maxDim = Math.max(window.innerWidth, window.innerHeight);
     const raw = 2000 / maxDim;           // 2000 is arbitrary scale factor
@@ -41,35 +45,68 @@ const handleSubmit = async (e: React.FormEvent) => {
   const userMsg = input.trim();
   setInput('');
   setMessages(prev => [...prev, { role: 'user', text: userMsg }]);
-  setMode('querying');
+  
+  // Set mode based on active mode
+  const orbMode = activeMode === 'agent' ? 'agent-processing' : 'querying';
+  setMode(orbMode);
 
   try {
-    const res = await fetch('http://localhost:8000/query', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question: userMsg, mode: queryMode }),
-    });
-    const data = await res.json();
-
-    // store last user query for potential dislike feedback
-    setLastUserQuery(userMsg);
-
-    if (data.fast && data.deep) {
-      // both mode – show concise answers + summaries, stash full details
-      setMessages(prev => [
-        ...prev,
-        { role: 'ai', text: `[FAST] ${data.fast.answer}` },
-        { role: 'ai', text: `[FAST SUMMARY] ${data.fast.summary}` },
-        { role: 'ai', text: `[DEEP] ${data.deep.answer}` },
-        { role: 'ai', text: `[DEEP SUMMARY] ${data.deep.summary}` },
-      ]);
-      setDetailsContent(`FAST CITATIONS:\n${data.fast.citations}\n\nFAST DETAILED:\n${data.fast.detailed}\n\nDEEP CITATIONS:\n${data.deep.citations}\n\nDEEP DETAILED:\n${data.deep.detailed}`);
+    if (activeMode === 'agent') {
+      // Agent mode: send to code agent endpoint
+      if (!selectedFilePath) {
+        setMessages(prev => [...prev, { role: 'ai', text: 'Error: No file selected. Please select a file to edit.' }]);
+        setMode('idle');
+        return;
+      }
+      
+      setMessages(prev => [...prev, { role: 'ai', text: '[CODE AGENT] Processing your code request...' }]);
+      const res = await fetch('http://localhost:8000/agent/edit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instruction: userMsg, file_path: selectedFilePath }),
+      });
+      const data = await res.json();
+      
+      if (data.status === 'pending_review') {
+        // Show dry_run output and set pending edit; use resolved path returned by server
+        const resolvedPath = data.file_path || selectedFilePath || '';
+        setSelectedFilePath(resolvedPath);
+        setMessages(prev => [...prev, { role: 'ai', text: `[DRY RUN PREVIEW]\n\n${data.dry_run_output}`, isDiff: true }]);
+        setPendingAgentEdit({ instruction: userMsg, output: data.dry_run_output, filePath: resolvedPath });
+      } else if (data.status === 'error') {
+        setMessages(prev => [...prev, { role: 'ai', text: `[AGENT ERROR] ${data.message || data.error}` }]);
+      } else {
+        setMessages(prev => [...prev, { role: 'ai', text: data.result || data.error || 'Agent processing complete' }]);
+      }
     } else {
-      // regular single-mode response: show answer + summary for deep mode
-      setMessages(prev => [...prev, { role: 'ai', text: data.answer }]);
-      if (queryMode === 'deep') {
-        setMessages(prev => [...prev, { role: 'ai', text: `[SUMMARY] ${data.summary}` }]);
-        setDetailsContent(`CITATIONS:\n${data.citations}\n\nDETAILED:\n${data.detailed}`);
+      // Query mode: send to query endpoint
+      const res = await fetch('http://localhost:8000/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: userMsg, mode: queryMode }),
+      });
+      const data = await res.json();
+
+      // store last user query for potential dislike feedback
+      setLastUserQuery(userMsg);
+
+      if (data.fast && data.deep) {
+        // both mode – show concise answers + summaries, stash full details
+        setMessages(prev => [
+          ...prev,
+          { role: 'ai', text: `[FAST] ${data.fast.answer}` },
+          { role: 'ai', text: `[FAST SUMMARY] ${data.fast.summary}` },
+          { role: 'ai', text: `[DEEP] ${data.deep.answer}` },
+          { role: 'ai', text: `[DEEP SUMMARY] ${data.deep.summary}` },
+        ]);
+        setDetailsContent(`FAST CITATIONS:\n${data.fast.citations}\n\nFAST DETAILED:\n${data.fast.detailed}\n\nDEEP CITATIONS:\n${data.deep.citations}\n\nDEEP DETAILED:\n${data.deep.detailed}`);
+      } else {
+        // regular single-mode response: show answer + summary for deep mode
+        setMessages(prev => [...prev, { role: 'ai', text: data.answer }]);
+        if (queryMode === 'deep' || queryMode === 'deep_semantic') {
+          setMessages(prev => [...prev, { role: 'ai', text: `[SUMMARY] ${data.summary}` }]);
+          setDetailsContent(`CITATIONS:\n${data.citations}\n\nDETAILED:\n${data.detailed}`);
+        }
       }
     }
   } catch (err) {
@@ -117,7 +154,7 @@ return (
             }
           }}
           style={{ padding: '6px 10px', borderRadius: '6px', backgroundColor: '#333', color: '#fff', border: 'none' }}
-          disabled={mode === 'querying'}
+          disabled={mode !== 'idle'}
         >
           Open Data Folder
         </button>
@@ -165,22 +202,58 @@ return (
         <button
           onClick={() => (document.getElementById('pdf-upload') as HTMLInputElement).click()}
           style={{ padding: '6px 10px', borderRadius: '6px', backgroundColor: '#228822', color: '#fff', border: 'none' }}
-          disabled={mode === 'querying'}
+          disabled={mode !== 'idle'}
         >
           Upload PDF
         </button>
 
-        <select
-          value={queryMode}
-          onChange={e => setQueryMode(e.target.value as any)}
-          disabled={mode === 'querying'}
-          style={{ padding: '6px', borderRadius: '6px', backgroundColor: '#111', color: '#fff', border: '1px solid #333' }}
-        >
-          <option value="auto">Auto</option>
-          <option value="fast">Fast</option>
-          <option value="deep">Deep</option>
-          <option value="both">Both</option>
-        </select>
+        {activeMode === 'query' && (
+          <select
+            value={queryMode}
+            onChange={e => setQueryMode(e.target.value as any)}
+            disabled={mode !== 'idle'}
+            style={{ padding: '6px', borderRadius: '6px', backgroundColor: '#111', color: '#fff', border: '1px solid #333' }}
+          >
+            <option value="auto">Auto</option>
+            <option value="fast">Fast</option>
+            <option value="deep">Deep</option>
+            <option value="deep_semantic">Deep (Semantic)</option>
+            <option value="both">Both</option>
+          </select>
+        )}
+
+        {activeMode === 'agent' && (
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flex: 1 }}>
+            <input
+              id="agent-file-picker"
+              type="file"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const f = (e.target as HTMLInputElement).files?.[0];
+                if (!f) return;
+                // In Electron with sandbox:false, .path gives the full OS path
+                const fullPath = (f as any).path || f.name;
+                setSelectedFilePath(fullPath);
+                (document.getElementById('agent-file-picker') as HTMLInputElement).value = '';
+              }}
+            />
+            <button
+              onClick={() => (document.getElementById('agent-file-picker') as HTMLInputElement)?.click()}
+              style={{ padding: '6px 10px', borderRadius: '6px', backgroundColor: '#4422aa', color: '#fff', border: 'none', cursor: 'pointer', whiteSpace: 'nowrap' }}
+              disabled={mode !== 'idle'}
+            >
+              📁 Select File
+            </button>
+            <input
+              type="text"
+              value={selectedFilePath || ''}
+              onChange={e => setSelectedFilePath(e.target.value)}
+              placeholder="Full path, e.g. C:\path\to\file.py"
+              disabled={mode !== 'idle'}
+              style={{ flex: 1, padding: '6px 8px', borderRadius: '6px', backgroundColor: '#111', color: '#fff', border: '1px solid #555', fontSize: '12px', minWidth: 0 }}
+            />
+          </div>
+        )}
       </div>
 
       {/* Orb + Idle label (fixed center) */}
@@ -197,10 +270,17 @@ return (
         }}
       >
         <Orb
-          hue={mode === 'querying' ? 200 : 0}
-          hoverIntensity={mode === 'querying' ? 2 : 0.4}
+          hue={
+            mode === 'agent-processing' ? 270 :  // Magenta for agent processing
+            mode === 'querying' ? 200 :           // Cyan for query processing
+            0                                      // Red for idle
+          }
+          hoverIntensity={
+            mode === 'agent-processing' ? 2.5 :
+            mode === 'querying' ? 2 : 0.4
+          }
           rotateOnHover={true}
-          forceHoverState={mode === 'querying'}
+          forceHoverState={mode !== 'idle'}
           backgroundColor="#000000"
         />
         <div
@@ -211,12 +291,15 @@ return (
             transform: 'translateX(-50%)',
             fontSize: '11px',
             letterSpacing: '0.18em',
-            color: mode === 'querying' ? '#7df9ff' : '#777',
+            color: 
+              mode === 'agent-processing' ? '#ff00ff' :  // Magenta for agent
+              mode === 'querying' ? '#7df9ff' :          // Cyan for query
+              '#777',
             textTransform: 'uppercase',
             transition: 'color 0.4s',
           }}
         >
-          {mode === 'querying' ? 'Thinking…' : 'Idle'}
+          {mode === 'agent-processing' ? 'Processing Code…' : mode === 'querying' ? 'Thinking…' : 'Idle'}
         </div>
       </div>
 
@@ -261,8 +344,25 @@ return (
                 alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',
             }}
             >
-            <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.5, wordBreak: 'break-word' }}>{m.text}</div>
-            {m.role === 'ai' && i === messages.length - 1 && lastUserQuery && (
+            <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.5, wordBreak: 'break-word', fontFamily: m.isDiff ? 'monospace' : 'inherit' }}>
+              {m.isDiff
+                ? m.text.split('\n').map((line, li) => (
+                    <span key={li} style={{
+                      display: 'block',
+                      backgroundColor: line.startsWith('+') && !line.startsWith('+++') ? 'rgba(0,200,80,0.18)'
+                                     : line.startsWith('-') && !line.startsWith('---') ? 'rgba(220,50,50,0.18)'
+                                     : line.startsWith('@@') ? 'rgba(100,150,255,0.15)'
+                                     : 'transparent',
+                      color: line.startsWith('+') && !line.startsWith('+++') ? '#7fffA0'
+                           : line.startsWith('-') && !line.startsWith('---') ? '#ff8080'
+                           : line.startsWith('@@') ? '#aac4ff'
+                           : 'inherit',
+                    }}>{line || '\u00a0'}</span>
+                  ))
+                : m.text
+              }
+            </div>
+            {m.role === 'ai' && i === messages.length - 1 && lastUserQuery && activeMode === 'query' && queryMode !== 'deep_semantic' && (
               <div style={{ marginTop: 6 }}>
                 <button
                   onClick={async () => {
@@ -299,7 +399,62 @@ return (
                     cursor: 'pointer'
                   }}
                 >
-                  Dislike — Ask Deep
+                  Dislike
+                </button>
+              </div>
+            )}
+            {pendingAgentEdit && i === messages.length - 1 && activeMode === 'agent' && (
+              <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
+                <button
+                  onClick={async () => {
+                    if (!pendingAgentEdit) return;
+                    setMode('agent-processing');
+                    try {
+                      const res = await fetch('http://localhost:8000/agent/apply', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ 
+                          file_path: pendingAgentEdit.filePath,
+                          instruction: pendingAgentEdit.instruction,
+                          confirmed: true
+                        })
+                      });
+                      const result = await res.json();
+                      setMessages(prev => [...prev, { role: 'ai', text: result.message || 'Changes applied successfully!' }]);
+                      setPendingAgentEdit(null);
+                    } catch (e) {
+                      setMessages(prev => [...prev, { role: 'ai', text: 'Error applying changes.' }]);
+                    }
+                    setMode('idle');
+                  }}
+                  style={{
+                    padding: '6px 12px',
+                    borderRadius: 8,
+                    backgroundColor: '#22aa22',
+                    color: '#fff',
+                    border: 'none',
+                    cursor: 'pointer',
+                    fontSize: '12px'
+                  }}
+                >
+                  ✓ Apply Changes
+                </button>
+                <button
+                  onClick={() => {
+                    setMessages(prev => [...prev, { role: 'ai', text: 'Changes declined.' }]);
+                    setPendingAgentEdit(null);
+                  }}
+                  style={{
+                    padding: '6px 12px',
+                    borderRadius: 8,
+                    backgroundColor: '#aa2222',
+                    color: '#fff',
+                    border: 'none',
+                    cursor: 'pointer',
+                    fontSize: '12px'
+                  }}
+                >
+                  ✗ Decline
                 </button>
               </div>
             )}
@@ -330,7 +485,7 @@ return (
               setMessages(prev => [...prev, { role: 'ai', text: detailsContent }]);
               setDetailsContent(null);
             }}
-            disabled={mode === 'querying'}
+            disabled={mode !== 'idle'}
             style={{
               marginRight: '8px',
               padding: '10px 12px',
@@ -344,12 +499,32 @@ return (
             Show Details
           </button>
         )}
+        <button
+          type="button"
+          onClick={() => setActiveMode(activeMode === 'query' ? 'agent' : 'query')}
+          disabled={mode !== 'idle'}
+          style={{
+            padding: '10px 14px',
+            borderRadius: '12px',
+            border: '2px solid',
+            borderColor: activeMode === 'agent' ? '#ff00ff' : '#5533ff',
+            backgroundColor: activeMode === 'agent' ? 'rgba(255,0,255,0.1)' : 'rgba(85,51,255,0.1)',
+            color: activeMode === 'agent' ? '#ff00ff' : '#5533ff',
+            cursor: 'pointer',
+            fontSize: '12px',
+            fontWeight: 'bold',
+            textTransform: 'uppercase',
+            transition: 'all 0.3s'
+          }}
+        >
+          {activeMode === 'agent' ? '🤖 Agent' : '🔍 Query'}
+        </button>
         <input
           type="text"
           value={input}
           onChange={e => setInput(e.target.value)}
-          placeholder="Ask Aion..."
-          disabled={mode === 'querying'}
+          placeholder={activeMode === 'agent' ? 'Describe code changes...' : 'Ask Aion...'}
+          disabled={mode !== 'idle'}
           style={{
             flex: 1,
             padding: '12px 18px',
@@ -363,19 +538,19 @@ return (
         />
         <button
           type="submit"
-          disabled={mode === 'querying' || !input.trim()}
+          disabled={mode !== 'idle' || !input.trim()}
           style={{
             padding: '12px 24px',
             borderRadius: '999px',
             border: 'none',
-            backgroundColor: mode === 'querying' ? '#222' : '#5533ff',
+            backgroundColor: mode !== 'idle' ? '#222' : '#5533ff',
             color: '#fff',
-            cursor: mode === 'querying' ? 'not-allowed' : 'pointer',
+            cursor: mode !== 'idle' ? 'not-allowed' : 'pointer',
             fontSize: '14px',
             transition: 'background 0.3s, transform 0.1s',
           }}
         >
-          {mode === 'querying' ? '...' : 'Send'}
+          {mode !== 'idle' ? '...' : 'Send'}
         </button>
       </form>
     </div>

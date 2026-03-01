@@ -35,19 +35,58 @@ class CodeAgent:
         self.repo_path = repo_path
         self.edit_log: dict[str, list] = {}
 
+    @staticmethod
+    def _resolve_rerank_method(instruction: str, rerank_method: str) -> str:
+        """Auto-select rerank method based on instruction complexity.
+        
+        fast  → keyword reranking  (no ML model, instant)
+        deep  → cross_encoder       (sentence-transformers, ~2s overhead, best quality)
+        auto  → chooses based on instruction complexity
+        """
+        if rerank_method != "auto":
+            return rerank_method
+        # Heuristic: long/complex instructions warrant cross-encoder; quick/simple ones use keyword
+        COMPLEX_KEYWORDS = {
+            "refactor", "fix", "bug", "error", "crash", "broken", "wrong", "fail",
+            "implement", "add feature", "redesign", "rewrite", "optimize", "performance",
+            "async", "concurrent", "race condition", "exception", "traceback"
+        }
+        instruction_lower = instruction.lower()
+        word_count = len(instruction_lower.split())
+        is_complex = (
+            word_count > 12 or
+            any(kw in instruction_lower for kw in COMPLEX_KEYWORDS)
+        )
+        chosen = "cross_encoder" if is_complex else "keyword"
+        logger.info("[AGENT] rerank auto-selected: %s (complex=%s)", chosen, is_complex)
+        return chosen
+
     def edit_code(
         self,
         path: str,
         instruction: str,
         dry_run: bool = True,
         use_rag: bool = False,
-        session_chat_history: Optional[List[Dict[str, str]]] = None
+        session_chat_history: Optional[List[Dict[str, str]]] = None,
+        rerank_method: str = "cross_encoder"
     ) -> str:
-        """Edit code in a file based on instruction using LLM."""
+        """Edit code in a file based on instruction using LLM.
+        
+        Args:
+            path: File path to edit
+            instruction: Editing instruction
+            dry_run: If True, only show diff without writing
+            use_rag: If True, include RAG context from code search
+            session_chat_history: Optional conversation history for context
+            rerank_method: Reranking method for RAG - "cross_encoder", "keyword", or "none"
+        """
         file_source = read_file(path)
         ext = os.path.splitext(path)[1].lower()
         is_python = ext == ".py"
         lang_fence = "python" if is_python else (ext.lstrip('.') if ext else "text")
+
+        # Resolve "auto" rerank method based on instruction complexity
+        rerank_method = self._resolve_rerank_method(instruction, rerank_method)
 
         file_lines = file_source.split('\n')
         MAX_BLOCK_RATIO = 0.6
@@ -70,7 +109,8 @@ class CodeAgent:
             instruction=instruction,
             use_rag=use_rag,
             session_chat_history=session_chat_history,
-            edit_log=self.edit_log
+            edit_log=self.edit_log,
+            rerank_method=rerank_method
         )
 
         # Only build runtime errors if no syntax errors were found
@@ -183,9 +223,7 @@ class CodeAgent:
             logger.debug(traceback.format_exc())
             return file_source
 
-        # Try parsing raw output first — strip_markdown would discard all but the
-        # first code fence, destroying any second/third block the LLM output.
-        # Only fall back to strip_markdown if no blocks found in raw form.
+        # --- Parse blocks with auto-retry ---
         blocks = parse_multiple_blocks(raw_output)
         if not blocks:
             raw_output = strip_markdown(raw_output)
@@ -359,20 +397,31 @@ class CodeAgent:
         if new_source == file_source and blocks:
             logger.warning("Verbatim retry also failed — falling back to whole-function rewrite")
             rewrite_prompt = (
-                f"Rewrite the following function to apply this change: {instruction}\n\n"
-                f"CURRENT FUNCTION:\n```{lang_fence}\n{verbatim}\n```\n\n"
+                f"Rewrite the following code to apply this change: {instruction}\n\n"
+                f"CURRENT CODE:\n```{lang_fence}\n{verbatim}\n```\n\n"
                 "Rules:\n"
-                "1. Output ONLY the rewritten function — no explanation, no markdown fence.\n"
+                "1. Output ONLY the rewritten code — no explanation, no markdown fence.\n"
                 "2. Preserve ALL existing logic except what the instruction explicitly changes.\n"
                 "3. Keep exact indentation of the original.\n"
-                f"{context_block}"  # purpose: provide RAG and history context to guide the rewrite, even in this fallback scenario
+                f"{context_block}"
             )
             try:
                 rewritten = llm.invoke(rewrite_prompt).strip()
                 rewritten = strip_markdown(rewritten) if "```" in rewritten else rewritten
                 if rewritten.strip():
-                    new_source = whole_function_replace(file_source, rewritten, func_start, func_end)
-                    logger.info("Whole-function rewrite applied (lines %s–%s)", func_start, func_end)
+                    # Safety check: reject if content is destroyed (rewritten loses >30% of lines on large files)
+                    original_span_lines = file_lines[func_start:func_end]
+                    rewritten_lines = rewritten.strip().split('\n')
+                    line_ratio = len(rewritten_lines) / max(1, len(original_span_lines))
+                    if line_ratio < 0.70 and len(original_span_lines) > 30:
+                        logger.warning(
+                            "Whole-function rewrite rejected — rewritten has only %.0f%% of original lines "
+                            "(%d vs %d), likely data loss. Refusing to apply.",
+                            line_ratio * 100, len(rewritten_lines), len(original_span_lines)
+                        )
+                    else:
+                        new_source = whole_function_replace(file_source, rewritten, func_start, func_end)
+                        logger.info("Whole-function rewrite applied (lines %s–%s)", func_start, func_end)
                 else:
                     logger.error("Whole-function rewrite returned empty output. Giving up.")
             except Exception as e:
@@ -386,7 +435,7 @@ class CodeAgent:
 
         if dry_run:
             logger.info("Dry run mode enabled; no file written.")
-            return new_source
+            return {"new_source": new_source, "diff": diff, "changed": new_source != file_source}
 
         try:
             write_file(path, new_source)

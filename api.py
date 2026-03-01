@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
+from pathlib import Path
 
 from brain.fast_search import initialize_bm25
 from brain.ingest import ingest_docs
@@ -30,12 +31,12 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 class QueryRequest(BaseModel):
     question: str
     verbose: bool = False
-    mode: Literal['auto', 'fast', 'deep', 'both'] = 'auto'
+    mode: Literal['auto', 'fast', 'deep', 'deep_semantic', 'both'] = 'auto'
 
 
 class FeedbackRequest(BaseModel):
     question: str
-    prev_mode: Optional[Literal['auto', 'fast', 'deep', 'both']] = 'auto'
+    prev_mode: Optional[Literal['auto', 'fast', 'deep', 'deep_semantic', 'both']] = 'auto'
 
 @app.post("/query")
 async def query(req: QueryRequest):
@@ -63,7 +64,7 @@ async def open_data_folder():
     print("[API] open_data_folder called")
     import os, subprocess, sys
     data_dir = DATA_DIR
-    from pathlib import Path
+
     p = Path(str(data_dir))
     if not p.exists():
         return {"status": "error", "error": f"path not found: {p}"}
@@ -92,7 +93,6 @@ async def open_data_folder():
 @app.post('/upload_and_ingest')
 async def upload_and_ingest(file: UploadFile = File(...)):
     # Accepts multipart file upload (form field 'file') and saves into DATA_DIR
-    from pathlib import Path
     print("[API] upload_and_ingest called")
     try:
         upload = file
@@ -130,15 +130,120 @@ async def ingest_file_endpoint(filename: str):
 
 @app.post("/feedback")
 async def feedback(req: FeedbackRequest):
-    # Run deep pipeline for the given question (user indicated dislike)
+    # User disliked result - escalate to semantic reranking with cross-encoder
     results = await query_brain_comprehensive(
         req.question,
         verbose=False,
         raw_docs=raw_docs,
         session_chat_history=session_chat_history,
-        mode_override='deep'
+        mode_override='deep_semantic'
     )
     return results
+
+
+class AgentEditRequest(BaseModel):
+    instruction: str
+    file_path: str
+
+
+@app.post("/agent/edit")
+async def agent_edit(req: AgentEditRequest):
+    """Code agent endpoint for dry-run preview."""
+    from agent.code_agent import CodeAgent
+    from pathlib import Path
+
+    if not req.file_path:
+        return {"error": "No file path provided", "status": "error"}
+
+    # Resolve path: if not found as-is, search repo for a file with that name
+    resolved_path = req.file_path
+    if not Path(resolved_path).exists():
+        # Try relative to Aion root (cwd)
+        candidate = Path(resolved_path)
+        if not candidate.is_absolute():
+            # already tried relative, now search recursively
+            matches = list(Path(".").rglob(candidate.name))
+            if matches:
+                resolved_path = str(matches[0].resolve())
+            else:
+                return {"error": f"File not found: {req.file_path}", "status": "error",
+                        "message": f"File not found: {req.file_path}. Please provide the full absolute path."}
+        else:
+            return {"error": f"File not found: {req.file_path}", "status": "error",
+                    "message": f"File not found: {req.file_path}"}
+
+    try:
+        agent = CodeAgent(repo_path=".")
+        result = agent.edit_code(
+            path=resolved_path,
+            instruction=req.instruction,
+            dry_run=True,
+            use_rag=True,
+            rerank_method="auto"
+        )
+        # edit_code returns a dict when dry_run=True: {new_source, diff, changed}
+        if isinstance(result, dict):
+            diff = result.get("diff", "")
+            changed = result.get("changed", False)
+            dry_run_output = diff if (changed and diff) else "(No changes — agent could not determine what to modify.)"
+        else:
+            dry_run_output = str(result)
+        return {
+            "status": "pending_review",
+            "dry_run_output": dry_run_output,
+            "file_path": resolved_path
+        }
+    except Exception as e:
+        return {"error": str(e), "status": "error", "message": f"Agent error: {str(e)}"}
+
+
+class AgentApplyRequest(BaseModel):
+    instruction: str
+    file_path: str
+    confirmed: bool = False
+
+
+@app.post("/agent/apply")
+async def agent_apply(req: AgentApplyRequest):
+    """Apply code agent changes to file."""
+    from agent.code_agent import CodeAgent
+    from pathlib import Path
+
+    if not req.confirmed:
+        return {"error": "Changes not confirmed", "status": "error"}
+
+    # Resolve path the same way as /agent/edit
+    resolved_path = req.file_path
+    if not Path(resolved_path).exists():
+        candidate = Path(resolved_path)
+        if not candidate.is_absolute():
+            matches = list(Path(".").rglob(candidate.name))
+            if matches:
+                resolved_path = str(matches[0].resolve())
+            else:
+                return {"error": f"File not found: {req.file_path}", "status": "error",
+                        "message": f"File not found: {req.file_path}"}
+        else:
+            return {"error": f"File not found: {req.file_path}", "status": "error",
+                    "message": f"File not found: {req.file_path}"}
+
+    try:
+        agent = CodeAgent(repo_path=".")
+        result = agent.edit_code(
+            path=resolved_path,
+            instruction=req.instruction,
+            dry_run=False,
+            use_rag=True,
+            rerank_method="cross_encoder"  # always use best quality when actually writing
+        )
+        return {
+            "status": "success",
+            "message": f"Changes applied to {resolved_path}",
+            "result": result
+        }
+    except Exception as e:
+        return {"error": str(e), "status": "error", "message": f"Failed to apply changes: {str(e)}"}
+
 
 @app.post("/clear")
 async def clear():
