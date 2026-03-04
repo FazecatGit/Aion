@@ -269,3 +269,74 @@ async def ingest_file(file_path: str):
         json.dump(top_keywords, f, indent=2)
 
     return documents, top_keywords
+
+
+async def batch_ingest_all(verbose: bool = True):
+    """
+    Batch ingest all PDFs from DATA_DIR with detailed progress reporting.
+    Only processes NEW files (skips already ingested ones).
+    
+    Args:
+        verbose: If True, prints detailed progress information
+        
+    Returns:
+        Tuple of (documents, topic_map)
+    """
+    if verbose:
+        print("="*70)
+        print("BATCH PDF INGESTION")
+        print("="*70)
+        print()
+        print(f"Scanning folder: {DATA_DIR}")
+    
+    # Count PDFs
+    pdf_files = list(Path(DATA_DIR).glob("**/*.pdf"))
+    
+    if verbose:
+        print(f"Found {len(pdf_files)} PDF files:")
+        for pdf in pdf_files:
+            print(f"  • {pdf.name}")
+        print()
+    
+    if not pdf_files:
+        if verbose:
+            print("  No PDF files found in data folder.")
+            print("   Drop some PDFs into the data/ folder first.")
+        return [], {}
+    
+    if verbose:
+        print("Starting ingestion...")
+        print("(This will only process NEW files, skipping already-ingested ones)")
+        print()
+    
+    # Run ingestion
+    docs, topic_map = await ingest_docs(force=False)
+    
+    if verbose:
+        print()
+        print("="*70)
+        print("✓ INGESTION COMPLETE")
+        print("="*70)
+        
+        if topic_map:
+            topic_count = len(topic_map)
+            print(f"Extracted {topic_count:,} keywords/phrases")
+            
+            # Show top topics
+            sorted_topics = sorted(topic_map.items(), key=lambda x: x[1], reverse=True)[:15]
+            print("\nTop 15 topics:")
+            for term, score in sorted_topics:
+                marker = "[PHRASE]" if ' ' in term else "        "
+                print(f"  {marker} {term}")
+        
+        print()
+        print("You can now query your documents!")
+        print()
+    
+    return docs, topic_map
+
+
+# Entry point for running as script: python -m brain.ingest
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(batch_ingest_all(verbose=True))

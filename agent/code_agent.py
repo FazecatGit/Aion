@@ -23,16 +23,29 @@ from .code_editing_helpers import (
     validate_code_structure, build_structural_issue_note
 )
 from .code_context_builders import build_all_contexts
+from .session_memory import SessionMemory
+from .orchestration import plan_task, format_plan_for_prompt, critique_code, build_critic_feedback_note
 
 logger = logging.getLogger("code_agent")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
+
+# Shared session memory instance (persists across requests within a server lifetime)
+_session_memory: Optional[SessionMemory] = None
+
+def get_session_memory() -> SessionMemory:
+    """Lazy-init singleton session memory."""
+    global _session_memory
+    if _session_memory is None:
+        _session_memory = SessionMemory()
+    return _session_memory
 
 
 class CodeAgent:
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
         self.edit_log: dict[str, list] = {}
+        self.memory = get_session_memory()
 
     @staticmethod
     def _is_implement_task(instruction: str) -> bool:
@@ -77,7 +90,8 @@ class CodeAgent:
         rerank_method: str = "cross_encoder",
         max_chunks: Optional[int] = None,
         task_mode: str = "auto",
-        search_method: str = "both"
+        search_method: str = "both",
+        session_id: Optional[str] = None,
     ) -> str:
         """Edit code in a file based on instruction using LLM.
         
@@ -145,7 +159,17 @@ class CodeAgent:
         if syntax_errors:
             runtime_error_note = ""
 
-        combined_context = history_context + rag_context + edit_history_text
+        # --- Session memory context ---
+        memory_context = ""
+        if session_id:
+            try:
+                memory_context = self.memory.build_context_block(session_id, instruction, k=4)
+                if memory_context:
+                    logger.info("[AGENT] Session memory: injecting %d chars of context", len(memory_context))
+            except Exception as e:
+                logger.debug("[AGENT] Session memory recall failed: %s", e)
+
+        combined_context = history_context + rag_context + edit_history_text + memory_context
 
         if multi_func_hint and runtime_error_note:
             runtime_error_note = (
@@ -207,14 +231,26 @@ class CodeAgent:
             if is_implement:
                 logger.info("[AGENT] task_mode=auto detected implementation task — switching to build mode")
 
+        # --- Planner step for implement tasks ---
+        plan_context = ""
+        if is_implement:
+            try:
+                plan = plan_task(instruction, file_source, ext, rag_context=rag_context, llm=llm)
+                plan_context = format_plan_for_prompt(plan)
+                logger.info("[AGENT] Planner produced %d steps, approach: %s", len(plan.get('steps', [])), plan.get('approach', '')[:100])
+            except Exception as e:
+                logger.debug("[AGENT] Planner failed, continuing without plan: %s", e)
+
         # --- Two-stage: analysis then edit ---
         logger.info("Waiting for LLM to analyze the issue...")
         try:
             if is_implement:
+                plan_section = f"\nPLAN:\n{plan_context}\n" if plan_context else ""
                 analysis_prompt = (
                     f"You are solving a programming task. Read the requirement carefully and plan the solution.\n\n"
                     f"{lang_directive}"
                     f"TASK: {instruction}\n\n"
+                    f"{plan_section}"
                     f"{original_header}```{lang_fence}\n{original_snippet}\n```\n\n"
                     "Describe step-by-step what algorithm or logic you will implement to satisfy the requirement. "
                     "Be specific about data structures, loop structure, and edge cases.\n\n"
@@ -535,7 +571,8 @@ class CodeAgent:
         # --- Finalize: diff, explanation, write ---
         return self._finalize_edit(
             file_source, new_source, path, ext, dry_run,
-            instruction, is_implement, llm, rag_citations, session_chat_history
+            instruction, is_implement, llm, rag_citations, session_chat_history,
+            session_id=session_id, rag_context=rag_context
         )
 
     # ─── Extracted helper methods for edit_code ─────────────────────────────
@@ -639,30 +676,91 @@ class CodeAgent:
 
     def _finalize_edit(self, file_source, new_source, path, ext, dry_run,
                        instruction, is_implement, llm, rag_citations,
-                       session_chat_history):
-        """Generate diff, explanation, and optionally write the edited file."""
+                       session_chat_history, session_id=None, rag_context=""):
+        """Generate diff, critic review, explanation, and optionally write the edited file."""
         diff = show_diff(file_source, new_source)
         logger.info("--- DIFF PREVIEW ---")
         logger.info('\n%s', diff or "No changes detected.")
         logger.info("--------------------")
 
-        # Generate explanation
+        lang_fence = LANG_FENCE.get(ext, ext.lstrip('.') if ext else 'text')
+
+        # --- Critic review ---
+        critic_note = ""
+        if new_source != file_source:
+            try:
+                critique = critique_code(
+                    instruction=instruction,
+                    original_source=file_source,
+                    new_source=new_source,
+                    ext=ext,
+                    rag_context=rag_context,
+                    llm=llm,
+                )
+                logger.info("[AGENT] Critic verdict: %s (confidence: %.1f)", critique["verdict"], critique["confidence"])
+                if critique["verdict"] != "PASS" and critique["issues"]:
+                    critic_note = build_critic_feedback_note(critique)
+                    logger.info("[AGENT] Critic found issues, attempting fix...")
+                    # One-shot fix based on critic feedback
+                    try:
+                        fix_prompt = (
+                            f"CURRENT CODE:\n```{lang_fence}\n{new_source}\n```\n\n"
+                            f"{critic_note}\n\n"
+                            "Output ONE SEARCH/REPLACE block per issue. "
+                            "Each SEARCH block must match the CURRENT CODE exactly."
+                        )
+                        raw_fix = llm.invoke(fix_prompt).strip()
+                        fix_blocks = parse_multiple_blocks(raw_fix)
+                        if not fix_blocks:
+                            fix_blocks = parse_multiple_blocks(strip_markdown(raw_fix))
+                        if fix_blocks:
+                            lines = new_source.split('\n')
+                            for s_text, r_text in fix_blocks:
+                                m_idx, r_lines, m_len = apply_block_to_lines(lines, s_text, r_text)
+                                if m_idx != -1:
+                                    lines = lines[:m_idx] + r_lines + lines[m_idx + m_len:]
+                                    logger.info("[AGENT] Critic fix block applied")
+                            new_source = "\n".join(lines)
+                            diff = show_diff(file_source, new_source)
+                    except Exception as e:
+                        logger.debug("[AGENT] Critic fix failed: %s", e)
+            except Exception as e:
+                logger.debug("[AGENT] Critic review failed: %s", e)
+
+        # --- Generate teaching-style explanation ---
         explanation = ""
-        if new_source != file_source and is_implement:
+        if new_source != file_source:
             try:
                 explain_prompt = (
-                    f"You just implemented code for this task:\\n"
-                    f"TASK: {instruction[:300]}\\n\\n"
-                    f"Briefly explain (3-4 lines max):\\n"
-                    f"1. What approach/algorithm you used\\n"
-                    f"2. Why you chose it\\n"
-                    f"3. Any edge cases handled\\n"
-                    f"Be concise. No code."
+                    f"You just {'implemented' if is_implement else 'fixed'} code for this task:\n"
+                    f"TASK: {instruction[:400]}\n\n"
+                    f"YOUR CODE:\n```{lang_fence}\n{new_source[:2000]}\n```\n\n"
+                    "Write an explanation for someone learning to code. Use this EXACT format:\n\n"
+                    "## Key Concept\n"
+                    "Name the core algorithm, data structure, or technique used (e.g. 'Two-Pointer Technique', "
+                    "'Hash Map Lookup', 'Dummy Node Pattern'). One sentence explaining what it is.\n\n"
+                    "## How It Works (Step-by-Step)\n"
+                    "Walk through the code logic step by step using the ACTUAL variable names and values "
+                    "from the code. Show what happens with a concrete example input.\n"
+                    "Number each step. Max 5 steps.\n\n"
+                    "## Why This Approach\n"
+                    "One sentence on time/space complexity. One sentence on why this is better than a naive approach.\n\n"
+                    "## Edge Cases\n"
+                    "List 2-3 edge cases the code handles (or should handle), with brief explanation.\n\n"
+                    "Keep it clear and beginner-friendly. Use the actual code to illustrate each point."
                 )
                 explanation = llm.invoke(explain_prompt).strip()
-                logger.info("[AGENT] Explanation: %s", explanation[:200])
+                logger.info("[AGENT] Teaching explanation: %s", explanation[:200])
             except Exception as e:
                 logger.debug("Explanation generation failed: %s", e)
+
+        # --- Store in session memory ---
+        if session_id and new_source != file_source:
+            try:
+                self.memory.add_turn(session_id, "user", instruction, {"file_path": path})
+                self.memory.add_agent_action(session_id, instruction, diff, path)
+            except Exception as e:
+                logger.debug("[AGENT] Session memory store failed: %s", e)
 
         if dry_run:
             logger.info("Dry run mode; no file written.")
@@ -714,6 +812,7 @@ class CodeAgent:
         test_cases: list,
         max_retries: int = 3,
         task_mode: str = "solve",
+        session_id: Optional[str] = None,
     ) -> dict:
         """Iteratively fix code until all test cases pass or max_retries is exhausted.
 
@@ -842,6 +941,7 @@ class CodeAgent:
                 dry_run=True,
                 use_rag=True,
                 task_mode=task_mode,
+                session_id=session_id,
             )
 
             if isinstance(edit_result, dict) and edit_result.get("changed"):
@@ -862,11 +962,42 @@ class CodeAgent:
         write_file(path, source)
         diff = show_diff(original_source, source)
 
+        # --- Critic verification on final output ---
+        critic_verdict = ""
+        if source != original_source:
+            try:
+                critique = critique_code(
+                    instruction=instruction,
+                    original_source=original_source,
+                    new_source=source,
+                    ext=ext,
+                    test_results=all_results,
+                    llm=llm,
+                )
+                critic_verdict = f"Critic: {critique['verdict']} (confidence: {critique['confidence']:.1f})"
+                if critique["issues"]:
+                    critic_verdict += " | Issues: " + "; ".join(critique["issues"][:3])
+                logger.info("[FIX_WITH_TESTS] %s", critic_verdict)
+            except Exception as e:
+                logger.debug("[FIX_WITH_TESTS] Critic failed: %s", e)
+
+        # --- Store in session memory ---
+        if session_id:
+            try:
+                self.memory.add_agent_action(
+                    session_id, instruction, diff, path,
+                    passed_tests=all(r["passed"] for r in all_results),
+                )
+            except Exception as e:
+                logger.debug("[FIX_WITH_TESTS] Memory store failed: %s", e)
+
         # Build explanation summary
         explanation = (
             f"Agent worked on: {instruction[:120]}{'...' if len(instruction) > 120 else ''}\n"
             + "\n".join(explanation_parts)
         )
+        if critic_verdict:
+            explanation += f"\n{critic_verdict}"
 
         return {
             "final_source": source,

@@ -62,13 +62,13 @@ def _bm25_search_single(query: str, bm25_idx: Any, all_chunks: list, top_k: int)
     return [(float(scores[i]), i) for i in ranked]
 
 
-def fast_topic_search(query: str, return_scores: bool = False, top_k: int = 20, candidate_k: int = 100, rerank_method: str = "cross_encoder"):
+def fast_topic_search(query: str, return_scores: bool = False, top_k: int = 20, candidate_k: int = 100, rerank_method: str = "keyword"):
     """
-    BM25 search with multi-query expansion and semantic reranking.
+    BM25 search with multi-query expansion and keyword reranking.
     - Generates query variants (no LLM needed, instant)
     - Retrieves top-candidate_k candidates across all variants (wider recall)
     - Deduplicates by chunk index, merging scores via max
-    - Reranks the merged pool using specified method (cross_encoder or keyword)
+    - Reranks the merged pool using specified method (keyword by default; cross_encoder optional)
     - Returns top_k results
     """
     bm25_idx = load_bm25_index()

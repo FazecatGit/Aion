@@ -36,6 +36,8 @@ function App() {
   const [showTestPanel, setShowTestPanel] = useState(false);
   const [testNextId, setTestNextId]       = useState(1);
   const lastAgentInstruction              = useRef<string>('');
+  // ── Session memory ─────────────────────────────────────────────────────────
+  const [sessionId] = useState<string>(() => crypto.randomUUID());
 
 
   // update baseSize whenever window resizes so orb scales with window size
@@ -77,7 +79,7 @@ const handleSubmit = async (e: React.FormEvent) => {
       const res = await fetch('http://localhost:8000/agent/edit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ instruction: userMsg, file_path: selectedFilePath, task_mode: agentTaskMode }),
+        body: JSON.stringify({ instruction: userMsg, file_path: selectedFilePath, task_mode: agentTaskMode, session_id: sessionId }),
       });
       const data = await res.json();
       
@@ -181,6 +183,7 @@ const handleFixWithTests = async () => {
         test_cases: testCases.map(tc => ({ input: tc.input, expected: tc.expected })),
         max_retries: 3,
         task_mode: agentTaskMode === 'auto' ? 'solve' : agentTaskMode,
+        session_id: sessionId,
       }),
     });
     const data = await res.json();
@@ -294,6 +297,30 @@ return (
           disabled={mode !== 'idle'}
         >
           Open Data Folder
+        </button>
+
+        <button
+          onClick={async () => {
+            setMode('querying');
+            setMessages(prev => [...prev, { role: 'user', text: 'Batch ingesting all PDFs in data folder...' }]);
+            try {
+              const res = await fetch('http://localhost:8000/ingest', { method: 'POST' });
+              const json = await res.json();
+              const topicCount = Object.keys(json.topics || {}).length;
+              setMessages(prev => [...prev, { 
+                role: 'ai', 
+                text: `✓ Batch ingest complete! Processed all PDFs in data folder. Extracted ${topicCount} topics: ${Object.keys(json.topics || {}).slice(0, 10).join(', ')}${topicCount > 10 ? '...' : ''}` 
+              }]);
+            } catch (e) {
+              setMessages(prev => [...prev, { role: 'ai', text: `Batch ingest failed: ${e.message}` }]);
+            }
+            setMode('idle');
+          }}
+          style={{ padding: '6px 10px', borderRadius: '6px', backgroundColor: '#2068b8', color: '#fff', border: 'none', fontWeight: 'bold' }}
+          disabled={mode !== 'idle'}
+          title="Process all PDF files in the data folder at once"
+        >
+          Batch Ingest All
         </button>
 
         <input id="pdf-upload" type="file" accept="application/pdf" style={{ display: 'none' }} onChange={async (e) => {
@@ -703,7 +730,8 @@ return (
                           file_path: pendingAgentEdit.filePath,
                           instruction: pendingAgentEdit.instruction,
                           confirmed: true,
-                          task_mode: agentTaskMode
+                          task_mode: agentTaskMode,
+                          session_id: sessionId,
                         })
                       });
                       const result = await res.json();

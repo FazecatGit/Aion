@@ -16,6 +16,167 @@ session_chat_history = []
 _last_filters        = {}
 
 
+# Known topics the system can retrieve docs for
+_KNOWN_TOPICS = [
+    'c++', 'cpp', 'go', 'golang', 'python', 'rust', 'typescript', 'javascript',
+    'java', 'blender', 'angular', 'calculus', 'derivative', 'integration',
+    'refactoring', 'concurrency', 'threading', 'multithreading',
+]
+
+
+def _extract_query_topics(query: str) -> list[str]:
+    """Return distinct known topics mentioned in the query."""
+    q = query.lower()
+    found = []
+    for topic in _KNOWN_TOPICS:
+        if topic in q and topic not in found:
+            found.append(topic)
+    # deduplicate aliases
+    if 'cpp' in found and 'c++' in found:
+        found.remove('cpp')
+    if 'golang' in found and 'go' in found:
+        found.remove('golang')
+    return found
+
+
+def _is_follow_up_query(query: str) -> bool:
+    """Detect if a query is vague / referential and needs conversation context to resolve."""
+    q = query.lower().strip()
+    words = q.split()
+
+    # Phrases that are almost always follow-ups regardless of length
+    strong_follow_up_phrases = [
+        'tell me more', 'can you expand', 'explain more', 'explain step',
+        'elaborate on', 'more about', 'what do you mean', 'go into more detail',
+        'can you explain', 'explain to me more', 'does that exist for',
+        'expand on it', 'expand on that', 'these three', 'those three',
+        'all three', 'for these', 'for those',
+    ]
+    for phrase in strong_follow_up_phrases:
+        if phrase in q:
+            return True
+
+    # Short queries (<= 8 words) with referential words
+    if len(words) <= 8:
+        referential_words = [
+            'step', 'it', 'that', 'this', 'those', 'these', 'above',
+            'previous', 'last', 'more', 'detail', 'explain', 'elaborate',
+            'again', 'expand', 'clarify',
+        ]
+        for word in referential_words:
+            if word in q:
+                return True
+    return False
+
+
+def _can_answer_from_history(query: str, chat_history: list[dict]) -> bool:
+    """Check if the last assistant message is a detailed explanation the user is asking about."""
+    if not chat_history:
+        return False
+    q = query.lower()
+    # Only trigger for queries referencing specific parts of a prior explanation
+    reference_words = ['step', 'iteration', 'example', 'part', 'section', 'point', 'bullet']
+    has_reference = any(w in q for w in reference_words)
+    if not has_reference:
+        return False
+    # Find the last assistant message
+    for msg in reversed(chat_history):
+        if msg['role'] == 'Assistant' and len(msg['content']) > 200:
+            return True
+    return False
+
+
+async def _answer_from_history(query: str, chat_history: list[dict], llm_model: str) -> dict:
+    """Answer a follow-up question directly from conversation history (no RAG search)."""
+    # Get the last substantial assistant message
+    last_explanation = ""
+    for msg in reversed(chat_history):
+        if msg['role'] == 'Assistant' and len(msg['content']) > 200:
+            last_explanation = msg['content']
+            break
+
+    # Also get the original user question that triggered that explanation
+    last_user_query = ""
+    for msg in reversed(chat_history):
+        if msg['role'] == 'User':
+            last_user_query = msg['content']
+            break
+
+    llm = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
+
+    prompt = f"""You are an expert programming assistant.
+
+The user previously asked a question and received a detailed explanation.
+Now they are asking a follow-up about a specific part of that explanation.
+Answer ONLY from the explanation below — do NOT make up new content or reference unrelated topics.
+
+Original question: {last_user_query}
+
+Previous explanation:
+{last_explanation}
+
+User's follow-up question: {query}
+
+Answer:"""
+
+    answer = await llm.ainvoke(prompt)
+    print(f"[HISTORY ANSWER] Answered '{query}' from conversation history (no RAG search)")
+    return {
+        "answer": answer,
+        "summary": "(Answered from conversation context)",
+        "citations": "(Based on previous explanation)",
+        "detailed": answer,
+    }
+
+
+def _rewrite_follow_up_query(query: str, chat_history: list[dict], llm_model: str) -> str:
+    """Use the LLM to rewrite a vague follow-up into a self-contained search query."""
+    if not chat_history:
+        return query
+
+    # Build compact history (last 4 turns)
+    recent = chat_history[-4:]
+    history_lines = []
+    for msg in recent:
+        role = msg['role'].upper()
+        content = msg['content']
+        # Truncate long assistant responses to keep prompt small
+        if role == 'ASSISTANT' and len(content) > 400:
+            content = content[:400] + '...'
+        history_lines.append(f"{role}: {content}")
+    history_text = "\n".join(history_lines)
+
+    prompt = f"""Given this conversation history, rewrite the user's latest question
+into a SELF-CONTAINED search query that includes all necessary context.
+The rewritten query should be something a search engine can answer without
+any prior conversation.
+
+CRITICAL RULES:
+- Preserve ALL specific programming languages, technologies, or topics from the conversation.
+- If the user was discussing TypeScript, Python, and Rust, the rewritten query MUST mention TypeScript, Python, and Rust — NOT different languages.
+- Include the specific technical detail the user is asking about.
+- Return ONLY the rewritten query, nothing else.
+
+Conversation:
+{history_text}
+
+Latest question: {query}
+
+Rewritten search query:"""
+
+    try:
+        llm = OllamaLLM(model=llm_model, temperature=0)
+        rewritten = llm.invoke(prompt)
+        rewritten = rewritten.strip().strip('"').strip("'")
+        if rewritten and len(rewritten) > 5:
+            print(f"[FOLLOW-UP REWRITE] '{query}' -> '{rewritten}'")
+            return rewritten
+    except Exception as e:
+        print(f"[FOLLOW-UP REWRITE] Failed: {e}")
+
+    return query
+
+
 def _format_search_results_for_prompt(results: list) -> str:
     if not results:
         return ""
@@ -42,10 +203,22 @@ def _format_search_results_for_prompt(results: list) -> str:
 async def answer_question(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
     llm = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
 
-    recent_history = "\n".join([
-        f"{msg['role'].upper()}: {msg['content'][:200]}..."
-        for msg in session_chat_history[-3:] if len(msg['content']) > 50
-    ]) if session_chat_history else ""
+    history_entries = []
+    if session_chat_history:
+        for msg in session_chat_history[-4:]:
+            if len(msg['content']) > 30:
+                history_entries.append(f"{msg['role'].upper()}: {msg['content']}")
+    recent_history = "\n".join(history_entries)
+
+    # Scale answer length to number of topics in the query
+    topics = _extract_query_topics(query)
+    if len(topics) >= 2:
+        length_instruction = (
+            f"- This question covers {len(topics)} topics ({', '.join(topics)}). "
+            f"Address EACH one — use a short paragraph or bullet section per topic."
+        )
+    else:
+        length_instruction = "- Keep it to 2-4 sentences maximum"
 
     prompt = f"""You are an expert programming assistant with deep knowledge of software engineering.
 
@@ -53,7 +226,7 @@ Using the provided context chunks, answer the question directly and concisely.
 - If the context contains the answer, use it and cite the source
 - If the context is partially relevant, supplement with your own knowledge
 - If the documents don't contain enough information, say so honestly.
-- Keep it to 2-4 sentences maximum
+{length_instruction}
 
 previous conversation (if relevant):
 {recent_history}
@@ -71,7 +244,7 @@ async def summarize_documents(query: str, formatted_docs: str, llm_model: str, s
     llm  = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
 
     recent_history = "\n".join([
-        f"{msg['role'].upper()}: {msg['content'][:200]}..."
+        f"{msg['role'].upper()}: {msg['content']}"
         for msg in session_chat_history[-3:] if len(msg['content']) > 50
     ]) if session_chat_history else ""
 
@@ -100,7 +273,7 @@ async def cite_documents(query: str, formatted_docs: str, llm_model: str, sessio
     llm  = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
 
     recent_history = "\n".join([
-        f"{msg['role'].upper()}: {msg['content'][:200]}..."
+        f"{msg['role'].upper()}: {msg['content']}"
         for msg in session_chat_history[-3:] if len(msg['content']) > 50
     ]) if session_chat_history else ""
 
@@ -128,10 +301,7 @@ async def detailed_answer(query: str, formatted_docs: str, llm_model: str, sessi
 
     history_str = []
     for msg in recent_history:
-        content = msg['content']
-        if msg['role'] == 'Assistant' and len(content) > 300:
-            content = content[:300] + "..."
-        history_str.append(f"{msg['role'].upper()}: {content}")
+        history_str.append(f"{msg['role'].upper()}: {msg['content']}")
 
     history_text = "\n".join(history_str)
 
@@ -155,23 +325,35 @@ Question: {query}
 Detailed Explanation:"""
 
     response = await llm.ainvoke(prompt)
-    if session_chat_history is not None:
-        session_chat_history.append({"role": "User",      "content": query})
-        session_chat_history.append({"role": "Assistant", "content": response})
     return response
 
 
-async def fast_pipeline(query: str, llm_model: str):
-    # Use the same top-k retrieval as fast search
-    results = fast_topic_search(query)
-    top_docs = results[:3]
+async def fast_pipeline(query: str, llm_model: str, session_chat_history: list[dict] | None = None):
+    topics = _extract_query_topics(query)
+
+    if len(topics) >= 2:
+        # Multi-topic query: retrieve docs per-topic to guarantee each topic has coverage
+        seen_keys: set = set()
+        merged_docs = []
+        for topic in topics:
+            topic_results = fast_topic_search(topic)
+            for doc in topic_results[:4]:  # up to 4 docs per topic
+                key = (doc.metadata.get('source', ''), doc.metadata.get('page', ''))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    merged_docs.append(doc)
+        top_docs = merged_docs[:10]  # cap total
+    else:
+        results = fast_topic_search(query)
+        top_docs = results[:5]  # slightly more than before for single-topic too
+
     formatted_docs = _format_search_results_for_prompt(top_docs)
 
     coros = [
-        answer_question(query, formatted_docs, llm_model, None),
-        summarize_documents(query, formatted_docs, llm_model, None),
-        cite_documents(query, formatted_docs, llm_model, None),
-        detailed_answer(query, formatted_docs, llm_model, None),
+        answer_question(query, formatted_docs, llm_model, session_chat_history),
+        summarize_documents(query, formatted_docs, llm_model, session_chat_history),
+        cite_documents(query, formatted_docs, llm_model, session_chat_history),
+        detailed_answer(query, formatted_docs, llm_model, session_chat_history),
     ]
 
     answer, summary, citations, detailed = await asyncio.gather(*coros)
@@ -316,40 +498,75 @@ async def query_brain_comprehensive(
 
     llm_model = llm_model or LLM_MODEL
 
+    # ── Follow-up handling ─────────────────────────────────────────────
+    effective_query = query
+    is_follow_up = session_chat_history and _is_follow_up_query(query)
+
+    if is_follow_up:
+        # If the user is referencing a specific part of a prior explanation
+        # ("step 3", "second iteration"), answer directly from history —
+        # no RAG search needed because the context lives in the conversation.
+        if _can_answer_from_history(query, session_chat_history):
+            print(f"[FOLLOW-UP] Answering from conversation history")
+            result = await _answer_from_history(query, session_chat_history, llm_model)
+            # Store in history
+            if session_chat_history is not None:
+                session_chat_history.append({"role": "User", "content": query})
+                session_chat_history.append({"role": "Assistant", "content": result.get("answer", "")})
+            return result
+
+        # Otherwise rewrite the vague follow-up into a self-contained query
+        # so BM25 / Chroma can retrieve the right documents.
+        effective_query = _rewrite_follow_up_query(query, session_chat_history, llm_model)
+
     # allow explicit override; otherwise let router choose
-    mode = mode_override or route_execution_mode(query)
+    mode = mode_override or route_execution_mode(effective_query)
 
     if verbose:
         print(f"[ROUTER] Execution mode: {mode}")
 
     if mode == "fast":
-        return await fast_pipeline(query, llm_model)
-
-    if mode == "deep_semantic":
-        return await deep_semantic_pipeline(
-            query=query,
+        result = await fast_pipeline(effective_query, llm_model, session_chat_history)
+    elif mode == "deep_semantic":
+        result = await deep_semantic_pipeline(
+            query=effective_query,
+            llm_model=llm_model,
+            verbose=verbose,
+            raw_docs=raw_docs,
+            session_chat_history=session_chat_history
+        )
+    elif mode == "both":
+        fast_res = await fast_pipeline(effective_query, llm_model, session_chat_history)
+        deep_res = await deep_pipeline(
+            query=effective_query,
+            llm_model=llm_model,
+            verbose=verbose,
+            raw_docs=raw_docs,
+            session_chat_history=session_chat_history,
+        )
+        result = {"fast": fast_res, "deep": deep_res}
+    else:
+        # deep (default)
+        result = await deep_pipeline(
+            query=effective_query,
             llm_model=llm_model,
             verbose=verbose,
             raw_docs=raw_docs,
             session_chat_history=session_chat_history
         )
 
-    if mode == "both":
-        fast_res = await fast_pipeline(query, llm_model)
-        deep_res = await deep_pipeline(
-            query=query,
-            llm_model=llm_model,
-            verbose=verbose,
-            raw_docs=raw_docs,
-            session_chat_history=session_chat_history,
-        )
-        return {"fast": fast_res, "deep": deep_res}
+    # ── Store the ORIGINAL query and the answer in chat history ──────
+    # so follow-up questions can see what the user actually asked.
+    if session_chat_history is not None:
+        session_chat_history.append({"role": "User", "content": query})
+        # For "both" mode, store the deep answer; otherwise the main answer
+        answer_text = ""
+        if isinstance(result, dict):
+            if "deep" in result:
+                answer_text = result["deep"].get("answer", "")
+            else:
+                answer_text = result.get("answer", "")
+        if answer_text:
+            session_chat_history.append({"role": "Assistant", "content": answer_text})
 
-    # deep (default)
-    return await deep_pipeline(
-        query=query,
-        llm_model=llm_model,
-        verbose=verbose,
-        raw_docs=raw_docs,
-        session_chat_history=session_chat_history
-    )
+    return result

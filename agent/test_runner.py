@@ -64,28 +64,34 @@ def _find_c_compiler() -> Tuple[Optional[str], str]:
 
 
 
-def _generate_harness(source: str, ext: str, test_inputs: List[str], llm: OllamaLLM) -> str:
+def _generate_harness(source: str, ext: str, test_inputs: List[str], expected_outputs: List[str], llm: OllamaLLM) -> str:
     """Ask LLM to write a complete runnable program that calls the function
     once per test input and prints only the return value per line."""
     lang = LANG_FENCE.get(ext, ext.lstrip("."))
-    inputs_block = "\n".join(f"  Input {i + 1}: {inp}" for i, inp in enumerate(test_inputs))
+    cases_block = "\n".join(
+        f"  Test {i + 1}: input={inp}  →  expected output={exp}"
+        for i, (inp, exp) in enumerate(zip(test_inputs, expected_outputs))
+    )
 
     prompt = (
         f"Given this {lang} source code:\n"
         f"```{lang}\n{source}\n```\n\n"
         f"Write a complete, self-contained, runnable {lang} program that:\n"
-        f"1. Contains the EXACT function(s) from above — copy them verbatim, do NOT modify their logic\n"
+        f"1. Contains the EXACT function(s) and type definitions from above — copy them verbatim, do NOT modify their logic\n"
         f"2. Has a main entry point that calls the function once for each test input below\n"
         f"3. Prints ONLY the return value of each call, one result per line, in order\n"
-        f"4. No debug output, no labels, no extra text — just one result per line\n\n"
-        f"Test inputs (call the function with each one):\n{inputs_block}\n\n"
+        f"4. No debug output, no labels, no extra text — just one result per line\n"
+        f"5. The printed output for each test MUST match the expected output format exactly\n\n"
+        f"Test cases:\n{cases_block}\n\n"
         f"Language-specific rules:\n"
-        f"- Go: use 'package main' and 'import \"fmt\"'. Use fmt.Println() for each result.\n"
+        f"- Go: use 'package main' and 'import \"fmt\"'. Use fmt.Println() for simple values. "
+        f"If the function returns a linked list / pointer-based structure, traverse it and print in the same format as the expected output.\n"
         f"- Python: define the function first, then use 'if __name__ == \"__main__\":' block.\n"
         f"- C++: use #include <iostream>, #include <vector>, #include <algorithm>, #include <climits> as needed. "
         f"Use std::cout << result << std::endl for each result. Parse the test inputs into proper C++ types "
         f"(e.g. vector<int> from array notation). Include a main() function.\n"
         f"- C: use #include <stdio.h>. Use printf() for output. Include a main() function.\n"
+        f"- If the input contains arrays like [1,2,3], convert them to the appropriate data structure (e.g. linked list, vector).\n"
         f"- The function logic must be IDENTICAL to the original — do NOT 'fix' or change it.\n\n"
         f"Output ONLY the complete program — no explanation, no markdown fences."
     )
@@ -120,10 +126,11 @@ def run_tests(
         llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
 
     inputs = [tc["input"] for tc in test_cases]
+    expected_outputs = [tc["expected"] for tc in test_cases]
     logger.info("[TEST_RUNNER] Generating harness for %d test case(s) [%s]...", len(test_cases), ext)
 
     try:
-        harness = _generate_harness(source, ext, inputs, llm)
+        harness = _generate_harness(source, ext, inputs, expected_outputs, llm)
     except Exception as e:
         logger.error("[TEST_RUNNER] Harness generation failed: %s", e)
         err = f"Harness generation failed: {e}"

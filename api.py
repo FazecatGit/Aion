@@ -130,13 +130,21 @@ async def ingest_file_endpoint(filename: str):
 
 @app.post("/feedback")
 async def feedback(req: FeedbackRequest):
-    # User disliked result - escalate to semantic reranking with cross-encoder
+    # Tiered escalation: fast → deep → deep_semantic
+    escalation = {
+        'fast': 'deep',
+        'auto': 'deep',
+        'deep': 'deep_semantic',
+        'deep_semantic': 'deep_semantic',  # already highest, retry same
+        'both': 'deep_semantic',
+    }
+    next_mode = escalation.get(req.prev_mode or 'auto', 'deep')
     results = await query_brain_comprehensive(
         req.question,
         verbose=False,
         raw_docs=raw_docs,
         session_chat_history=session_chat_history,
-        mode_override='deep_semantic'
+        mode_override=next_mode
     )
     return results
 
@@ -145,6 +153,7 @@ class AgentEditRequest(BaseModel):
     instruction: str
     file_path: str
     task_mode: str = "auto"  # "fix", "solve", or "auto"
+    session_id: Optional[str] = None
 
 
 @app.post("/agent/edit")
@@ -181,7 +190,8 @@ async def agent_edit(req: AgentEditRequest):
             dry_run=True,
             use_rag=True,
             rerank_method="auto",
-            task_mode=req.task_mode
+            task_mode=req.task_mode,
+            session_id=req.session_id,
         )
         # edit_code returns a dict when dry_run=True: {new_source, diff, changed}
         if isinstance(result, dict):
@@ -195,6 +205,13 @@ async def agent_edit(req: AgentEditRequest):
         if isinstance(result, dict):
             explanation = result.get("explanation", "")
             citations = result.get("citations", [])
+        
+        # Store agent interaction into the shared query chat history
+        # so follow-up questions in query mode have context
+        session_chat_history.append({"role": "User", "content": req.instruction})
+        if explanation:
+            session_chat_history.append({"role": "Assistant", "content": explanation})
+        
         return {
             "status": "pending_review",
             "dry_run_output": dry_run_output,
@@ -211,6 +228,7 @@ class AgentApplyRequest(BaseModel):
     file_path: str
     confirmed: bool = False
     task_mode: str = "auto"  # "fix", "solve", or "auto"
+    session_id: Optional[str] = None
 
 
 @app.post("/agent/apply")
@@ -245,7 +263,8 @@ async def agent_apply(req: AgentApplyRequest):
             dry_run=False,
             use_rag=True,
             rerank_method="cross_encoder",  # always use best quality when actually writing
-            task_mode=req.task_mode
+            task_mode=req.task_mode,
+            session_id=req.session_id,
         )
         return {
             "status": "success",
@@ -363,6 +382,7 @@ class FixWithTestsRequest(BaseModel):
     test_cases: list  # [{input: str, expected: str}]
     max_retries: int = 3
     task_mode: str = "solve"
+    session_id: Optional[str] = None
 
 
 @app.post("/agent/fix_with_tests")
@@ -391,6 +411,7 @@ async def fix_with_tests_endpoint(req: FixWithTestsRequest):
             test_cases=req.test_cases,
             max_retries=max(1, min(req.max_retries, 5)),
             task_mode=req.task_mode,
+            session_id=req.session_id,
         )
         return {
             "status": "ok",
@@ -410,3 +431,12 @@ async def fix_with_tests_endpoint(req: FixWithTestsRequest):
 async def clear():
     session_chat_history.clear()
     return {"status": "cleared"}
+
+
+@app.post("/clear_memory")
+async def clear_memory():
+    """Clear code agent session memory."""
+    from agent.code_agent import get_session_memory
+    memory = get_session_memory()
+    memory.clear_all()
+    return {"status": "memory_cleared"}
