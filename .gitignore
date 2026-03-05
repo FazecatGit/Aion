@@ -14,3 +14,5 @@ frontend/node_modules/
 frontend/orb-app/node_modules/
 
 tests_for_code_agent/
+
+vscode-extension/node_modules/
