@@ -468,6 +468,7 @@ class OrchestrateRequest(BaseModel):
     max_attempts: int = 3
     include_related: bool = True   # multi-file context
     context_files: list = []       # additional file paths for cross-file context
+    test_cases: list = []          # optional [{input: str, expected: str}] for execution-based critique
 
 
 @app.post("/agent/orchestrate")
@@ -500,6 +501,7 @@ async def agent_orchestrate(req: OrchestrateRequest):
             max_attempts=max(1, min(req.max_attempts, 5)),
             include_related=req.include_related,
             extra_context_files=req.context_files,
+            test_cases=req.test_cases if req.test_cases else None,
         )
 
         # Build the full assistant response matching what the frontend displays
@@ -615,6 +617,14 @@ async def fix_with_tests_endpoint(req: FixWithTestsRequest):
         else:
             return {"error": f"File not found: {req.file_path}", "status": "error"}
 
+    # Save original file content so we can restore it after the pipeline.
+    # fix_with_tests writes intermediate states to disk; the user must
+    # approve changes via the frontend before they are persisted.
+    try:
+        original_content = Path(resolved_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        original_content = None
+
     try:
         agent = CodeAgent(repo_path=".")
         result = agent.fix_with_tests(
@@ -625,6 +635,14 @@ async def fix_with_tests_endpoint(req: FixWithTestsRequest):
             task_mode=req.task_mode,
             session_id=req.session_id,
         )
+
+        # Restore original file on disk — user must approve via frontend
+        if original_content is not None:
+            try:
+                Path(resolved_path).write_text(original_content, encoding="utf-8")
+            except Exception:
+                pass
+
         return {
             "status": "ok",
             "all_passed": result["all_passed"],
@@ -634,8 +652,15 @@ async def fix_with_tests_endpoint(req: FixWithTestsRequest):
             "file_path": resolved_path,
             "explanation": result.get("explanation", ""),
             "citations": result.get("citations", []),
+            "new_source": result.get("final_source", ""),
         }
     except Exception as e:
+        # Restore on error too
+        if original_content is not None:
+            try:
+                Path(resolved_path).write_text(original_content, encoding="utf-8")
+            except Exception:
+                pass
         return {"error": str(e), "status": "error"}
 
 

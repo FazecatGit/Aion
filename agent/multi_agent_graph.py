@@ -2,15 +2,17 @@
 Multi-Agent Orchestration via LangGraph.
 
 Workflow:
-  1. Planner  — decomposes a complex task into sub-steps
-  2. CodeAgent — executes each step (edit_code)
-  3. Critic   — verifies output, flags issues
-  4. Router   — if critic fails, feeds issues back to CodeAgent for retry
+  1. Planner    — decomposes a complex task into sub-steps
+  2. Strategist — deep algorithmic analysis: identifies the correct approach,
+                  produces pseudocode, and queries RAG for reference patterns
+  3. CodeAgent  — executes each step (edit_code) guided by the strategy
+  4. Critic     — verifies output, flags issues
+  5. Router     — if critic fails, feeds issues back to CodeAgent for retry
 
 Graph:
-  plan → execute → critique ──(PASS)──→ done
-                       │
-                       └──(FAIL)──→ execute (retry with critic feedback, max 2)
+  plan → strategist → execute → critique ──(PASS)──→ done
+                                    │
+                                    └──(FAIL)──→ discuss → execute (retry)
 """
 
 import logging
@@ -21,7 +23,7 @@ from langgraph.graph import StateGraph, END
 
 from langchain_ollama import OllamaLLM
 
-from brain.config import LLM_MODEL, LANG_FENCE
+from brain.config import LLM_MODEL, LANG_FENCE, LANG_NAMES
 from agent.orchestration import plan_task, format_plan_for_prompt, critique_code, build_critic_feedback_note
 
 logger = logging.getLogger("multi_agent")
@@ -52,8 +54,13 @@ class AgentState(TypedDict):
     error: Optional[str]
     # Multi-file support
     related_files: List[Dict]  # [{path, source}]
+    # Strategist output
+    strategy: str  # detailed algorithmic strategy + pseudocode from strategist agent
     # Agent discussion
     discussion_log: List[str]  # conversation between agents when stuck
+    # Test-driven execution
+    test_cases: Optional[List[Dict]]    # [{input, expected}] — enables execution-based critique
+    test_results: Optional[List[Dict]]  # [{input, expected, actual, passed, error}]
 
 
 # ── Node functions ───────────────────────────────────────────────────────────
@@ -80,17 +87,134 @@ def plan_node(state: AgentState) -> dict:
         return {"plan": {"steps": [state["instruction"]], "approach": "", "edge_cases": []}, "plan_text": ""}
 
 
+def strategist_node(state: AgentState) -> dict:
+    """Strategist agent: deep algorithmic analysis before code is written.
+
+    The strategist sits between the planner and the coder. It:
+      1. Analyses what algorithm class / data structure the problem requires
+      2. Queries RAG for relevant algorithm patterns and reference material
+      3. Produces concrete pseudocode with state definitions and transitions
+      4. Traces through the first test case to verify correctness
+
+    The output is a detailed strategy string that the coder can follow
+    mechanically — the coder doesn't need to independently derive the algorithm.
+    """
+    instruction = state["instruction"]
+    source = state["original_source"]
+    ext = state["ext"]
+    plan = state.get("plan", {})
+    approach = plan.get("approach", "")
+    edge_cases = plan.get("edge_cases", [])
+    test_cases = state.get("test_cases")
+
+    lang = LANG_FENCE.get(ext, ext.lstrip('.'))
+    lang_name = LANG_NAMES.get(ext, ext.lstrip('.').upper() if ext else 'code')
+
+    llm = OllamaLLM(model=LLM_MODEL, temperature=0.1)
+
+    logger.info("[STRATEGIST] Analyzing problem for algorithmic approach...")
+
+    # ── Query RAG for relevant algorithm reference material ─────────
+    rag_section = ""
+    try:
+        from brain.fast_search import fast_topic_search
+        # Build a query targeting algorithm patterns, not just the language
+        rag_query = f"algorithm {approach} dynamic programming combinatorics {instruction[:150]}"
+        rag_results = fast_topic_search(
+            rag_query,
+            top_k=5,
+            rerank_method="cross_encoder",
+        )
+        if rag_results:
+            rag_chunks = []
+            for doc in rag_results[:3]:
+                chunk = doc.page_content[:600]
+                if chunk.strip():
+                    rag_chunks.append(chunk)
+            if rag_chunks:
+                rag_section = (
+                    "\n\nREFERENCE MATERIAL (from algorithm textbooks):\n"
+                    + "\n---\n".join(rag_chunks)
+                    + "\n"
+                )
+                logger.info("[STRATEGIST] RAG: injected %d reference chunks", len(rag_chunks))
+    except Exception as e:
+        logger.debug("[STRATEGIST] RAG query failed: %s", e)
+
+    # ── Build test case context ─────────────────────────────────────
+    test_section = ""
+    if test_cases:
+        test_lines = [
+            f"  Test {i+1}: input=({tc['input']}) → expected={tc['expected']}"
+            for i, tc in enumerate(test_cases[:5])
+        ]
+        test_section = "\n\nTEST CASES:\n" + "\n".join(test_lines)
+
+    # ── Build edge case context from planner ────────────────────────
+    edge_section = ""
+    if edge_cases:
+        edge_section = "\n\nEDGE CASES TO HANDLE:\n" + "\n".join(f"  - {ec}" for ec in edge_cases)
+
+    # ── Main strategist prompt ──────────────────────────────────────
+    prompt = (
+        f"You are the STRATEGIST agent — an expert algorithm designer. "
+        f"Your job is to figure out the CORRECT algorithm before any code is written.\n\n"
+        f"PROBLEM:\n{instruction}\n\n"
+        f"LANGUAGE: {lang_name} ({ext})\n\n"
+        f"CURRENT CODE (stub or broken attempt):\n```{lang}\n{source[:2000]}\n```\n"
+        f"{test_section}"
+        f"{edge_section}"
+        f"{rag_section}\n\n"
+        f"PLANNER'S APPROACH: {approach}\n\n"
+        f"Analyze this problem step by step:\n\n"
+        f"1. PROBLEM CLASSIFICATION: What type of problem is this? "
+        f"(DP, greedy, graph, combinatorics, math, etc.)\n\n"
+        f"2. KEY INSIGHT: What is the non-obvious observation that makes this solvable? "
+        f"What constraint must the algorithm enforce?\n\n"
+        f"3. STATE DEFINITION: If DP, define the state precisely. "
+        f"What does dp[i][j] represent? What are the dimensions?\n\n"
+        f"4. TRANSITIONS: How do you move between states? "
+        f"Write the recurrence relation. If there's a prefix-sum or sliding-window trick, explain it.\n\n"
+        f"5. BASE CASES: What are the initial values?\n\n"
+        f"6. PSEUDOCODE: Write clear pseudocode (NOT {lang_name} code — just pseudocode) "
+        f"that a coder can translate directly.\n\n"
+        f"7. TRACE: Walk through the first test case with your algorithm to verify it produces "
+        f"the expected output.\n\n"
+        f"Be CONCRETE — specify array dimensions, loop bounds, exact formulas. "
+        f"Do NOT be vague. The coder will follow this mechanically."
+    )
+
+    try:
+        strategy = llm.invoke(prompt).strip()
+        # Truncate if excessively long (shouldn't be, but safety)
+        if len(strategy) > 4000:
+            strategy = strategy[:4000] + "\n... (truncated)"
+        logger.info("[STRATEGIST] Strategy produced (%d chars)", len(strategy))
+        logger.info("[STRATEGIST] Preview: %s", strategy[:200])
+        return {"strategy": strategy}
+    except Exception as e:
+        logger.warning("[STRATEGIST] Failed: %s", e)
+        return {"strategy": ""}
+
+
 def execute_node(state: AgentState) -> dict:
-    """Code agent: apply edits based on plan + any critic feedback."""
+    """Code agent: apply edits based on plan + strategy + any critic feedback.
+
+    When test_cases are available, uses the iterative fix_with_tests loop
+    (debug trace + step verification + strategy pivot) instead of one-shot edit.
+    """
     from agent.code_agent import CodeAgent
 
     instruction = state["instruction"]
     critic_feedback = state.get("critic_feedback", "")
+    strategy = state.get("strategy", "")
 
-    # Augment instruction with plan and critic feedback
+    # Augment instruction with plan, strategy, and critic feedback
     augmented = instruction
     if state.get("plan_text"):
         augmented = f"{instruction}\n\nPLAN:\n{state['plan_text']}"
+    if strategy:
+        augmented = f"{augmented}\n\nSTRATEGY (follow this algorithm closely):\n{strategy}"
     if critic_feedback:
         augmented = f"{augmented}\n\nPREVIOUS ATTEMPT ISSUES:\n{critic_feedback}\nFix the issues above."
 
@@ -115,10 +239,40 @@ def execute_node(state: AgentState) -> dict:
 
     try:
         agent = CodeAgent(repo_path=".")
+
+        # ── Test-driven path: use iterative fix_with_tests ──────────────
+        if state.get("test_cases"):
+            logger.info("[EXECUTE] Test cases available — using fix_with_tests loop")
+            # Write current source to disk for fix_with_tests
+            try:
+                with open(state["file_path"], "w", encoding="utf-8") as f:
+                    f.write(state["current_source"])
+            except Exception:
+                pass
+
+            result = agent.fix_with_tests(
+                path=state["file_path"],
+                instruction=augmented,
+                test_cases=state["test_cases"],
+                max_retries=2,  # fewer retries per-attempt since outer loop also retries
+                task_mode=state.get("task_mode", "solve"),
+                session_id=state.get("session_id"),
+            )
+            test_results = result.get("test_results", [])
+            return {
+                "current_source": result.get("final_source", state["current_source"]),
+                "diff": result.get("diff", ""),
+                "explanation": result.get("explanation", ""),
+                "citations": result.get("citations", []),
+                "test_results": test_results,
+                "attempt": state["attempt"] + 1,
+            }
+
+        # ── Standard path: one-shot edit_code ──────────────────────────
         result = agent.edit_code(
             path=state["file_path"],
             instruction=augmented,
-            dry_run=True, # user approved changes before writing to disk
+            dry_run=True,
             use_rag=True,
             task_mode=state.get("task_mode", "auto"),
             session_id=state.get("session_id"),
@@ -143,13 +297,47 @@ def execute_node(state: AgentState) -> dict:
 
 
 def critique_node(state: AgentState) -> dict:
-    """Critic agent: verify the code against requirements."""
+    """Critic agent: verify the code against requirements.
+
+    When test_results are available (from fix_with_tests), uses execution-based
+    verdict instead of LLM-only review \u2014 real test data beats guessing.
+    """
     if state.get("error"):
         return {"verdict": "FAIL", "critic_feedback": f"Execution error: {state['error']}"}
 
     if state["current_source"] == state["original_source"]:
         return {"verdict": "FAIL", "critic_feedback": "No changes were made to the code."}
 
+    # \u2500\u2500 Execution-based critique (when test results exist) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    test_results = state.get("test_results")
+    if test_results:
+        pass_count = sum(1 for r in test_results if r.get("passed"))
+        total = len(test_results)
+        all_passed = pass_count == total
+
+        if all_passed:
+            logger.info("[CRITIQUE] All %d tests pass \u2014 PASS", total)
+            return {"verdict": "PASS", "critic_feedback": "", "test_results": test_results}
+
+        # Build concrete feedback from actual failures
+        failures = [r for r in test_results if not r.get("passed")]
+        feedback_lines = [
+            f"EXECUTION-BASED CRITIQUE ({pass_count}/{total} tests passing):\n"
+        ]
+        for i, r in enumerate(failures, 1):
+            got = r.get("actual") or f"ERROR: {r.get('error', 'unknown')}"
+            feedback_lines.append(
+                f"  FAIL Test {i}: input={r['input']}  expected={r['expected']}  got={got}"
+            )
+        feedback_lines.append(
+            "\nThese are REAL execution results, not guesses. "
+            "Fix the specific logic errors causing wrong output."
+        )
+        feedback = "\n".join(feedback_lines)
+        logger.info("[CRITIQUE] %d/%d tests pass \u2014 FAIL", pass_count, total)
+        return {"verdict": "FAIL", "critic_feedback": feedback, "test_results": test_results}
+
+    # \u2500\u2500 LLM-based critique (no tests available) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     logger.info("[CRITIQUE] Reviewing code changes...")
 
     try:
@@ -203,6 +391,23 @@ def discuss_node(state: AgentState) -> dict:
     critic_feedback = state.get("critic_feedback", "No specific feedback")
     current_code = state.get("current_source", "")[:2000]
     instruction = state["instruction"]
+    strategy = state.get("strategy", "")
+
+    # Build test results section if available (gives agents real execution data)
+    test_section = ""
+    test_results = state.get("test_results")
+    if test_results:
+        test_lines = []
+        for r in test_results:
+            status = "PASS" if r.get("passed") else "FAIL"
+            got = r.get("actual") or f"ERROR: {r.get('error', 'N/A')}"
+            test_lines.append(f"  {status}: input={r['input']} expected={r['expected']} got={got}")
+        test_section = "\n\nACTUAL TEST EXECUTION RESULTS:\n" + "\n".join(test_lines)
+
+    # Include strategist's analysis so discussion agents can reference it
+    strategy_section = ""
+    if strategy:
+        strategy_section = f"\n\nORIGINAL STRATEGY (from strategist agent):\n{strategy[:1500]}\n"
 
     # Round 1: Planner proposes a new approach based on critic feedback
     planner_prompt = (
@@ -210,12 +415,15 @@ def discuss_node(state: AgentState) -> dict:
         f"TASK: {instruction}\n"
         f"LANGUAGE: {lang}\n\n"
         f"The CRITIC agent rejected the previous attempt with this feedback:\n"
-        f"{critic_feedback}\n\n"
+        f"{critic_feedback}\n"
+        f"{test_section}\n"
+        f"{strategy_section}\n\n"
         f"Current code:\n```{lang}\n{current_code}\n```\n\n"
-        f"Propose a different approach to fix the issues. Be specific about:\n"
+        f"The original strategy may have been wrong or the coder may have deviated from it.\n"
+        f"Propose a CORRECTED approach. Be specific about:\n"
         f"1. What went wrong in the previous attempt\n"
-        f"2. What new strategy you recommend\n"
-        f"3. Specific code changes needed\n\n"
+        f"2. What the correct algorithm/state definition should be\n"
+        f"3. Specific recurrence relations or transitions needed\n\n"
         f"Keep your response concise (3-5 sentences)."
     )
     planner_response = llm.invoke(planner_prompt).strip()
@@ -226,13 +434,15 @@ def discuss_node(state: AgentState) -> dict:
     critic_prompt = (
         f"You are the CRITIC agent in a multi-agent coding system.\n\n"
         f"TASK: {instruction}\n"
-        f"LANGUAGE: {lang}\n\n"
+        f"LANGUAGE: {lang}\n"
+        f"{test_section}\n"
+        f"{strategy_section}\n\n"
         f"The PLANNER proposed this approach:\n{planner_response}\n\n"
         f"Previous issues: {critic_feedback}\n\n"
         f"Evaluate this proposal:\n"
         f"1. Will it address the issues found?\n"
-        f"2. Are there any risks or edge cases the planner missed?\n"
-        f"3. Any modifications to the plan?\n\n"
+        f"2. Does it align with the original strategy or improve on it?\n"
+        f"3. Are there any risks or edge cases the planner missed?\n\n"
         f"If you agree with the approach, say 'AGREED' and elaborate briefly.\n"
         f"If not, explain what needs to change. Keep concise (3-5 sentences)."
     )
@@ -280,12 +490,14 @@ def build_agent_graph() -> StateGraph:
     graph = StateGraph(AgentState)
 
     graph.add_node("plan", plan_node)
+    graph.add_node("strategist", strategist_node)
     graph.add_node("execute", execute_node)
     graph.add_node("critique", critique_node)
     graph.add_node("discuss", discuss_node)
 
     graph.set_entry_point("plan")
-    graph.add_edge("plan", "execute")
+    graph.add_edge("plan", "strategist")
+    graph.add_edge("strategist", "execute")
     graph.add_edge("execute", "critique")
     graph.add_edge("discuss", "execute")  # after discussion, retry execution
 
@@ -489,6 +701,7 @@ def run_multi_agent(
     max_attempts: int = 3,
     include_related: bool = True,
     extra_context_files: List[str] = None,
+    test_cases: Optional[List[Dict]] = None,
 ) -> Dict:
     """
     Run the full planner → executor → critic pipeline.
@@ -543,6 +756,7 @@ def run_multi_agent(
         "ext": ext,
         "plan": {},
         "plan_text": "",
+        "strategy": "",
         "critic_feedback": "",
         "attempt": 0,
         "max_attempts": max_attempts,
@@ -553,6 +767,8 @@ def run_multi_agent(
         "error": None,
         "related_files": related_files,
         "discussion_log": [],
+        "test_cases": test_cases,
+        "test_results": None,
     }
 
     graph = get_agent_graph()
@@ -598,7 +814,9 @@ def run_multi_agent(
         "related_files": [rf["path"] for rf in related_files],
         "new_source": new_source,
         "file_path": file_path,
+        "strategy": final_state.get("strategy", ""),
         "critic_feedback": final_state.get("critic_feedback", ""),
         "discussion_log": final_state.get("discussion_log", []),
         "context_file_edits": context_file_edits,
+        "test_results": final_state.get("test_results"),
     }

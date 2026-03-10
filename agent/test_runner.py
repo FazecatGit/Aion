@@ -120,7 +120,23 @@ def run_tests(
     Returns:
         List of {"input", "expected", "actual", "passed", "error"} dicts.
     """
+    from .code_editing_helpers import source_matches_ext
+
     ext = os.path.splitext(path)[1].lower()
+
+    # Language safety check: if the source code doesn't match the file extension
+    # (e.g. Python code in a .go file due to LLM language confusion), report
+    # the mismatch instead of generating a broken harness.
+    if not source_matches_ext(source, ext):
+        err = (
+            f"Language mismatch: file is {ext} but source appears to be a different language. "
+            "The LLM likely generated code in the wrong language."
+        )
+        logger.error("[TEST_RUNNER] %s", err)
+        return [
+            {"input": tc["input"], "expected": tc["expected"], "actual": None, "passed": False, "error": err}
+            for tc in test_cases
+        ]
 
     if llm is None:
         llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
@@ -437,14 +453,16 @@ def build_test_failure_note(
     failed_approaches: Optional[List[str]] = None,
     debug_trace: Optional[str] = None,
     previous_diff: Optional[str] = None,
+    step_verification: Optional[str] = None,
 ) -> str:
     """
     Build a structured prompt note from failing test cases.
 
     Includes:
+      - Step verification: concrete assertion results showing which logical step fails
       - Debug trace: actual runtime variable values from executing the code
         (when available), so the LLM sees real execution data instead of guessing
-      - Self-reasoning: LLM reads problem + debug trace to identify root cause
+      - Self-reasoning: LLM reads problem + debug trace + step verification to find root cause
       - Previous attempt diff: what changed last time (so LLM doesn't repeat it)
       - Graduated escalation: early attempts target specific bugs, later attempts
         suggest broader rethinking
@@ -506,6 +524,16 @@ def build_test_failure_note(
                     "Use this trace to find EXACTLY where the logic produces the wrong value.\n\n"
                 )
 
+            # Include step verification — the most precise diagnostic
+            verify_section = ""
+            if step_verification:
+                verify_section = (
+                    "\nSTEP-BY-STEP ASSERTION RESULTS (from actually running the code):\n"
+                    f"{step_verification}\n\n"
+                    "The above was EXECUTED — these are real values, not guesses.\n"
+                    "Focus your fix on the FIRST FAILING STEP. That is where the bug is.\n\n"
+                )
+
             prev_diff_section = ""
             if previous_diff:
                 prev_diff_section = (
@@ -521,6 +549,7 @@ def build_test_failure_note(
                 f"CODE:\n```\n{source}\n```\n\n"
                 f"FAILED TEST:\n{failure_lines}\n\n"
                 f"{crash_hint}"
+                f"{verify_section}"
                 f"{debug_section}"
                 f"{prev_diff_section}"
                 f"{pivot_hint}"
@@ -584,6 +613,9 @@ def build_test_failure_note(
             f"```\n{debug_trace}\n```\n\n"
         )
 
+    if step_verification:
+        note += f"\n{step_verification}\n\n"
+
     if previous_diff:
         note += (
             "PREVIOUS FIX THAT DID NOT WORK (do NOT repeat this):\n"
@@ -612,3 +644,275 @@ def build_test_failure_note(
             "Output a SEARCH/REPLACE block."
         )
     return note
+
+
+# ── Step-by-Step Assertion Verifier ──────────────────────────────────────────
+#
+# Unlike debug_trace (which prints values for a human to read), this generates
+# executable assertions that HALT with a clear error message when a specific
+# logical step produces the wrong intermediate value.
+#
+# Flow:
+#   1. LLM decomposes the algorithm into numbered logical steps
+#   2. For each step, LLM generates an assertion with the expected value
+#   3. The assertion harness is compiled and run
+#   4. On failure: returns "STEP 3 FAILED: expected flips1=2, got flips1=5"
+#   5. On success: returns "ALL STEPS VERIFIED" (the function is correct)
+#
+# This gives the edit agent CONCRETE, EXECUTABLE feedback — not guesses.
+
+def _generate_assertion_harness(
+    source: str,
+    ext: str,
+    failing_input: str,
+    expected_output: str,
+    instruction: str,
+    llm: OllamaLLM,
+) -> str:
+    """Generate a test harness with step-by-step assertions for intermediate values."""
+    lang = LANG_FENCE.get(ext, ext.lstrip("."))
+    prompt = (
+        f"You are writing a STEP-BY-STEP VERIFICATION PROGRAM for this {lang} code.\n\n"
+        f"PROBLEM: {instruction}\n\n"
+        f"CODE UNDER TEST:\n```{lang}\n{source}\n```\n\n"
+        f"FAILING TEST:\n  Input: {failing_input}\n  Expected output: {expected_output}\n\n"
+        f"Write a complete, self-contained, runnable {lang} program that:\n\n"
+        f"1. COPIES the function(s) from above EXACTLY — do NOT fix or change the logic\n"
+        f"2. DECOMPOSES the algorithm into logical steps (initialization, each loop phase, etc.)\n"
+        f"3. After each logical step, prints a verification line in this EXACT format:\n"
+        f"   STEP <N> (<description>): <var1>=<val1>, <var2>=<val2> | EXPECTED: <what_correct_value_should_be>\n"
+        f"4. After each step, prints PASS or FAIL:\n"
+        f"   STEP <N>: PASS    (if values match what a correct algorithm would produce)\n"
+        f"   STEP <N>: FAIL    (if values diverge from correct — this is where the bug is)\n"
+        f"5. After ALL steps, prints: RESULT: <actual_return_value>\n"
+        f"6. Has a main entry point that calls the function with input: {failing_input}\n\n"
+        f"CRITICAL RULES:\n"
+        f"- You must MANUALLY compute what the correct intermediate values should be for this specific input\n"
+        f"- Do NOT just check if the function 'runs' — check if EACH STEP produces the RIGHT VALUE\n"
+        f"- Include at least 3-5 verification steps covering: initialization, key loop iterations, final result\n"
+        f"- For loops that run N iterations, check at least iteration 0, a middle iteration, and the last iteration\n"
+        f"- The function logic must be IDENTICAL to the original — do NOT 'fix' it\n\n"
+        f"Language-specific rules:\n"
+        f"- Go: use 'package main' and fmt.Printf for output\n"
+        f"- Python: use print() for output\n"
+        f"- C++: use std::cout for ALL output. Include necessary headers.\n"
+        f"- C: use printf() for output\n\n"
+        f"Output ONLY the complete program — no explanation, no markdown fences."
+    )
+    harness = llm.invoke(prompt).strip()
+    if "```" in harness:
+        harness = strip_markdown(harness)
+    return harness
+
+
+def run_step_verification(
+    source: str,
+    path: str,
+    failing_input: str,
+    expected_output: str,
+    instruction: str,
+    llm: Optional[OllamaLLM] = None,
+) -> Optional[Dict]:
+    """Run step-by-step assertion verification and return structured results.
+
+    Returns:
+        {
+            "steps": [
+                {"step": 1, "description": "...", "values": "...", "expected": "...", "passed": True/False},
+                ...
+            ],
+            "first_failure": {"step": N, "description": "...", "values": "...", "expected": "..."},
+            "all_passed": True/False,
+            "raw_output": "...",
+            "actual_result": "...",
+        }
+        or None on infrastructure failure (compilation error, timeout, etc.)
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if llm is None:
+        llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+
+    try:
+        harness = _generate_assertion_harness(source, ext, failing_input, expected_output, instruction, llm)
+    except Exception as e:
+        logger.warning("[STEP_VERIFY] Harness generation failed: %s", e)
+        return None
+
+    logger.debug("[STEP_VERIFY] Generated assertion harness:\n%s", harness[:1200])
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            if ext == ".go":
+                harness_path = os.path.join(tmpdir, "main.go")
+                cmd = ["go", "run", harness_path]
+            elif ext == ".py":
+                harness_path = os.path.join(tmpdir, "verify.py")
+                cmd = [sys.executable, harness_path]
+            elif ext == ".cpp":
+                harness_path = os.path.join(tmpdir, "verify.cpp")
+                exe_path = os.path.join(tmpdir, "verify.exe" if os.name == "nt" else "verify")
+                compiler, _ = _find_cpp_compiler()
+                if not compiler:
+                    return None
+                compile_cmd = [compiler, "-std=c++17", "-O0", "-g", "-o", exe_path, harness_path]
+                cmd = None
+            elif ext == ".c":
+                harness_path = os.path.join(tmpdir, "verify.c")
+                exe_path = os.path.join(tmpdir, "verify.exe" if os.name == "nt" else "verify")
+                compiler, _ = _find_c_compiler()
+                if not compiler:
+                    return None
+                compile_cmd = [compiler, "-std=c11", "-O0", "-g", "-o", exe_path, harness_path]
+                cmd = None
+            else:
+                return None
+
+            with open(harness_path, "w", encoding="utf-8") as f:
+                f.write(harness)
+
+            if ext in (".cpp", ".c"):
+                compile_result = subprocess.run(
+                    compile_cmd, capture_output=True, text=True, timeout=30, cwd=tmpdir
+                )
+                if compile_result.returncode != 0:
+                    logger.warning("[STEP_VERIFY] Compilation failed: %s", compile_result.stderr[:500])
+                    return None
+                cmd = [exe_path]
+
+            run_result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=15, cwd=tmpdir
+            )
+
+            output = ((run_result.stdout or "") + (run_result.stderr or "")).strip()
+            if not output:
+                return None
+
+            # Truncate excessive output
+            lines = output.split("\n")
+            if len(lines) > 80:
+                output = "\n".join(lines[:40] + ["... (truncated) ..."] + lines[-15:])
+
+            return _parse_step_verification(output)
+
+    except subprocess.TimeoutExpired:
+        logger.warning("[STEP_VERIFY] Execution timed out")
+        return None
+    except Exception as e:
+        logger.warning("[STEP_VERIFY] Failed: %s", e)
+        return None
+
+
+def _parse_step_verification(raw_output: str) -> Dict:
+    """Parse the step verification harness output into structured data."""
+    import re
+
+    steps = []
+    first_failure = None
+    actual_result = None
+
+    for line in raw_output.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+
+        # Parse RESULT line
+        if line.upper().startswith("RESULT:"):
+            actual_result = line[len("RESULT:"):].strip()
+            continue
+
+        # Parse STEP lines: "STEP 3 (description): var=val | EXPECTED: ..."
+        step_match = re.match(
+            r'STEP\s+(\d+)\s*(?:\(([^)]*)\))?\s*:\s*(.*)',
+            line, re.IGNORECASE
+        )
+        if step_match:
+            step_num = int(step_match.group(1))
+            description = step_match.group(2) or ""
+            rest = step_match.group(3).strip()
+
+            # Check for PASS/FAIL verdict
+            if rest.upper() in ("PASS", "FAIL"):
+                # This is a verdict line, update the previous step
+                for s in reversed(steps):
+                    if s["step"] == step_num:
+                        s["passed"] = rest.upper() == "PASS"
+                        if not s["passed"] and first_failure is None:
+                            first_failure = s.copy()
+                        break
+                continue
+
+            # This is a data line with values
+            values = rest
+            expected = ""
+            if "| EXPECTED:" in rest.upper():
+                parts = re.split(r'\|\s*EXPECTED:\s*', rest, flags=re.IGNORECASE)
+                values = parts[0].strip()
+                expected = parts[1].strip() if len(parts) > 1 else ""
+
+            steps.append({
+                "step": step_num,
+                "description": description,
+                "values": values,
+                "expected": expected,
+                "passed": None,  # Will be updated by PASS/FAIL line
+            })
+
+    # If no explicit PASS/FAIL lines, infer from last step
+    for s in steps:
+        if s["passed"] is None:
+            s["passed"] = True  # Assume pass if no verdict (harness didn't crash before it)
+
+    # Try to detect first failure from crash (steps that never got a verdict)
+    if first_failure is None:
+        for s in steps:
+            if not s["passed"]:
+                first_failure = s.copy()
+                break
+
+    return {
+        "steps": steps,
+        "first_failure": first_failure,
+        "all_passed": all(s.get("passed", True) for s in steps) if steps else False,
+        "raw_output": raw_output,
+        "actual_result": actual_result,
+    }
+
+
+def format_step_verification_for_prompt(verification: Dict) -> str:
+    """Format step verification results into a prompt-friendly string."""
+    if not verification or not verification.get("steps"):
+        return ""
+
+    parts = ["STEP-BY-STEP EXECUTION VERIFICATION (ran against your current code):"]
+
+    for s in verification["steps"]:
+        status = "PASS ✓" if s.get("passed", True) else "**FAIL ✗**"
+        desc = f" ({s['description']})" if s.get('description') else ""
+        line = f"  Step {s['step']}{desc}: {s['values']}"
+        if s.get("expected"):
+            line += f"  | Expected: {s['expected']}"
+        line += f"  → {status}"
+        parts.append(line)
+
+    if verification.get("actual_result"):
+        parts.append(f"  Final result: {verification['actual_result']}")
+
+    if verification.get("first_failure"):
+        fail = verification["first_failure"]
+        desc = f" ({fail['description']})" if fail.get('description') else ""
+        parts.append(f"\n>>> BUG LOCATION: Step {fail['step']}{desc}")
+        parts.append(f"    Got: {fail['values']}")
+        if fail.get("expected"):
+            parts.append(f"    Expected: {fail['expected']}")
+        parts.append(
+            "    Fix the code so this specific step produces the expected value. "
+            "Do NOT rewrite the entire algorithm — target ONLY the expression(s) "
+            "that produce the wrong value at this step."
+        )
+    elif verification.get("all_passed"):
+        parts.append(
+            "\nAll steps verified correctly — the intermediate values are right. "
+            "The bug may be in how the final result is assembled or returned."
+        )
+
+    return "\n".join(parts)

@@ -83,6 +83,57 @@ _C_FUNC_PATTERN = re.compile(
     r"(\w+)\s*\("            # function name + opening paren
 )
 
+def detect_source_language(source: str) -> str:
+    """Detect the likely programming language of source code.
+    Returns one of: 'python', 'go', 'cpp', 'c', 'js', 'ts', 'rust', 'unknown'.
+    Used to catch wrong-language generation by the LLM."""
+    lines = source.strip().split('\n')
+    first_lines = '\n'.join(lines[:20])
+
+    # Python indicators
+    py_indicators = sum(1 for _ in re.finditer(
+        r'\bdef\s+\w+\s*\(|^import\s|^from\s.*import\s|if\s+__name__|^\s+return\s|:\s*$',
+        first_lines, re.MULTILINE))
+    # Go indicators
+    go_indicators = sum(1 for _ in re.finditer(
+        r'\bfunc\s+\w+\s*\(|^package\s|:=|fmt\.\w+|^import\s+\(',
+        first_lines, re.MULTILINE))
+    # C/C++ indicators
+    cpp_indicators = sum(1 for _ in re.finditer(
+        r'#include\s|int\s+main\s*\(|std::|void\s+\w+\s*\(|->|cout\s*<<',
+        first_lines, re.MULTILINE))
+    # Rust indicators
+    rust_indicators = sum(1 for _ in re.finditer(
+        r'\bfn\s+\w+|let\s+mut\s|println!\(|use\s+\w+::|impl\s+',
+        first_lines, re.MULTILINE))
+
+    scores = {
+        'python': py_indicators,
+        'go': go_indicators,
+        'cpp': cpp_indicators,
+        'rust': rust_indicators,
+    }
+    best = max(scores, key=scores.get)
+    return best if scores[best] >= 2 else 'unknown'
+
+
+def source_matches_ext(source: str, ext: str) -> bool:
+    """Check if source code language matches the expected file extension.
+    Returns True if they match or if detection is uncertain."""
+    detected = detect_source_language(source)
+    if detected == 'unknown':
+        return True  # uncertain, don't reject
+    ext_to_lang = {
+        '.py': 'python', '.go': 'go',
+        '.cpp': 'cpp', '.c': 'cpp', '.h': 'cpp', '.hpp': 'cpp',
+        '.rs': 'rust',
+    }
+    expected = ext_to_lang.get(ext)
+    if not expected:
+        return True  # unknown ext, don't reject
+    return detected == expected
+
+
 def _find_function_range(lines: list, start_hint: int) -> tuple:
     """Given a start line that's inside/at a function, find (start, end) of that function."""
     # Walk backwards to find the function signature
@@ -375,11 +426,19 @@ def apply_block_to_lines(source_lines, search_text, replace_text):
 
 
 def is_oversized_block(search_text: str, source_lines: list, idx=None, prefix: str = "Block", max_ratio: float = 0.6) -> bool:
-    """Check if a search block is too large (exceeds MAX_BLOCK_RATIO of file)."""
+    """Check if a search block is too large (exceeds MAX_BLOCK_RATIO of file).
+
+    For small files (< 50 lines), the ratio is relaxed to 0.95 because
+    single-function files (e.g. LeetCode problems) legitimately require
+    replacing most of the file content.
+    """
     try:
         search_line_count = len(search_text.strip('\n').split('\n'))
         file_len = len(source_lines)
-        if search_line_count > file_len * max_ratio:
+        # Small files: relax the limit — a 15-line file with one function
+        # can only be edited by replacing most of it.
+        effective_ratio = 0.95 if file_len < 50 else max_ratio
+        if search_line_count > file_len * effective_ratio:
             if idx is not None:
                 logger.warning("%s %s rejected — SEARCH spans %s/%s lines. Skipping.", prefix, idx, search_line_count, file_len)
             else:

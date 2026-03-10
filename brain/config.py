@@ -76,6 +76,13 @@ LANG_CHECK_CMD: dict[str, list[str]] = {
     '.ts':  ['tsc', '--noEmit'],
 }
 
+# Lint commands per extension (deeper analysis beyond basic compilation)
+# These are only used when the binary is found on PATH.
+LANG_LINT_CMD: dict[str, list[str]] = {
+    '.go':  ['go', 'vet'],
+    '.py':  ['ruff', 'check', '--select', 'E,F,W'],
+}
+
 # Query enhancement keywords for RAG search
 LANG_QUERY_ENHANCEMENT: dict[str, str] = {
     '.py': 'Python programming', '.go': 'Go Golang programming',

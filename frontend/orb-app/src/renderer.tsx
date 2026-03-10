@@ -576,7 +576,16 @@ const handleSubmit = async (e: React.FormEvent) => {
       const res = await fetch(`http://localhost:8000${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ instruction: userMsg, file_path: selectedFilePath, task_mode: agentTaskMode, session_id: sid, context_files: contextFiles }),
+        body: JSON.stringify({
+          instruction: userMsg,
+          file_path: selectedFilePath,
+          task_mode: agentTaskMode,
+          session_id: sid,
+          context_files: contextFiles,
+          ...(useMultiAgent && testCases.length > 0 ? {
+            test_cases: testCases.map(tc => ({ input: tc.input, expected: tc.expected })),
+          } : {}),
+        }),
       });
       const data = await res.json();
 
@@ -592,6 +601,16 @@ const handleSubmit = async (e: React.FormEvent) => {
           orchestrateMsgs.push({ role: 'ai', text: `[AGENT DISCUSSION]\n${discussionText}` });
         }
         if (data.diff) orchestrateMsgs.push({ role: 'ai', text: `[DRY RUN PREVIEW]\n\n${data.diff}`, isDiff: true });
+        // Show test results if available (execution-based critique)
+        if (data.test_results?.length > 0) {
+          const passCount = data.test_results.filter((r: any) => r.passed).length;
+          const total = data.test_results.length;
+          const testLines = data.test_results.map((r: any, i: number) =>
+            `  ${r.passed ? '✓' : '✗'} Test ${i + 1}: input=${r.input}  expected=${r.expected}  got=${r.actual || r.error || 'N/A'}`
+          ).join('\n');
+          orchestrateMsgs.push({ role: 'ai', text: `[TEST RESULTS] ${passCount}/${total} passing\n${testLines}` });
+          setTestResults(data.test_results);
+        }
         if (data.explanation) {
           const citationBlock = data.citations?.length > 0
             ? `\n\n Sources:\n${data.citations.map((c: string, i: number) => `  ${i + 1}. ${c}`).join('\n')}`

@@ -22,9 +22,10 @@ from .code_editing_helpers import (
     build_runtime_error_note, build_post_error_note,
     validate_code_structure, build_structural_issue_note,
     count_top_level_functions, extract_error_lines_from_text,
+    source_matches_ext,
     FUNC_PATTERN, _C_FUNC_PATTERN
 )
-from .code_context_builders import build_all_contexts
+from .code_context_builders import build_all_contexts, run_lint_checks
 from .session_memory import SessionMemory
 from .orchestration import plan_task, format_plan_for_prompt, critique_code, build_critic_feedback_note
 
@@ -186,7 +187,9 @@ class CodeAgent:
         rerank_method = self._resolve_rerank_method(instruction, rerank_method)
 
         file_lines = file_source.split('\n')
-        MAX_BLOCK_RATIO = 0.6
+        # For small files (< 50 lines), allow larger SEARCH/REPLACE blocks since
+        # a single-function file (e.g. LeetCode) requires replacing most of itself.
+        MAX_BLOCK_RATIO = 0.95 if len(file_lines) < 50 else 0.6
 
         # --- Instruction clarification: normalize casual/vague language ---
         instruction = self._clarify_instruction(instruction, file_source, ext)
@@ -254,6 +257,12 @@ class CodeAgent:
             extra_syntax += "\n\n" + syntax_error_note
         if runtime_error_note:
             extra_syntax += "\n\n" + runtime_error_note
+
+        # --- Lint checks (deeper static analysis beyond compilation) ---
+        lint_note = run_lint_checks(path, file_source, ext)
+        if lint_note:
+            extra_syntax += "\n\n" + lint_note
+            logger.info("[AGENT] Lint issues found for %s", path)
 
         # extracted repeated `combined_context + extra_syntax` into one variable
         context_block = combined_context + extra_syntax
@@ -626,10 +635,12 @@ class CodeAgent:
         # --- Whole-function rewrite fallback ---
         if new_source == file_source and blocks:
             logger.warning("Verbatim retry also failed — falling back to whole-function rewrite")
+            # Strong language reminder at end of prompt (7B models lose early context)
+            lang_reminder = f"\nREMINDER: Output {lang_name} code ONLY. The file extension is {ext}. Do NOT write Python or any other language.\n"
             if is_implement:
                 rewrite_prompt = (
-                    f"Implement a complete solution for the following task inside the function stub below.\n\n"
                     f"{lang_directive}"
+                    f"Implement a complete solution for the following task inside the function stub below.\n\n"
                     f"TASK: {instruction}\n\n"
                     f"FUNCTION STUB:\n```{lang_fence}\n{verbatim}\n```\n\n"
                     "Rules:\n"
@@ -638,11 +649,12 @@ class CodeAgent:
                     "3. Keep exact indentation of the original.\n"
                     "4. Output ONLY this function — do NOT include other functions from the file.\n"
                     f"{context_block}"
+                    f"{lang_reminder}"
                 )
             else:
                 rewrite_prompt = (
-                    f"Rewrite the following code to apply this change: {instruction}\n\n"
                     f"{lang_directive}"
+                    f"Rewrite the following code to apply this change: {instruction}\n\n"
                     f"CURRENT CODE:\n```{lang_fence}\n{verbatim}\n```\n\n"
                     "Rules:\n"
                     "1. Output ONLY the rewritten code — no explanation, no markdown fence.\n"
@@ -650,35 +662,43 @@ class CodeAgent:
                     "3. Keep exact indentation of the original.\n"
                     "4. Do NOT remove, rewrite, or omit any code outside the targeted function.\n"
                     f"{context_block}"
+                    f"{lang_reminder}"
                 )
             try:
                 rewritten = llm.invoke(rewrite_prompt).strip()
                 rewritten = strip_markdown(rewritten) if "```" in rewritten else rewritten
                 if rewritten.strip():
-                    # Safety check: reject if content is destroyed (rewritten loses >30% of lines on large files)
-                    original_span_lines = file_lines[func_start:func_end]
-                    rewritten_lines = rewritten.strip().split('\n')
-                    line_ratio = len(rewritten_lines) / max(1, len(original_span_lines))
-
-                    # Guard: if the span covers the entire file and has multiple functions,
-                    # the rewrite would destroy unrelated code — refuse and keep original.
-                    is_full_file = func_start == 0 and func_end >= len(file_lines)
-                    func_count = count_top_level_functions(file_lines, ext)
-                    if is_full_file and func_count > 1:
+                    # Language guard: reject if LLM generated the wrong language
+                    if not source_matches_ext(rewritten, ext):
                         logger.warning(
-                            "Whole-function rewrite rejected — span covers the entire file "
-                            "(%d functions detected). Refusing to destroy unrelated code.",
-                            func_count
-                        )
-                    elif line_ratio < 0.70 and len(original_span_lines) > 30:
-                        logger.warning(
-                            "Whole-function rewrite rejected — rewritten has only %.0f%% of original lines "
-                            "(%d vs %d), likely data loss. Refusing to apply.",
-                            line_ratio * 100, len(rewritten_lines), len(original_span_lines)
+                            "Whole-function rewrite rejected — LLM generated wrong language "
+                            "(expected %s). Keeping original.", ext
                         )
                     else:
-                        new_source = whole_function_replace(file_source, rewritten, func_start, func_end)
-                        logger.info("Whole-function rewrite applied (lines %s–%s)", func_start, func_end)
+                        # Safety check: reject if content is destroyed (rewritten loses >30% of lines on large files)
+                        original_span_lines = file_lines[func_start:func_end]
+                        rewritten_lines = rewritten.strip().split('\n')
+                        line_ratio = len(rewritten_lines) / max(1, len(original_span_lines))
+
+                        # Guard: if the span covers the entire file and has multiple functions,
+                        # the rewrite would destroy unrelated code — refuse and keep original.
+                        is_full_file = func_start == 0 and func_end >= len(file_lines)
+                        func_count = count_top_level_functions(file_lines, ext)
+                        if is_full_file and func_count > 1:
+                            logger.warning(
+                                "Whole-function rewrite rejected — span covers the entire file "
+                                "(%d functions detected). Refusing to destroy unrelated code.",
+                                func_count
+                            )
+                        elif line_ratio < 0.70 and len(original_span_lines) > 30:
+                            logger.warning(
+                                "Whole-function rewrite rejected — rewritten has only %.0f%% of original lines "
+                                "(%d vs %d), likely data loss. Refusing to apply.",
+                                line_ratio * 100, len(rewritten_lines), len(original_span_lines)
+                            )
+                        else:
+                            new_source = whole_function_replace(file_source, rewritten, func_start, func_end)
+                            logger.info("Whole-function rewrite applied (lines %s–%s)", func_start, func_end)
                 else:
                     logger.error("Whole-function rewrite returned empty output. Giving up.")
             except Exception as e:
@@ -1027,6 +1047,7 @@ class CodeAgent:
             failed_block += "\n"
 
         prompt = (
+            f"LANGUAGE: You MUST write {lang_name} code. The file is {ext}. Do NOT use any other language.\n\n"
             f"Multiple fix attempts have failed with the same test errors, suggesting the "
             f"current approach has a structural issue that small edits cannot resolve.\n\n"
             f"PROBLEM: {instruction}\n\n"
@@ -1041,6 +1062,7 @@ class CodeAgent:
             f"4. Trace through your solution with the first failing test input to verify it works.\n\n"
             f"Write the COMPLETE rewritten function in {lang_name}.\n"
             f"Output ONLY the function code — no explanation, no markdown fences.\n"
+            f"REMINDER: The output MUST be valid {lang_name} ({ext}) — not Python or any other language.\n"
         )
 
         try:
@@ -1051,6 +1073,11 @@ class CodeAgent:
 
             if not rewritten.strip():
                 logger.warning("[STRATEGY_PIVOT] LLM returned empty output")
+                return None
+
+            # Language guard: reject wrong-language pivots
+            if not source_matches_ext(rewritten, ext):
+                logger.warning("[STRATEGY_PIVOT] LLM generated wrong language (expected %s). Rejecting.", ext)
                 return None
 
             # Apply via whole-function replace
@@ -1085,7 +1112,7 @@ class CodeAgent:
         Returns dict with final_source, test_results, all_passed, attempts, diff,
                explanation, citations.
         """
-        from .test_runner import run_tests, build_test_failure_note, run_debug_trace
+        from .test_runner import run_tests, build_test_failure_note, run_debug_trace, run_step_verification, format_step_verification_for_prompt
 
         llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
         original_source = read_file(path)
@@ -1280,6 +1307,41 @@ class CodeAgent:
                         f"Attempt {attempt}: Runtime crash detected — analyzing crash report."
                     )
 
+            # --- Step-by-step assertion verification ---
+            # Run structured verification to pinpoint EXACTLY which logical step fails.
+            # This gives the edit agent concrete "Step 3 FAILED: got X, expected Y" data
+            # instead of just "wrong output".
+            step_verification_note = ""
+            if failures and not all(r.get("actual") is None for r in failures):
+                # Only run step verification when we have actual (wrong) output, not crashes
+                first_fail = failures[0]
+                if first_fail.get("actual") is not None:
+                    try:
+                        logger.info("[FIX_WITH_TESTS] Running step verification for input=%s...",
+                                    first_fail["input"][:60])
+                        step_result = run_step_verification(
+                            source, path, first_fail["input"], first_fail["expected"],
+                            instruction, llm
+                        )
+                        if step_result and step_result.get("steps"):
+                            step_verification_note = format_step_verification_for_prompt(step_result)
+                            n_pass = sum(1 for s in step_result["steps"] if s.get("passed"))
+                            n_total = len(step_result["steps"])
+                            logger.info("[FIX_WITH_TESTS] Step verification: %d/%d steps pass", n_pass, n_total)
+                            if step_result.get("first_failure"):
+                                fail_step = step_result["first_failure"]
+                                explanation_parts.append(
+                                    f"Attempt {attempt}: Step verification — bug at step {fail_step['step']}"
+                                    f"{' (' + fail_step['description'] + ')' if fail_step.get('description') else ''}"
+                                    f": got {fail_step['values'][:80]}"
+                                )
+                            else:
+                                explanation_parts.append(
+                                    f"Attempt {attempt}: Step verification — {n_pass}/{n_total} steps pass."
+                                )
+                    except Exception as e:
+                        logger.debug("[FIX_WITH_TESTS] Step verification failed: %s", e)
+
             # Build diff from previous attempt to show LLM what already didn't work
             previous_diff = None
             if previous_source and previous_source != source:
@@ -1291,8 +1353,38 @@ class CodeAgent:
                 results, instruction, source=source, llm=llm,
                 attempt=attempt, failed_approaches=failed_approaches,
                 debug_trace=debug_trace, previous_diff=previous_diff,
+                step_verification=step_verification_note,
             )
             augmented_instruction = f"{instruction}\n\n{failure_note}"
+
+            # --- RAG-assisted error resolution ---
+            # Query RAG specifically for the error pattern / algorithm to give
+            # the edit agent relevant reference material (not just generic docs).
+            if attempt >= 1 and failures:
+                try:
+                    first_fail = failures[0]
+                    error_context = first_fail.get("error", "") or ""
+                    actual = first_fail.get("actual", "") or ""
+                    # Build a targeted query from the error + instruction
+                    rag_error_query = f"{instruction[:200]} {error_context[:100]} {actual[:50]}".strip()
+                    from brain.fast_search import fast_topic_search
+                    rag_error_results = fast_topic_search(
+                        rag_error_query,
+                        top_n=3,
+                        rerank_method="keyword",
+                    )
+                    if rag_error_results:
+                        rag_error_text = "\n\n".join(
+                            doc.page_content[:500] for doc in rag_error_results[:2]
+                        )
+                        augmented_instruction += (
+                            f"\n\nREFERENCE (relevant algorithm/pattern from docs):\n"
+                            f"{rag_error_text}\n"
+                        )
+                        logger.info("[FIX_WITH_TESTS] RAG error resolution: injected %d chars of relevant docs",
+                                    len(rag_error_text))
+                except Exception as e:
+                    logger.debug("[FIX_WITH_TESTS] RAG error resolution failed: %s", e)
 
             # Include structural issues in the instruction so LLM can fix them
             if structural_issues:
@@ -1317,7 +1409,18 @@ class CodeAgent:
             )
 
             if isinstance(edit_result, dict) and edit_result.get("changed"):
-                source = edit_result.get("new_source", source)
+                new_source_candidate = edit_result.get("new_source", source)
+                # Language guard: reject if edit_code generated the wrong language
+                if not source_matches_ext(new_source_candidate, ext):
+                    logger.warning(
+                        "[FIX_WITH_TESTS] edit_code generated wrong language (expected %s) — "
+                        "discarding and stopping.", ext
+                    )
+                    explanation_parts.append(
+                        f"Attempt {attempt}: LLM generated wrong language — discarded."
+                    )
+                    break
+                source = new_source_candidate
                 logger.info("[FIX_WITH_TESTS] Code updated on attempt %d, re-running tests...", attempt)
             else:
                 logger.warning("[FIX_WITH_TESTS] LLM made no changes on attempt %d — stopping.", attempt)

@@ -1,5 +1,8 @@
+import os
 import sys
 import subprocess
+import shutil
+import tempfile
 import logging
 from typing import Optional, List, Dict
 from operator import itemgetter
@@ -7,7 +10,7 @@ from operator import itemgetter
 from brain.fast_search import fast_topic_search
 from brain.config import (
     LLM_MODEL, CHROMA_DIR, EMBEDDING_MODEL,
-    LANG_CHECK_CMD, LANG_FENCE, LANG_DOC_KEYWORDS,
+    LANG_CHECK_CMD, LANG_LINT_CMD, LANG_FENCE, LANG_DOC_KEYWORDS,
     LANG_IRRELEVANT_DOC_KEYWORDS, LANG_QUERY_ENHANCEMENT,
     UNIVERSAL_DOC_KEYWORDS, IMPLEMENT_KEYWORDS,
 )
@@ -15,18 +18,80 @@ from .code_editing_helpers import parse_compiler_errors
 
 logger = logging.getLogger("code_agent")
 
+def _go_compile_check(path: str, source: str, file_lines: list) -> str:
+    """Run Go compilation check, handling standalone functions (no package declaration).
+
+    LeetCode-style Go files often have no 'package main' — `go build` rejects them
+    with 'expected package, found func'. We wrap in a temp package to catch REAL
+    compile errors (type mismatches, undefined vars) without the false positive.
+    """
+    from .code_editing_helpers import build_runtime_error_note as build_formatted_note
+
+    stripped = source.lstrip()
+    needs_wrap = not stripped.startswith("package ")
+
+    if not needs_wrap:
+        # Normal Go file — direct compile check
+        try:
+            result = subprocess.run(
+                ["go", "build", path],
+                capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
+            )
+            if result.returncode != 0 and result.stderr:
+                errors = parse_compiler_errors(result.stderr)
+                if errors:
+                    logger.info("Compiler errors detected in %s", path)
+                    return build_formatted_note(errors, file_lines)
+        except Exception as e:
+            logger.debug("Go compile check failed: %s", e)
+        return ""
+
+    # Standalone function — wrap in temp package for compilation
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wrapped = f"package main\n\n{source}\n\nfunc main() {{}}\n"
+            tmp_path = os.path.join(tmpdir, "main.go")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(wrapped)
+
+            result = subprocess.run(
+                ["go", "build", "."],
+                capture_output=True, text=True, timeout=10,
+                cwd=tmpdir, stdin=subprocess.DEVNULL,
+            )
+            if result.returncode != 0 and result.stderr:
+                errors = parse_compiler_errors(result.stderr)
+                # Adjust line numbers (offset by 2 for 'package main\n\n')
+                for e in errors:
+                    e["lineno"] = max(1, e["lineno"] - 2)
+                # Filter out the dummy main() errors
+                errors = [e for e in errors if "main redeclared" not in e.get("msg", "")]
+                if errors:
+                    logger.info("Compiler errors detected in %s (via temp wrap)", path)
+                    return build_formatted_note(errors, file_lines)
+    except Exception as e:
+        logger.debug("Go compile check (wrapped) failed: %s", e)
+
+    return ""
+
+
 def build_runtime_error_notes(
     path: str,
     ext: str,
     is_python: bool,
-    file_lines: list
+    file_lines: list,
+    file_source: str = "",
 ) -> str:
     """
     Build runtime/compiler error notes by running the code/compiler check.
     Returns error note string (empty if no errors).
     """
+    # Go has special handling for standalone functions
+    if ext == ".go":
+        return _go_compile_check(path, file_source or "\n".join(file_lines), file_lines)
+
     runtime_error_note = ""
-    
+
     if is_python:
         cmd = [sys.executable, path]
     else:
@@ -61,6 +126,90 @@ def build_runtime_error_notes(
         logger.debug("Compiler check failed: %s", e)
 
     return runtime_error_note
+
+
+def run_lint_checks(path: str, source: str, ext: str) -> str:
+    """Run language-specific lint checks. Returns a prompt note or empty string.
+
+    This complements the compiler/syntax checks with deeper analysis:
+    - Go: `go vet` checks for suspicious constructs, printf format errors, etc.
+    - Python: `ruff` checks for common mistakes (if installed).
+    """
+    lint_cmd_template = LANG_LINT_CMD.get(ext)
+    if not lint_cmd_template:
+        return ""
+
+    # Check if lint binary is available
+    binary = lint_cmd_template[0]
+    if not shutil.which(binary):
+        return ""
+
+    try:
+        if ext == ".go":
+            # Go vet needs a valid package — wrap standalone functions
+            stripped = source.lstrip()
+            if not stripped.startswith("package "):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    wrapped = f"package main\n\n{source}\n\nfunc main() {{}}\n"
+                    tmp_path = os.path.join(tmpdir, "main.go")
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        f.write(wrapped)
+                    result = subprocess.run(
+                        ["go", "vet", "."],
+                        capture_output=True, text=True, timeout=10,
+                        cwd=tmpdir, stdin=subprocess.DEVNULL,
+                    )
+            else:
+                result = subprocess.run(
+                    ["go", "vet", path],
+                    capture_output=True, text=True, timeout=10,
+                    stdin=subprocess.DEVNULL,
+                )
+        else:
+            # Generic: run lint command on the file
+            result = subprocess.run(
+                lint_cmd_template + [path],
+                capture_output=True, text=True, timeout=10,
+                stdin=subprocess.DEVNULL,
+            )
+
+        stderr_out = (result.stderr or "").strip()
+        stdout_out = (result.stdout or "").strip()
+        lint_output = stderr_out or stdout_out
+
+        if result.returncode != 0 and lint_output:
+            # Filter out noise from the dummy wrapper
+            lines = [l for l in lint_output.split("\n")
+                     if "main redeclared" not in l and l.strip()]
+            if not lines:
+                return ""
+            # Adjust line numbers for Go standalone wrapping
+            if ext == ".go" and not source.lstrip().startswith("package "):
+                adjusted = []
+                for l in lines:
+                    import re as _re
+                    m = _re.match(r"^(.*?):(\d+):(\d+):\s*(.*)$", l)
+                    if m:
+                        lineno = max(1, int(m.group(2)) - 2)
+                        adjusted.append(f"line {lineno}: {m.group(4)}")
+                    else:
+                        adjusted.append(l)
+                lines = adjusted
+
+            lint_text = "\n".join(lines[:10])  # cap at 10 issues
+            logger.info("[LINT] Found %d issue(s) in %s", len(lines), path)
+            return (
+                f"LINT WARNINGS (from static analysis — these are NOT compiler errors, "
+                f"but suspicious patterns that may indicate bugs):\n"
+                f"```\n{lint_text}\n```\n\n"
+                f"Fix any lint issues that relate to the task. Ignore unrelated warnings.\n"
+            )
+    except subprocess.TimeoutExpired:
+        logger.debug("Lint check timed out for %s", path)
+    except Exception as e:
+        logger.debug("Lint check failed for %s: %s", path, e)
+
+    return ""
 
 
 def assess_instruction_clarity(instruction: str, file_source: str) -> int:
@@ -469,7 +618,7 @@ def build_all_contexts(
         file_source: Full source code (used to assess clarity for RAG chunking)
         search_method: "bm25", "semantic", or "both" (default)
     """
-    runtime_error_note = build_runtime_error_notes(path, ext, is_python, file_lines)
+    runtime_error_note = build_runtime_error_notes(path, ext, is_python, file_lines, file_source=file_source)
     
     # Assess instruction clarity and determine optimal RAG chunk limit (unless overridden)
     if max_chunks is None:
