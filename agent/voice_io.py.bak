@@ -18,9 +18,7 @@ import numpy as np
 
 logger = logging.getLogger("voice_io")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LAZY IMPORTS
-# ═══════════════════════════════════════════════════════════════════════════════──
+# ── Lazy imports with dependency checks ──────────────────────────────────────
 
 _whisper_model = None
 _tts_engine = None
@@ -49,9 +47,7 @@ def _get_tts_engine():
     return _tts_engine
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# WAV DECODING
-# ═══════════════════════════════════════════════════════════════════════════════──
+# ── WAV → numpy (no ffmpeg) ─────────────────────────────────────────────────
 
 def _wav_bytes_to_numpy(audio_bytes: bytes) -> np.ndarray:
     #Decode WAV bytes to float32 numpy array at Whisper's expected 16kHz mono.
@@ -85,9 +81,7 @@ def _wav_bytes_to_numpy(audio_bytes: bytes) -> np.ndarray:
     return audio
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CORE FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════──
+# ── Core functions ───────────────────────────────────────────────────────────
 
 def record_audio(duration: float = 5.0, sample_rate: int = 16000) -> bytes:
     """Record audio from default microphone. Returns WAV bytes."""
@@ -157,16 +151,10 @@ def transcribe_file(file_path: str, model_name: str = "base", language: Optional
     return transcribe_audio(audio_bytes, model_name, language)
 
 
-def _truncate_for_speech(text: str, limit: int = 2000) -> str:
-    """Truncate text to *limit* chars, appending an ellipsis if shortened."""
-    if len(text) > limit:
-        return text[:limit] + "... (truncated for speech)"
-    return text
-
-
 def speak_text(text: str, block: bool = True) -> None:
     engine = _get_tts_engine()
-    text = _truncate_for_speech(text)
+    if len(text) > 2000:
+        text = text[:2000] + "... (truncated for speech)"
     engine.say(text)
     if block:
         engine.runAndWait()
@@ -176,16 +164,15 @@ def speak_text(text: str, block: bool = True) -> None:
 def speak_to_file(text: str, output_path: str) -> str:
     """Save spoken text to a WAV file. Returns the file path."""
     engine = _get_tts_engine()
-    text = _truncate_for_speech(text)
+    if len(text) > 2000:
+        text = text[:2000] + "... (truncated for speech)"
     engine.save_to_file(text, output_path)
     engine.runAndWait()
     logger.info("[VOICE] Saved speech to %s", output_path)
     return output_path
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HIGH-LEVEL PIPELINE
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── High-level pipeline ─────────────────────────────────────────────────────
 
 def voice_to_text(duration: float = 5.0, model_name: str = "base") -> str:
     audio = record_audio(duration)

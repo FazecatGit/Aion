@@ -18,8 +18,8 @@ from .code_editing_helpers import (
     collect_syntax_errors, parse_compiler_errors, get_focused_context,
     detect_indent_char, extract_function, apply_block_to_lines,
     is_oversized_block, find_first_mismatch, whole_function_replace,
-    strip_markdown, parse_multiple_blocks, build_syntax_error_note,
-    build_runtime_error_note, build_post_error_note,
+    strip_markdown, parse_multiple_blocks, parse_blocks_with_retry,
+    build_syntax_error_note, build_runtime_error_note, build_post_error_note,
     validate_code_structure, build_structural_issue_note,
     count_top_level_functions, extract_error_lines_from_text,
     source_matches_ext,
@@ -33,6 +33,11 @@ logger = logging.getLogger("code_agent")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODULE HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 # Shared session memory instance (persists across requests within a server lifetime)
 _session_memory: Optional[SessionMemory] = None
 
@@ -42,6 +47,38 @@ def get_session_memory() -> SessionMemory:
     if _session_memory is None:
         _session_memory = SessionMemory()
     return _session_memory
+
+
+def _apply_repair_blocks(
+    blocks: list[tuple[str, str]],
+    source_lines: list[str],
+    prefix: str = "Block",
+) -> list[str]:
+    """Apply a list of SEARCH/REPLACE blocks to *source_lines*, skipping oversized ones.
+
+    Returns the (possibly mutated) source_lines list.
+    """
+    for idx, (search_text, replace_text) in enumerate(blocks):
+        if is_oversized_block(search_text, source_lines, idx + 1, prefix=prefix):
+            continue
+        match_idx, replace_lines, matched_len = apply_block_to_lines(
+            source_lines, search_text, replace_text
+        )
+        if match_idx == -1:
+            logger.warning("%s %s: Unable to locate SEARCH block. Skipping.", prefix, idx + 1)
+            continue
+        logger.debug("Applying %s %s at line %s replacing %s lines", prefix, idx + 1, match_idx, matched_len)
+        source_lines = (
+            source_lines[:match_idx]
+            + replace_lines
+            + source_lines[match_idx + matched_len:]
+        )
+    return source_lines
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CODE AGENT
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 class CodeAgent:
@@ -426,10 +463,7 @@ class CodeAgent:
             return file_source
 
         # --- Parse blocks with auto-retry ---
-        blocks = parse_multiple_blocks(raw_output)
-        if not blocks:
-            raw_output = strip_markdown(raw_output)
-            blocks = parse_multiple_blocks(raw_output)
+        blocks, raw_output = parse_blocks_with_retry(raw_output)
 
         for i, (s, r) in enumerate(blocks):
             logger.debug("Block %s SEARCH:\n%s", i + 1, s)
@@ -454,10 +488,7 @@ class CodeAgent:
                 logger.error("LLM re-invocation failed: %s", e)
                 logger.debug(traceback.format_exc())
                 break
-            blocks = parse_multiple_blocks(raw_output)
-            if not blocks:
-                raw_output = strip_markdown(raw_output)
-                blocks = parse_multiple_blocks(raw_output)
+            blocks, raw_output = parse_blocks_with_retry(raw_output)
             retry_count += 1
 
         if not blocks:
@@ -465,23 +496,7 @@ class CodeAgent:
             return file_source
 
         # --- Apply blocks sequentially ---
-        source_lines = file_lines[:]  # copy pre-computed list instead of re-splitting
-
-        for idx, (search_text, replace_text) in enumerate(blocks):
-            if is_oversized_block(search_text, source_lines, idx + 1, prefix="Block"):
-                continue
-
-            match_start_idx, replace_lines, matched_len = apply_block_to_lines(source_lines, search_text, replace_text)
-            if match_start_idx == -1:
-                logger.error("Block %s: Unable to locate SEARCH block. Skipping.", idx + 1)
-                continue
-
-            logger.debug("Applying block %s at line %s replacing %s lines", idx + 1, match_start_idx, matched_len)
-            source_lines = (
-                source_lines[:match_start_idx]
-                + replace_lines
-                + source_lines[match_start_idx + matched_len:]
-            )
+        source_lines = _apply_repair_blocks(blocks, file_lines[:], prefix="Block")
 
         post_errors = collect_syntax_errors("\n".join(source_lines), path) if is_python else []
 
@@ -500,23 +515,10 @@ class CodeAgent:
             )
             try:
                 raw_output = llm.invoke(reinvoke_prompt).strip()
-                repair_blocks = parse_multiple_blocks(raw_output)
-                if not repair_blocks:
-                    raw_output = strip_markdown(raw_output)
-                    repair_blocks = parse_multiple_blocks(raw_output)
-                for search_text, replace_text in repair_blocks:
-                    if is_oversized_block(search_text, source_lines, None, prefix="Self-repair Block"):
-                        continue
-                    match_start_idx, replace_lines, matched_len = apply_block_to_lines(source_lines, search_text, replace_text)
-                    if match_start_idx != -1:
-                        logger.debug("Applying self-repair block at %s replacing %s lines", match_start_idx, matched_len)
-                        source_lines = (
-                            source_lines[:match_start_idx]
-                            + replace_lines
-                            + source_lines[match_start_idx + matched_len:]
-                        )
-                    else:
-                        logger.warning("Self-repair block could not be located. Skipping.")
+                repair_blocks, raw_output = parse_blocks_with_retry(raw_output)
+                source_lines = _apply_repair_blocks(
+                    repair_blocks, source_lines, prefix="Self-repair Block"
+                )
             except Exception as e:
                 logger.error("Self-repair LLM call failed: %s", e)
                 logger.debug(traceback.format_exc())
@@ -538,24 +540,10 @@ class CodeAgent:
                     "Each SEARCH block must match the CURRENT FILE STATE exactly."
                 )
                 raw_repair = llm.invoke(repair_prompt).strip()
-                repair_blocks = parse_multiple_blocks(raw_repair)
-                if not repair_blocks:
-                    repair_blocks = parse_multiple_blocks(strip_markdown(raw_repair))
-                for search_text, replace_text in repair_blocks:
-                    if is_oversized_block(search_text, source_lines, None, prefix="Structural-repair"):
-                        continue
-                    match_start_idx, replace_lines, matched_len = apply_block_to_lines(
-                        source_lines, search_text, replace_text
-                    )
-                    if match_start_idx != -1:
-                        logger.info("Structural repair block applied at line %s", match_start_idx)
-                        source_lines = (
-                            source_lines[:match_start_idx]
-                            + replace_lines
-                            + source_lines[match_start_idx + matched_len:]
-                        )
-                    else:
-                        logger.warning("Structural repair block could not be located. Skipping.")
+                repair_blocks, _ = parse_blocks_with_retry(raw_repair)
+                source_lines = _apply_repair_blocks(
+                    repair_blocks, source_lines, prefix="Structural-repair"
+                )
                 new_source = "\n".join(source_lines)
             except Exception as e:
                 logger.warning("Structural repair LLM call failed: %s", e)
@@ -606,27 +594,12 @@ class CodeAgent:
 
             try:
                 raw_output = llm.invoke(verbatim_hint).strip()
-                retry_blocks = parse_multiple_blocks(raw_output)
-                if not retry_blocks:
-                    raw_output = strip_markdown(raw_output)
-                    retry_blocks = parse_multiple_blocks(raw_output)
+                retry_blocks, raw_output = parse_blocks_with_retry(raw_output)
                 if retry_blocks:
-                    source_lines = file_lines[:]  # copy pre-computed list
-                    for idx, (search_text, replace_text) in enumerate(retry_blocks):
-                        if is_oversized_block(search_text, source_lines, idx + 1, prefix="Retry Block"):
-                            continue
-                        match_start_idx, replace_lines, matched_len = apply_block_to_lines(
-                            source_lines, search_text, replace_text
-                        )
-                        if match_start_idx == -1:
-                            logger.error("Retry Block %s: Unable to locate SEARCH block. Skipping.", idx + 1)
-                            continue
-                        logger.debug("Applying retry block %s at %s replacing %s lines", idx + 1, match_start_idx, matched_len)
-                        source_lines = (
-                            source_lines[:match_start_idx]
-                            + replace_lines
-                            + source_lines[match_start_idx + matched_len:]
-                        )
+                    source_lines = file_lines[:]
+                    source_lines = _apply_repair_blocks(
+                        retry_blocks, source_lines, prefix="Retry Block"
+                    )
                     new_source = "\n".join(source_lines)
             except Exception as e:
                 logger.error("Verbatim retry LLM invocation failed: %s", e)
@@ -738,22 +711,12 @@ class CodeAgent:
                     )
                     try:
                         raw_output = llm.invoke(targeted_prompt).strip()
-                        targeted_blocks = parse_multiple_blocks(raw_output)
-                        if not targeted_blocks:
-                            targeted_blocks = parse_multiple_blocks(strip_markdown(raw_output))
+                        targeted_blocks, _ = parse_blocks_with_retry(raw_output)
                         if targeted_blocks:
                             source_lines = file_lines[:]
-                            for idx, (search_text, replace_text) in enumerate(targeted_blocks):
-                                match_start_idx, replace_lines, matched_len = apply_block_to_lines(
-                                    source_lines, search_text, replace_text
-                                )
-                                if match_start_idx != -1:
-                                    source_lines = (
-                                        source_lines[:match_start_idx]
-                                        + replace_lines
-                                        + source_lines[match_start_idx + matched_len:]
-                                    )
-                                    logger.info("[AGENT] Targeted line-edit block applied at line %s", match_start_idx)
+                            source_lines = _apply_repair_blocks(
+                                targeted_blocks, source_lines, prefix="Targeted"
+                            )
                             new_source = "\n".join(source_lines)
                     except Exception as e:
                         logger.warning("[AGENT] Targeted line-edit fallback failed: %s", e)
@@ -845,18 +808,10 @@ class CodeAgent:
                     f"FORMAT:\n{FORMAT_BLOCK}"
                 )
                 raw = llm.invoke(correction_prompt).strip()
-                blocks = parse_multiple_blocks(raw)
-                if not blocks:
-                    blocks = parse_multiple_blocks(strip_markdown(raw))
+                blocks, _ = parse_blocks_with_retry(raw)
                 if blocks:
                     lines = new_source.split('\n')
-                    for s_text, r_text in blocks:
-                        m_idx, r_lines, m_len = apply_block_to_lines(lines, s_text, r_text)
-                        if m_idx != -1:
-                            lines = lines[:m_idx] + r_lines + lines[m_idx + m_len:]
-                            logger.info("[AGENT] Self-correction block applied")
-                        else:
-                            logger.warning("[AGENT] Self-correction block could not be located.")
+                    lines = _apply_repair_blocks(blocks, lines, prefix="Self-correction")
                     new_source = "\n".join(lines)
                     logger.info("[AGENT] Self-correction complete")
                 else:
@@ -905,16 +860,10 @@ class CodeAgent:
                             "Each SEARCH block must match the CURRENT CODE exactly."
                         )
                         raw_fix = llm.invoke(fix_prompt).strip()
-                        fix_blocks = parse_multiple_blocks(raw_fix)
-                        if not fix_blocks:
-                            fix_blocks = parse_multiple_blocks(strip_markdown(raw_fix))
+                        fix_blocks, _ = parse_blocks_with_retry(raw_fix)
                         if fix_blocks:
                             lines = new_source.split('\n')
-                            for s_text, r_text in fix_blocks:
-                                m_idx, r_lines, m_len = apply_block_to_lines(lines, s_text, r_text)
-                                if m_idx != -1:
-                                    lines = lines[:m_idx] + r_lines + lines[m_idx + m_len:]
-                                    logger.info("[AGENT] Critic fix block applied")
+                            lines = _apply_repair_blocks(fix_blocks, lines, prefix="Critic fix")
                             new_source = "\n".join(lines)
                             diff = show_diff(file_source, new_source)
                     except Exception as e:
@@ -1483,16 +1432,3 @@ class CodeAgent:
             "explanation": explanation,
             "citations": citations,
         }
-
-    def list_db_code(self, limit: int = 20):
-        docs = get_code_documents(limit=limit)
-        return [d["text"] for d in docs]
-
-    def test_file(self, path: str) -> str:
-        return run_python_file(path)
-
-    def run_shell_command(self, command: str) -> str:
-        return run_shell_command(command)
-
-    def list_files(self) -> list[str]:
-        return list_files(self.repo_path)

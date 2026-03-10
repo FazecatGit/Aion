@@ -15,10 +15,8 @@ Graph:
                                     └──(FAIL)──→ discuss → execute (retry)
 """
 
-import difflib
 import logging
 import os
-import re
 from typing import TypedDict, Annotated, List, Dict, Optional
 
 from langgraph.graph import StateGraph, END
@@ -31,9 +29,7 @@ from agent.orchestration import plan_task, format_plan_for_prompt, critique_code
 logger = logging.getLogger("multi_agent")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STATE SCHEMA
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── State schema ─────────────────────────────────────────────────────────────
 
 class AgentState(TypedDict):
     # Inputs
@@ -67,9 +63,7 @@ class AgentState(TypedDict):
     test_results: Optional[List[Dict]]  # [{input, expected, actual, passed, error}]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GRAPH NODES
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── Node functions ───────────────────────────────────────────────────────────
 
 def plan_node(state: AgentState) -> dict:
     """Planner agent: decompose instruction into sub-steps."""
@@ -343,7 +337,7 @@ def critique_node(state: AgentState) -> dict:
         logger.info("[CRITIQUE] %d/%d tests pass \u2014 FAIL", pass_count, total)
         return {"verdict": "FAIL", "critic_feedback": feedback, "test_results": test_results}
 
-    # LLM-based critique (no tests available) 
+    # \u2500\u2500 LLM-based critique (no tests available) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     logger.info("[CRITIQUE] Reviewing code changes...")
 
     try:
@@ -484,9 +478,7 @@ def discuss_node(state: AgentState) -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GRAPH CONSTRUCTION
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── Build the graph ──────────────────────────────────────────────────────────
 
 def build_agent_graph() -> StateGraph:
     """Build and compile the multi-agent LangGraph.
@@ -518,9 +510,7 @@ def build_agent_graph() -> StateGraph:
     return graph.compile()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PUBLIC API
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── Public API ───────────────────────────────────────────────────────────────
 
 # Cached compiled graph — reset on import to pick up graph changes
 _compiled_graph = None
@@ -547,6 +537,8 @@ def _find_related_files(file_path: str, instruction: str) -> List[Dict]:
     Find files that might be related to the current edit.
     Looks for imports, includes, and explicit file mentions in the instruction.
     """
+    import re
+
     related = []
     source = _read_file_safe(file_path)
     base_dir = os.path.dirname(file_path) or "."
@@ -613,6 +605,7 @@ def _edit_context_files(
     session_id: str,
 ) -> List[Dict]:
     """Run CodeAgent on each context file to produce edits informed by the main change."""
+    import difflib
     from agent.code_agent import CodeAgent
 
     edits = []

@@ -41,9 +41,7 @@ class SessionMemory:
         )
         logger.info("[SESSION_MEMORY] Initialized (persist=%s)", persist_dir)
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # WRITE
-    # ═══════════════════════════════════════════════════════════════════════
+    # ── Write ────────────────────────────────────────────────────────────────
 
     def add_turn(
         self,
@@ -87,9 +85,7 @@ class SessionMemory:
             meta["passed_tests"] = str(passed_tests)
         return self.add_turn(session_id, "agent", summary, metadata=meta)
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # READ
-    # ═══════════════════════════════════════════════════════════════════════
+    # ── Read ─────────────────────────────────────────────────────────────────
 
     def recall(
         self,
@@ -119,9 +115,7 @@ class SessionMemory:
         results.sort(key=lambda d: d.metadata.get("timestamp", ""), reverse=True)
         return results[:n]
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # UTILITIES
-    # ═══════════════════════════════════════════════════════════════════════
+    # ── Utilities ────────────────────────────────────────────────────────────
 
     def build_context_block(self, session_id: str, query: str, k: int = 4) -> str:
         """Build a formatted context string from relevant past turns."""

@@ -6,7 +6,6 @@ Critic   — verifies agent output against requirements and RAG docs
 """
 
 import logging
-import re
 from typing import List, Dict, Optional
 
 from langchain_ollama import OllamaLLM
@@ -16,29 +15,7 @@ from brain.config import LLM_MODEL, LANG_FENCE
 logger = logging.getLogger("code_agent")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _parse_bullet_items(lines_iter, line_stripped: str, section_name: str) -> list:
-    """Collect bullet/numbered items from an already-entered section.
-
-    *lines_iter* is an iterator of ``(stripped_line, upper_line)`` pairs.
-    Returns a list of cleaned strings.
-    """
-    items: list[str] = []
-    # Process any text on the header line itself (after the colon)
-    rest = line_stripped.split(":", 1)[1].strip() if ":" in line_stripped else ""
-    if rest and rest.lower() != "none":
-        items.append(re.sub(r'^\d+[.)\]]\s*', '', rest.lstrip("-•* ")).strip())
-    return items
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PLANNER
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ── Planner ──────────────────────────────────────────────────────────────────
 
 def plan_task(
     instruction: str,
@@ -125,7 +102,8 @@ def _parse_plan(raw: str) -> Dict:
         elif upper.startswith("EDGE_CASES:") or upper.startswith("EDGE CASES:"):
             section = "edge_cases"
         elif section == "steps" and line_stripped:
-
+            # Strip leading number/bullet: "1. xxx" → "xxx"
+            import re
             clean = re.sub(r'^\d+[\.\)]\s*', '', line_stripped)
             if clean:
                 steps.append(clean)
@@ -157,10 +135,7 @@ def format_plan_for_prompt(plan: Dict) -> str:
     return "\n".join(parts) + "\n"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CRITIC
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ── Critic ───────────────────────────────────────────────────────────────────
 
 def critique_code(
     instruction: str,

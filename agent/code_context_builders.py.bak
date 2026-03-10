@@ -1,5 +1,4 @@
 import os
-import re
 import sys
 import subprocess
 import shutil
@@ -18,11 +17,6 @@ from brain.config import (
 from .code_editing_helpers import parse_compiler_errors
 
 logger = logging.getLogger("code_agent")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# COMPILER / RUNTIME ERROR DETECTION
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _go_compile_check(path: str, source: str, file_lines: list) -> str:
     """Run Go compilation check, handling standalone functions (no package declaration).
@@ -134,11 +128,6 @@ def build_runtime_error_notes(
     return runtime_error_note
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STATIC ANALYSIS / LINTING
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 def run_lint_checks(path: str, source: str, ext: str) -> str:
     """Run language-specific lint checks. Returns a prompt note or empty string.
 
@@ -198,7 +187,8 @@ def run_lint_checks(path: str, source: str, ext: str) -> str:
             if ext == ".go" and not source.lstrip().startswith("package "):
                 adjusted = []
                 for l in lines:
-                    m = re.match(r"^(.*?):(\d+):(\d+):\s*(.*)$", l)
+                    import re as _re
+                    m = _re.match(r"^(.*?):(\d+):(\d+):\s*(.*)$", l)
                     if m:
                         lineno = max(1, int(m.group(2)) - 2)
                         adjusted.append(f"line {lineno}: {m.group(4)}")
@@ -220,11 +210,6 @@ def run_lint_checks(path: str, source: str, ext: str) -> str:
         logger.debug("Lint check failed for %s: %s", path, e)
 
     return ""
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# INSTRUCTION CLARITY ASSESSMENT
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def assess_instruction_clarity(instruction: str, file_source: str) -> int:
@@ -283,11 +268,6 @@ def assess_instruction_clarity(instruction: str, file_source: str) -> int:
         return 5  # Medium: 3-5 chunks
     else:
         return 7  # Vague: 5-7 chunks
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# RAG RETRIEVAL & CHUNK GRADING
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 # ---------- Language pre-filter (cheap, no LLM) ----------
@@ -481,6 +461,7 @@ def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cro
     enhanced_query = instruction
     ext = ""
     if file_path:
+        import os
         ext = os.path.splitext(file_path)[1].lower()
         if ext in LANG_QUERY_ENHANCEMENT:
             enhanced_query = f"{LANG_QUERY_ENHANCEMENT[ext]} {instruction}"
@@ -574,11 +555,6 @@ def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cro
     return rag_context, citations
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONVERSATION & EDIT HISTORY
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 def build_history_context(session_chat_history: Optional[List[Dict[str, str]]]) -> str:
     """
     Build conversation history context from recent chat messages.
@@ -617,11 +593,6 @@ def build_edit_history(edit_log: dict, path: str) -> str:
         logger.debug(f"Failed to build edit history: {e}")
 
     return edit_history_text
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# COMBINED CONTEXT BUILDER
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def build_all_contexts(

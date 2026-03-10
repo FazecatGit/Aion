@@ -1,63 +1,292 @@
 """
-Helper functions for code editing operations.
-Extracted from code_agent.py to improve readability and maintainability.
+Code Editing Helpers - parsing, matching, and structural validation for code edits.
+
+Provides the low-level machinery that CodeAgent relies on:
+  - Syntax / compiler error collection
+  - SEARCH/REPLACE block parsing and application
+  - Function extraction with call-site expansion
+  - Language detection and extension matching
+  - Structural validation (brace balance, unreachable code, indentation)
+  - Formatted error notes for LLM prompts
 """
 
 import re
 import logging
 import traceback
+from dataclasses import dataclass
 from difflib import SequenceMatcher
+from typing import Optional
 
 from brain.config import BRACE_LANGUAGES
 
 logger = logging.getLogger("code_agent")
 
-# --- Pattern Recognition ---
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS & PATTERNS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Python / Go-style function signature
 FUNC_PATTERN = re.compile(r"\s*(def|class|func)\s+\w+")
 
+# C/C++/Java-style function: type name(...) {
+# Handles: void foo(, int main(, static std::vector<int> bar(, const char* baz(
+_C_FUNC_PATTERN = re.compile(
+    r"^\s*"
+    r"(?:(?:static|inline|virtual|extern|const|volatile|unsigned|signed)\s+)*"
+    r"(?:[\w:*&<>]+\s+)+"
+    r"(\w+)\s*\("
+)
 
-def collect_syntax_errors(source: str, path: str) -> list:
-    """Collect all syntax errors from Python source code."""
-    errors = []
+_C_FAMILY_EXTS = frozenset({
+    '.c', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.java', '.cs', '.js', '.ts',
+})
+
+_LANG_INDICATORS: dict[str, re.Pattern] = {
+    "python": re.compile(
+        r'\bdef\s+\w+\s*\(|^import\s|^from\s.*import\s|if\s+__name__|^\s+return\s|:\s*$',
+        re.MULTILINE,
+    ),
+    "go": re.compile(
+        r'\bfunc\s+\w+\s*\(|^package\s|:=|fmt\.\w+|^import\s+\(',
+        re.MULTILINE,
+    ),
+    "cpp": re.compile(
+        r'#include\s|int\s+main\s*\(|std::|void\s+\w+\s*\(|->|cout\s*<<',
+        re.MULTILINE,
+    ),
+    "rust": re.compile(
+        r'\bfn\s+\w+|let\s+mut\s|println!\(|use\s+\w+::|impl\s+',
+        re.MULTILINE,
+    ),
+}
+
+_EXT_TO_LANG: dict[str, str] = {
+    '.py': 'python', '.go': 'go',
+    '.cpp': 'cpp', '.c': 'cpp', '.h': 'cpp', '.hpp': 'cpp',
+    '.rs': 'rust',
+}
+
+_RETURN_KEYWORDS = frozenset({'return', 'break', 'continue'})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LANGUAGE DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detect_source_language(source: str) -> str:
+    """Detect the likely programming language of *source*.
+
+    Returns one of: 'python', 'go', 'cpp', 'rust', 'unknown'.
+    """
+    first_lines = '\n'.join(source.strip().split('\n')[:20])
+    scores = {
+        lang: sum(1 for _ in pattern.finditer(first_lines))
+        for lang, pattern in _LANG_INDICATORS.items()
+    }
+    best = max(scores, key=scores.get)
+    return best if scores[best] >= 2 else 'unknown'
+
+
+def source_matches_ext(source: str, ext: str) -> bool:
+    """Return True if the detected language matches *ext* (or detection is uncertain)."""
+    detected = detect_source_language(source)
+    if detected == 'unknown':
+        return True
+    expected = _EXT_TO_LANG.get(ext)
+    if not expected:
+        return True
+    return detected == expected
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ERROR COLLECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def collect_syntax_errors(source: str, path: str) -> list[dict]:
+    """Collect all syntax errors from Python source code (up to 10)."""
+    errors: list[dict] = []
     temp = source
     lines = temp.split('\n')
-    seen_lines = set()
+    seen_lines: set[int | None] = set()
+
     for _ in range(10):
         try:
             compile(temp, path, 'exec')
             break
         except SyntaxError as se:
-            se_line = getattr(se, 'lineno', None)
-            if se_line in seen_lines:
+            lineno = getattr(se, 'lineno', None)
+            if lineno in seen_lines:
                 break
-            seen_lines.add(se_line)
+            seen_lines.add(lineno)
             errors.append({
                 'msg': se.msg,
-                'lineno': se_line,
+                'lineno': lineno,
                 'offset': getattr(se, 'offset', None),
-                'text': (getattr(se, 'text', '') or '').strip()
+                'text': (getattr(se, 'text', '') or '').strip(),
             })
-            if se_line and se_line <= len(lines):
-                lines[se_line - 1] = '# SYNTAX_ERROR_PLACEHOLDER'
+            if lineno and lineno <= len(lines):
+                lines[lineno - 1] = '# SYNTAX_ERROR_PLACEHOLDER'
                 temp = '\n'.join(lines)
     return errors
 
 
-def parse_compiler_errors(stderr: str) -> list:
-    """Parse compiler errors from stderr (works for go, rustc, gcc, clang, tsc)."""
-    errors = []
-    for match in re.finditer(r"^(.+?):(\d+):(\d+):\s+(.+)$", stderr, re.MULTILINE):
-        errors.append({
-            'file': match.group(1),
-            'lineno': int(match.group(2)),
-            'col': int(match.group(3)),
-            'msg': match.group(4)
-        })
-    return errors
+def parse_compiler_errors(stderr: str) -> list[dict]:
+    """Parse ``file:line:col: message`` errors from compiler stderr."""
+    return [
+        {'file': m.group(1), 'lineno': int(m.group(2)), 'col': int(m.group(3)), 'msg': m.group(4)}
+        for m in re.finditer(r"^(.+?):(\d+):(\d+):\s+(.+)$", stderr, re.MULTILINE)
+    ]
 
 
-def get_focused_context(source: str, error_lineno: int, window: int = 20) -> tuple:
-    """Extract focused context around error line with numbering."""
+def extract_error_lines_from_text(text: str) -> list[int]:
+    """Extract line numbers mentioned in error messages / user instructions.
+
+    Handles compiler ``file:line:col``, Python traceback ``File "...", line N``,
+    and generic ``line N`` / ``Line N:`` patterns.
+    """
+    lines: set[int] = set()
+    for m in re.finditer(r'[\w./\\]+\.\w+:(\d+):\d+', text):
+        lines.add(int(m.group(1)))
+    for m in re.finditer(r'[Ff]ile\s+"[^"]+",\s*line\s+(\d+)', text):
+        lines.add(int(m.group(1)))
+    for m in re.finditer(r'\b[Ll]ine\s+(\d+)\b', text):
+        lines.add(int(m.group(1)))
+    return sorted(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ERRORNOTE FORMATTING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class _ErrorNoteStyle:
+    """Configuration for how an error note is rendered."""
+    title: str
+    lineno_key: str
+    col_key: str
+    include_raw: bool
+    footer: str
+
+
+_SYNTAX_STYLE = _ErrorNoteStyle(
+    title="SYNTAX_ERRORS_DETECTED (fix ALL of them):",
+    lineno_key="lineno",
+    col_key="offset",
+    include_raw=True,
+    footer=(
+        "Output ONE SEARCH/REPLACE block per error, in order top to bottom.\n"
+        "Each SEARCH block must match the exact broken lines shown above."
+    ),
+)
+
+_RUNTIME_STYLE = _ErrorNoteStyle(
+    title="RUNTIME_ERRORS_DETECTED (fix ALL of them):",
+    lineno_key="lineno",
+    col_key="col",
+    include_raw=True,
+    footer="Output ONE SEARCH/REPLACE block per error, top to bottom.",
+)
+
+_POST_EDIT_STYLE = _ErrorNoteStyle(
+    title="NEWLY INTRODUCED SYNTAX ERRORS (fix these only):",
+    lineno_key="lineno",
+    col_key="offset",
+    include_raw=False,
+    footer="",
+)
+
+
+def _build_error_note(errors: list[dict], file_lines: list[str], style: _ErrorNoteStyle) -> str:
+    """Build a formatted prompt note from a list of error dicts.
+
+    Centralises the logic previously spread across three separate builders.
+    """
+    if not errors:
+        return ""
+
+    parts = [f"{style.title}\n"]
+    for err in errors:
+        lineno = err.get(style.lineno_key, 0)
+        col = err.get(style.col_key, '')
+        start = max(0, lineno - 3)
+        end = min(len(file_lines), lineno + 2)
+        snippet = '\n'.join(f"{start + i + 1}: {l}" for i, l in enumerate(file_lines[start:end]))
+
+        col_str = f", Col {col}" if col else ""
+        parts.append(
+            f"ERROR: {err['msg']} at Line {lineno}{col_str}\n"
+            f"CONTEXT (line numbers are reference only  never copy them into SEARCH/REPLACE):\n"
+            f"```\n{snippet}\n```\n"
+        )
+        if style.include_raw:
+            raw_lines = '\n'.join(file_lines[start:end])
+            parts.append(f"RAW LINES FOR SEARCH (no line numbers):\n```\n{raw_lines}\n```\n")
+        parts.append("")
+
+    if style.footer:
+        parts.append(style.footer)
+    return "\n".join(parts)
+
+
+def build_syntax_error_note(syntax_errors: list, file_lines: list) -> str:
+    """Build a formatted note describing syntax errors."""
+    return _build_error_note(syntax_errors, file_lines, _SYNTAX_STYLE)
+
+
+def build_runtime_error_note(compiler_errors: list, file_lines: list) -> str:
+    """Build a formatted note describing runtime/compiler errors."""
+    return _build_error_note(compiler_errors, file_lines, _RUNTIME_STYLE)
+
+
+def build_post_error_note(post_errors: list, file_lines: list) -> str:
+    """Build a formatted note for syntax errors introduced by LLM edits."""
+    return _build_error_note(post_errors, file_lines, _POST_EDIT_STYLE)
+
+
+#  ═══════════════════════════════════════════════════════════════════════════════
+# TEXT & BLOCK PARSING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def strip_markdown(code: str) -> str:
+    """Remove markdown code fences from LLM output."""
+    try:
+        m = re.search(r"```(?:[a-zA-Z0-9_+\-]*)\s*\n(.*?)\n```", code, re.DOTALL)
+        if m:
+            return m.group(1)
+    except Exception:
+        logger.warning("Failed to strip markdown fences; using raw output")
+    return code
+
+
+def parse_multiple_blocks(text: str) -> list[tuple[str, str]]:
+    """Parse one or more SEARCH/REPLACE blocks from LLM output."""
+    pattern = re.compile(
+        r"<<<<<<<\s*SEARCH\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>>\s*REPLACE",
+        re.DOTALL,
+    )
+    return [(m.group(1), m.group(2)) for m in pattern.finditer(text)]
+
+
+def parse_blocks_with_retry(raw_output: str) -> tuple[list[tuple[str, str]], str]:
+    """Parse SEARCH/REPLACE blocks, stripping markdown on first failure.
+
+    Returns ``(blocks, cleaned_output)`` so callers don't need to repeat
+    the ``if not blocks: strip -> retry`` pattern themselves.
+    """
+    blocks = parse_multiple_blocks(raw_output)
+    if not blocks:
+        raw_output = strip_markdown(raw_output)
+        blocks = parse_multiple_blocks(raw_output)
+    return blocks, raw_output
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INDENTATION & CONTEXT UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_focused_context(source: str, error_lineno: int, window: int = 20) -> tuple[str, str]:
+    """Extract focused context around *error_lineno* with numbered lines."""
     lines = source.split('\n')
     start = max(0, error_lineno - window)
     end = min(len(lines), error_lineno + window)
@@ -74,69 +303,28 @@ def detect_indent_char(source: str) -> str:
     return ' '
 
 
-# Also match C/C++/Java-style function definitions: type name(...) {
-# Handles: void foo(, int main(, static std::vector<int> bar(, const char* baz(
-_C_FUNC_PATTERN = re.compile(
-    r"^\s*"
-    r"(?:(?:static|inline|virtual|extern|const|volatile|unsigned|signed)\s+)*"  # optional qualifiers
-    r"(?:[\w:*&<>]+\s+)+"   # return type tokens (at least one word + space)
-    r"(\w+)\s*\("            # function name + opening paren
-)
-
-def detect_source_language(source: str) -> str:
-    """Detect the likely programming language of source code.
-    Returns one of: 'python', 'go', 'cpp', 'c', 'js', 'ts', 'rust', 'unknown'.
-    Used to catch wrong-language generation by the LLM."""
-    lines = source.strip().split('\n')
-    first_lines = '\n'.join(lines[:20])
-
-    # Python indicators
-    py_indicators = sum(1 for _ in re.finditer(
-        r'\bdef\s+\w+\s*\(|^import\s|^from\s.*import\s|if\s+__name__|^\s+return\s|:\s*$',
-        first_lines, re.MULTILINE))
-    # Go indicators
-    go_indicators = sum(1 for _ in re.finditer(
-        r'\bfunc\s+\w+\s*\(|^package\s|:=|fmt\.\w+|^import\s+\(',
-        first_lines, re.MULTILINE))
-    # C/C++ indicators
-    cpp_indicators = sum(1 for _ in re.finditer(
-        r'#include\s|int\s+main\s*\(|std::|void\s+\w+\s*\(|->|cout\s*<<',
-        first_lines, re.MULTILINE))
-    # Rust indicators
-    rust_indicators = sum(1 for _ in re.finditer(
-        r'\bfn\s+\w+|let\s+mut\s|println!\(|use\s+\w+::|impl\s+',
-        first_lines, re.MULTILINE))
-
-    scores = {
-        'python': py_indicators,
-        'go': go_indicators,
-        'cpp': cpp_indicators,
-        'rust': rust_indicators,
-    }
-    best = max(scores, key=scores.get)
-    return best if scores[best] >= 2 else 'unknown'
+def reindent_block(replace_lines: list[str], file_indent: int, llm_base_indent: int) -> list[str]:
+    """Re-indent a block of replacement lines to match the file indentation."""
+    result: list[str] = []
+    for line in replace_lines:
+        if not line.strip():
+            result.append("")
+        elif llm_base_indent == 0:
+            llm_spaces = len(line) - len(line.lstrip())
+            result.append(' ' * file_indent + ' ' * llm_spaces + line.lstrip())
+        else:
+            delta = file_indent - llm_base_indent
+            current = len(line) - len(line.lstrip())
+            result.append(' ' * max(0, current + delta) + line.lstrip())
+    return result
 
 
-def source_matches_ext(source: str, ext: str) -> bool:
-    """Check if source code language matches the expected file extension.
-    Returns True if they match or if detection is uncertain."""
-    detected = detect_source_language(source)
-    if detected == 'unknown':
-        return True  # uncertain, don't reject
-    ext_to_lang = {
-        '.py': 'python', '.go': 'go',
-        '.cpp': 'cpp', '.c': 'cpp', '.h': 'cpp', '.hpp': 'cpp',
-        '.rs': 'rust',
-    }
-    expected = ext_to_lang.get(ext)
-    if not expected:
-        return True  # unknown ext, don't reject
-    return detected == expected
+# ═══════════════════════════════════════════════════════════════════════════════
+# FUNCTION EXTRACTION & CALL-SITE EXPANSION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-
-def _find_function_range(lines: list, start_hint: int) -> tuple:
-    """Given a start line that's inside/at a function, find (start, end) of that function."""
-    # Walk backwards to find the function signature
+def _find_function_range(lines: list[str], start_hint: int) -> tuple[int, int]:
+    """Walk from *start_hint* to find the (start, end) of the enclosing function."""
     start_idx = start_hint
     while start_idx > 0:
         if FUNC_PATTERN.match(lines[start_idx]) or _C_FUNC_PATTERN.match(lines[start_idx]):
@@ -145,14 +333,12 @@ def _find_function_range(lines: list, start_hint: int) -> tuple:
 
     is_python_style = FUNC_PATTERN.match(lines[start_idx]) if start_idx < len(lines) else False
 
-    indent = (
-        len(lines[start_idx]) - len(lines[start_idx].lstrip())
-        if start_idx < len(lines) and (FUNC_PATTERN.match(lines[start_idx]) or _C_FUNC_PATTERN.match(lines[start_idx]))
-        else 0
-    )
+    indent = 0
+    if start_idx < len(lines) and (FUNC_PATTERN.match(lines[start_idx]) or _C_FUNC_PATTERN.match(lines[start_idx])):
+        indent = len(lines[start_idx]) - len(lines[start_idx].lstrip())
 
+    # -- Indent-based end detection (Python/Ruby) --
     if is_python_style:
-        # Indent-based end detection (Python, Ruby, etc.)
         end_idx = start_idx + 1
         while end_idx < len(lines):
             line = lines[end_idx]
@@ -161,8 +347,7 @@ def _find_function_range(lines: list, start_hint: int) -> tuple:
             end_idx += 1
         return start_idx, end_idx
 
-    # Brace-based end detection (C/C++/Java/Go/JS)
-    end_idx = start_idx + 1
+    # -- Brace-based end detection (C/C++/Java/Go/JS) --
     brace_depth = 0
     seen_open = False
     for i in range(start_idx, len(lines)):
@@ -173,8 +358,7 @@ def _find_function_range(lines: list, start_hint: int) -> tuple:
             elif ch == '}':
                 brace_depth -= 1
         if seen_open and brace_depth <= 0:
-            end_idx = i + 1
-            return start_idx, end_idx
+            return start_idx, i + 1
 
     # Fallback: walk to next top-level function
     end_idx = start_idx + 1
@@ -183,58 +367,54 @@ def _find_function_range(lines: list, start_hint: int) -> tuple:
         if (FUNC_PATTERN.match(line) or _C_FUNC_PATTERN.match(line)) and (len(line) - len(line.lstrip())) <= indent:
             break
         end_idx += 1
-
     return start_idx, end_idx
 
 
-def _find_call_sites(lines: list, func_name: str, func_start: int, func_end: int, context_window: int = 5) -> list:
-    """
-    Find lines outside (func_start, func_end) that call func_name.
-    Returns list of (region_start, region_end) line ranges including surrounding context.
-    """
+def _find_call_sites(
+    lines: list[str], func_name: str, func_start: int, func_end: int, context_window: int = 5,
+) -> list[tuple[int, int]]:
+    """Find line ranges outside the function body that call *func_name*."""
     call_pattern = re.compile(rf'\b{re.escape(func_name)}\s*\(')
-    regions = []
+    regions: list[tuple[int, int]] = []
+
     for i, line in enumerate(lines):
         if func_start <= i < func_end:
-            continue  # skip the function definition itself
+            continue
         if call_pattern.search(line):
-            # Find the enclosing function for this call site
-            enc_start, enc_end = _find_function_range(lines, i)
-            regions.append((enc_start, enc_end))
+            regions.append(_find_function_range(lines, i))
 
-    # Merge strictly overlapping regions (not merely adjacent)
     if not regions:
         return []
     regions.sort()
     merged = [regions[0]]
     for s, e in regions[1:]:
-        if s < merged[-1][1]:  # strict overlap only
+        if s < merged[-1][1]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], e))
         else:
             merged.append((s, e))
     return merged
 
 
-def extract_function(source: str, instruction: str, hint_blocks=None) -> tuple:
-    """Extract the relevant function/class from source based on instruction.
+def extract_function(source: str, instruction: str, hint_blocks=None) -> tuple[str, int, int]:
+    """Extract the relevant function/class from *source* based on *instruction*.
 
-    Now also includes call sites of the target function so the LLM can
-    produce multi-site SEARCH/REPLACE blocks (e.g. fix a function signature
-    AND update its callers).
+    Also includes call sites of the target function so the LLM can produce
+    multi-site SEARCH/REPLACE blocks.
     """
     lines = source.split('\n')
-    target_idx = None
-    func_name = None  # track the matched function name for call-site discovery
+    target_idx: Optional[int] = None
+    func_name: Optional[str] = None
 
+    # -- Hint-based discovery --
     if hint_blocks:
         try:
             first_search = hint_blocks[0][0]
-            for line in first_search.split('\n'):
-                if not line.strip():
+            for search_line in first_search.split('\n'):
+                stripped = search_line.strip()
+                if not stripped:
                     continue
-                pat = line.strip()
                 for i, l in enumerate(lines):
-                    if l.strip() == pat:
+                    if l.strip() == stripped:
                         target_idx = i
                         break
                 if target_idx is not None:
@@ -242,6 +422,7 @@ def extract_function(source: str, instruction: str, hint_blocks=None) -> tuple:
         except Exception:
             target_idx = None
 
+    # -- Instruction-based discovery --
     if target_idx is None:
         m = re.search(
             r"\b([\w_]+)\s+function\b"
@@ -249,30 +430,13 @@ def extract_function(source: str, instruction: str, hint_blocks=None) -> tuple:
             r"|def\s+([\w_]+)\b"
             r"|func\s+([\w_]+)\b"
             r"|\b([\w_]+)\s*\(\)",
-            instruction, re.I
+            instruction, re.I,
         )
         func_name = next((g for g in m.groups() if g), None) if m else None
         if func_name:
-            # Try Python/Go style first
-            for i, l in enumerate(lines):
-                if re.match(rf"\s*(def|func)\s+{re.escape(func_name)}\b", l, re.I):
-                    target_idx = i
-                    break
-            # Try C/C++/Java style: type funcName(...)
-            if target_idx is None:
-                for i, l in enumerate(lines):
-                    cm = _C_FUNC_PATTERN.match(l)
-                    if cm and cm.group(1) == func_name:
-                        target_idx = i
-                        break
-                    # Also match bare name at start like: void funcName(...)
-                    if re.search(rf'\b{re.escape(func_name)}\s*\(', l) and '{' in source[sum(len(lines[j])+1 for j in range(i)):sum(len(lines[j])+1 for j in range(min(i+3, len(lines))))]:
-                        # Verify this looks like a definition, not a call (has a type before it or is at top-level indent)
-                        stripped = l.lstrip()
-                        if not stripped.startswith('if') and not stripped.startswith('while') and not stripped.startswith('for') and not stripped.startswith('return'):
-                            target_idx = i
-                            break
+            target_idx = _locate_function_definition(lines, func_name)
 
+    # -- Determine function range --
     if target_idx is None:
         start_idx = 0
     else:
@@ -290,79 +454,88 @@ def extract_function(source: str, instruction: str, hint_blocks=None) -> tuple:
     if target_idx is None and start_idx == 0:
         return "", 0, len(lines)
 
-    # ── Call-site expansion ───────────────────────────────────────────
-    # If we identified a function name, find its call sites outside the
-    # function body and include them in the snippet so the LLM can
-    # produce multi-site edits (signature + callers).
-    if func_name:
-        call_regions = _find_call_sites(lines, func_name, func_start, func_end)
-    else:
-        call_regions = []
+    # -- Call-site expansion --
+    call_regions = _find_call_sites(lines, func_name, func_start, func_end) if func_name else []
 
-    if call_regions:
-        # Build a composite snippet: function definition + call-site regions
-        # with clear section markers so the LLM knows what it's looking at.
-        # NEVER merge across categories — keep func def and each call site separate.
-        parts = []
+    if not call_regions:
+        return '\n'.join(lines[func_start:func_end]), func_start, func_end
 
-        # 1. Always emit the function definition first
-        parts.append(f"// ── FUNCTION DEFINITION (lines {func_start+1}-{func_end}) ──")
-        parts.append('\n'.join(lines[func_start:func_end]))
+    return _build_composite_snippet(lines, func_name, func_start, func_end, call_regions)
+
+
+def _locate_function_definition(lines: list[str], func_name: str) -> Optional[int]:
+    """Find the line index of a function *definition* by name."""
+    # Python/Go style
+    for i, l in enumerate(lines):
+        if re.match(rf"\s*(def|func)\s+{re.escape(func_name)}\b", l, re.I):
+            return i
+    # C/C++/Java style
+    for i, l in enumerate(lines):
+        cm = _C_FUNC_PATTERN.match(l)
+        if cm and cm.group(1) == func_name:
+            return i
+        if re.search(rf'\b{re.escape(func_name)}\s*\(', l) and _looks_like_definition(l):
+            return i
+    return None
+
+
+def _looks_like_definition(line: str) -> bool:
+    """Heuristic: a line that contains ``name(`` is a definition (not a call)."""
+    stripped = line.lstrip()
+    return not any(stripped.startswith(kw) for kw in ('if', 'while', 'for', 'return'))
+
+
+def _build_composite_snippet(
+    lines: list[str],
+    func_name: str,
+    func_start: int,
+    func_end: int,
+    call_regions: list[tuple[int, int]],
+) -> tuple[str, int, int]:
+    """Build a composite snippet containing the function definition + its call sites."""
+    parts = [
+        f"// -- FUNCTION DEFINITION (lines {func_start + 1}-{func_end}) --",
+        '\n'.join(lines[func_start:func_end]),
+        "",
+    ]
+    emitted = 0
+    for cs, ce in call_regions:
+        if cs >= func_start and ce <= func_end:
+            continue
+        if cs < func_end and ce > func_end:
+            cs = func_end
+        parts.append(f"// -- CALL SITE (lines {cs + 1}-{ce}) --")
+        parts.append('\n'.join(lines[cs:ce]))
         parts.append("")
+        emitted += 1
 
-        # 2. Emit each call-site region, skipping any that overlap with func def
-        emitted_call_sites = 0
-        for cs, ce in call_regions:
-            # Skip if fully contained within function definition
-            if cs >= func_start and ce <= func_end:
-                continue
-            # Trim overlap with function definition
-            if cs < func_end and ce > func_end:
-                cs = func_end
-            parts.append(f"// ── CALL SITE (lines {cs+1}-{ce}) ──")
-            parts.append('\n'.join(lines[cs:ce]))
-            parts.append("")
-            emitted_call_sites += 1
+    if emitted == 0:
+        return '\n'.join(lines[func_start:func_end]), func_start, func_end
 
-        if emitted_call_sites == 0:
-            # All call sites were inside the function itself — no expansion needed
-            return '\n'.join(lines[func_start:func_end]), func_start, func_end
-
-        composite = '\n'.join(parts)
-        overall_start = func_start
-        overall_end = max(func_end, max(ce for _, ce in call_regions))
-        logger.info("[EXTRACT] Expanded snippet: function '%s' (%d-%d) + %d call-site region(s)",
-                    func_name, func_start+1, func_end, emitted_call_sites)
-        return composite, overall_start, overall_end
-
-    return '\n'.join(lines[func_start:func_end]), func_start, func_end
+    logger.info(
+        "[EXTRACT] Expanded snippet: function '%s' (%d-%d) + %d call-site region(s)",
+        func_name, func_start + 1, func_end, emitted,
+    )
+    overall_end = max(func_end, max(ce for _, ce in call_regions))
+    return '\n'.join(parts), func_start, overall_end
 
 
-def reindent_block(replace_lines: list, file_indent: int, llm_base_indent: int) -> list:
-    """Reindent a block of code to match file indentation."""
-    result = []
-    for line in replace_lines:
-        if not line.strip():
-            result.append("")
-        elif llm_base_indent == 0:
-            llm_spaces = len(line) - len(line.lstrip())
-            result.append(' ' * file_indent + ' ' * llm_spaces + line.lstrip())
-        else:
-            delta = file_indent - llm_base_indent
-            current = len(line) - len(line.lstrip())
-            new_indent = max(0, current + delta)
-            result.append(' ' * new_indent + line.lstrip())
-    return result
+# ═══════════════════════════════════════════════════════════════════════════════
+# BLOCK APPLICATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
+def apply_block_to_lines(
+    source_lines: list[str], search_text: str, replace_text: str,
+) -> tuple[int, list[str] | None, int]:
+    """Match and replace a SEARCH block within *source_lines*.
 
-def apply_block_to_lines(source_lines, search_text, replace_text):
-    """Match and replace a code block within source lines."""
-    search_lines = search_text.split('\n')
-    while search_lines and not search_lines[0].strip():
-        search_lines.pop(0)
-    while search_lines and not search_lines[-1].strip():
-        search_lines.pop()
-
+    Tries four strategies in order:
+      1. Exact match (trailing-whitespace normalised)
+      2. Whitespace-insensitive match
+      3. Anchor + sliding-window tolerant match
+      4. Fuzzy difflib fallback
+    """
+    search_lines = _strip_blank_edges(search_text.split('\n'))
     replace_lines = replace_text.strip('\n').split('\n')
     n = len(search_lines)
     if n == 0:
@@ -370,47 +543,77 @@ def apply_block_to_lines(source_lines, search_text, replace_text):
 
     indent_char = detect_indent_char('\n'.join(source_lines))
 
-    def get_replace(match_idx):
+    def _get_replace(match_idx: int) -> list[str]:
         if indent_char == '\t':
             return replace_lines
         file_indent = len(source_lines[match_idx]) - len(source_lines[match_idx].lstrip())
         first_non_empty = next((l for l in replace_lines if l.strip()), "")
-        llm_base_indent = len(first_non_empty) - len(first_non_empty.lstrip()) if first_non_empty else 0
-        return reindent_block(replace_lines, file_indent, llm_base_indent)
+        llm_base = len(first_non_empty) - len(first_non_empty.lstrip()) if first_non_empty else 0
+        return reindent_block(replace_lines, file_indent, llm_base)
 
-    # 1. Exact match (trailing whitespace normalized)
+    # Strategy 1 -- exact (trailing whitespace normalised)
     for i in range(len(source_lines) - n + 1):
-        if all(source_lines[i+j].rstrip() == search_lines[j].rstrip() for j in range(n)):
-            return i, get_replace(i), n
+        if all(source_lines[i + j].rstrip() == search_lines[j].rstrip() for j in range(n)):
+            return i, _get_replace(i), n
 
-    # 2. Whitespace-insensitive match
+    # Strategy 2 -- whitespace-insensitive
     for i in range(len(source_lines) - n + 1):
-        if all(source_lines[i+j].strip() == search_lines[j].strip() for j in range(n)):
-            return i, get_replace(i), n
+        if all(source_lines[i + j].strip() == search_lines[j].strip() for j in range(n)):
+            return i, _get_replace(i), n
 
-    # 3. Anchor + sliding window tolerant match
+    # Strategy 3 -- anchor + sliding window
+    result = _anchor_match(source_lines, search_lines, n, _get_replace)
+    if result[0] != -1:
+        return result
+
+    # Strategy 4 -- fuzzy difflib
+    return _fuzzy_match(source_lines, search_lines, n, _get_replace)
+
+
+def _strip_blank_edges(lines: list[str]) -> list[str]:
+    """Strip leading and trailing blank lines."""
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines
+
+
+def _anchor_match(
+    source_lines: list[str],
+    search_lines: list[str],
+    n: int,
+    get_replace,
+) -> tuple[int, list[str] | None, int]:
+    """Find the best anchor-based match."""
     anchors = [s.strip() for s in search_lines if s.strip()]
-    if anchors:
-        first_anchor = anchors[0]
-        best_idx, best_score = -1, 0
-        for i, line in enumerate(source_lines):
-            if line.strip() == first_anchor:
-                score = sum(
-                    1 for j in range(min(n, len(source_lines) - i))
-                    if source_lines[i+j].strip() == search_lines[j].strip()
-                )
-                if score > best_score:
-                    best_score, best_idx = score, i
-        if best_score >= max(2, n // 2):
-            matched = 0
-            for j in range(min(n, len(source_lines) - best_idx)):
-                if source_lines[best_idx + j].strip() == search_lines[j].strip():
-                    matched += 1
-                else:
-                    break
-            return best_idx, get_replace(best_idx), n
+    if not anchors:
+        return -1, None, 0
 
-    # 4. Fuzzy difflib fallback
+    first_anchor = anchors[0]
+    best_idx, best_score = -1, 0
+    for i, line in enumerate(source_lines):
+        if line.strip() != first_anchor:
+            continue
+        score = sum(
+            1 for j in range(min(n, len(source_lines) - i))
+            if source_lines[i + j].strip() == search_lines[j].strip()
+        )
+        if score > best_score:
+            best_score, best_idx = score, i
+
+    if best_score >= max(2, n // 2):
+        return best_idx, get_replace(best_idx), n
+    return -1, None, 0
+
+
+def _fuzzy_match(
+    source_lines: list[str],
+    search_lines: list[str],
+    n: int,
+    get_replace,
+) -> tuple[int, list[str] | None, int]:
+    """Fuzzy difflib-based match as last resort."""
     try:
         source_str = '\n'.join(source_lines)
         search_str = '\n'.join(s.rstrip() for s in search_lines)
@@ -421,36 +624,36 @@ def apply_block_to_lines(source_lines, search_text, replace_text):
             return start_line, get_replace(start_line), n
     except Exception:
         logger.debug("Fuzzy matching failed: %s", traceback.format_exc())
-
     return -1, None, 0
 
 
-def is_oversized_block(search_text: str, source_lines: list, idx=None, prefix: str = "Block", max_ratio: float = 0.6) -> bool:
-    """Check if a search block is too large (exceeds MAX_BLOCK_RATIO of file).
+def is_oversized_block(
+    search_text: str,
+    source_lines: list[str],
+    idx: int | None = None,
+    prefix: str = "Block",
+    max_ratio: float = 0.6,
+) -> bool:
+    """Return True if a SEARCH block is too large relative to the file.
 
-    For small files (< 50 lines), the ratio is relaxed to 0.95 because
-    single-function files (e.g. LeetCode problems) legitimately require
-    replacing most of the file content.
+    For small files (< 50 lines) the ratio is relaxed to 0.95 because
+    single-function files legitimately require replacing most of the content.
     """
     try:
         search_line_count = len(search_text.strip('\n').split('\n'))
         file_len = len(source_lines)
-        # Small files: relax the limit — a 15-line file with one function
-        # can only be edited by replacing most of it.
         effective_ratio = 0.95 if file_len < 50 else max_ratio
         if search_line_count > file_len * effective_ratio:
-            if idx is not None:
-                logger.warning("%s %s rejected — SEARCH spans %s/%s lines. Skipping.", prefix, idx, search_line_count, file_len)
-            else:
-                logger.warning("%s rejected — SEARCH spans %s/%s lines. Skipping.", prefix, search_line_count, file_len)
+            tag = f"{prefix} {idx}" if idx is not None else prefix
+            logger.warning("%s rejected -- SEARCH spans %s/%s lines. Skipping.", tag, search_line_count, file_len)
             return True
     except Exception:
         logger.debug("Oversize check failed: %s", traceback.format_exc())
     return False
 
 
-def find_first_mismatch(source_lines: list, search_lines: list) -> tuple:
-    """Find the first line in search_lines that doesn't exist in source_lines."""
+def find_first_mismatch(source_lines: list[str], search_lines: list[str]) -> tuple[int, str | None]:
+    """Find the first line in *search_lines* that has no verbatim match in *source_lines*."""
     for j, sl in enumerate(search_lines):
         if sl.strip() and not any(sl.strip() == src.strip() for src in source_lines):
             return j, sl
@@ -458,169 +661,47 @@ def find_first_mismatch(source_lines: list, search_lines: list) -> tuple:
 
 
 def whole_function_replace(source: str, func_text: str, start_idx: int, end_idx: int) -> str:
-    """Replace a function in the source, keeping everything before and after."""
+    """Replace lines ``[start_idx:end_idx]`` in *source* with *func_text*."""
     source_lines = source.split('\n')
-    new_func_lines = func_text.strip('\n').split('\n')
-    return '\n'.join(source_lines[:start_idx] + new_func_lines + source_lines[end_idx:])
+    return '\n'.join(source_lines[:start_idx] + func_text.strip('\n').split('\n') + source_lines[end_idx:])
 
 
-def strip_markdown(code: str) -> str:
-    """Remove markdown code fences from output."""
-    try:
-        m = re.search(r"```(?:[a-zA-Z0-9_+\-]*)\s*\n(.*?)\n```", code, re.DOTALL)
-        if m:
-            return m.group(1)
-    except Exception:
-        logger.warning("Failed to strip markdown fences; using raw output")
-    return code
+# ═══════════════════════════════════════════════════════════════════════════════
+# FUNCTION COUNTING
+# ═══════════════════════════════════════════════════════════════════════════════
 
-
-def parse_multiple_blocks(text: str) -> list:
-    """Parse one or more SEARCH/REPLACE blocks from LLM output."""
-    pattern = re.compile(
-        r"<<<<<<<\s*SEARCH\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>>\s*REPLACE",
-        re.DOTALL
-    )
-    return [(m.group(1), m.group(2)) for m in pattern.finditer(text)]
-
-
-def count_top_level_functions(file_lines: list, ext: str = "") -> int:
-    """Count top-level function definitions, excluding class declarations in C-family languages.
-
-    For C/C++/Java/Go files, 'class' keyword should not count as a function.
-    Only counts actual function definitions (def/func for Python/Go, type+name( for C-family).
-    Also skips methods that are indented inside a class body — only counts truly top-level.
-    """
-    c_family_exts = {'.c', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.java', '.cs', '.js', '.ts'}
-    is_c_family = ext.lower() in c_family_exts
-
+def count_top_level_functions(file_lines: list[str], ext: str = "") -> int:
+    """Count top-level function definitions (excludes class declarations in C-family)."""
+    is_c_family = ext.lower() in _C_FAMILY_EXTS
     count = 0
+
     for line in file_lines:
         stripped = line.lstrip()
         indent = len(line) - len(stripped)
-
-        # Skip blank lines
         if not stripped:
             continue
-
-        # For C-family: only count top-level functions (indent <= 4 to allow some namespace indentation)
-        # and skip 'class' keyword
         if is_c_family:
             if stripped.startswith('class '):
-                continue  # class declarations are not functions
+                continue
             if _C_FUNC_PATTERN.match(line) and indent <= 4:
                 count += 1
         else:
-            # Python/Go/Ruby: use FUNC_PATTERN but only at top-level (indent 0)
             if FUNC_PATTERN.match(line) and indent == 0:
                 count += 1
-
     return count
 
 
-def extract_error_lines_from_text(text: str) -> list:
-    """Extract line numbers from error messages in user instructions.
-
-    Handles common error report formats:
-      - AddressSanitizer: 'solution.cpp:33:43'
-      - GCC/Clang: 'file.cpp:10:5: error:'
-      - Python traceback: 'File "foo.py", line 42'
-      - Generic: 'line 33', 'Line 33:', 'at line 33'
-      - User shorthand: 'Line 33:'
-    """
-    lines = set()
-
-    # Standard compiler format: file:line:col
-    for m in re.finditer(r'[\w./\\]+\.\w+:(\d+):\d+', text):
-        lines.add(int(m.group(1)))
-
-    # Python traceback: File "...", line N
-    for m in re.finditer(r'[Ff]ile\s+"[^"]+",\s*line\s+(\d+)', text):
-        lines.add(int(m.group(1)))
-
-    # Generic "line N" patterns
-    for m in re.finditer(r'\b[Ll]ine\s+(\d+)\b', text):
-        lines.add(int(m.group(1)))
-
-    return sorted(lines)
-
-
-def build_syntax_error_note(syntax_errors: list, file_lines: list) -> str:
-    """Build a formatted note describing syntax errors."""
-    if not syntax_errors:
-        return ""
-    
-    note = "SYNTAX_ERRORS_DETECTED (fix ALL of them):\n\n"
-    for err in syntax_errors:
-        se_line = err['lineno']
-        start = max(0, se_line - 3)
-        end = min(len(file_lines), se_line + 2)
-        snippet = '\n'.join(f"{start+i+1}: {l}" for i, l in enumerate(file_lines[start:end]))
-        note += (
-            f"ERROR: {err['msg']} at Line {se_line}, Col {err['offset']}\n"
-            f"CONTEXT (line numbers are reference only — never copy them into SEARCH/REPLACE):\n"
-            f"```\n{snippet}\n```\n"
-            f"RAW LINES FOR SEARCH (no line numbers):\n"
-            f"```\n{chr(10).join(file_lines[start:end])}\n```\n\n"
-        )
-    note += (
-        "Output ONE SEARCH/REPLACE block per error, in order top to bottom.\n"
-        "Each SEARCH block must match the exact broken lines shown above."
-    )
-    return note
-
-
-def build_runtime_error_note(compiler_errors: list, file_lines: list) -> str:
-    """Build a formatted note describing runtime/compiler errors."""
-    if not compiler_errors:
-        return ""
-    
-    note = "RUNTIME_ERRORS_DETECTED (fix ALL of them):\n\n"
-    for err in compiler_errors:
-        lineno = err['lineno']
-        start = max(0, lineno - 3)
-        end = min(len(file_lines), lineno + 2)
-        snippet = '\n'.join(
-            f"{start+i+1}: {l}"
-            for i, l in enumerate(file_lines[start:end])
-        )
-        note += (
-            f"ERROR: {err['msg']} at Line {lineno}, Col {err['col']}\n"
-            f"CONTEXT (line numbers are reference only — never copy them into SEARCH/REPLACE):\n"
-            f"```\n{snippet}\n```\n"
-            f"RAW LINES FOR SEARCH (no line numbers):\n"
-            f"```\n{chr(10).join(file_lines[start:end])}\n```\n\n"
-        )
-    note += "Output ONE SEARCH/REPLACE block per error, top to bottom."
-    return note
-
-
-def build_post_error_note(post_errors: list, file_lines: list) -> str:
-    """Build a formatted note for syntax errors introduced by LLM edits."""
-    if not post_errors:
-        return ""
-    
-    note = "NEWLY INTRODUCED SYNTAX ERRORS (fix these only):\n\n"
-    for err in post_errors:
-        se_line = err['lineno']
-        start = max(0, se_line - 3)
-        end = min(len(file_lines), se_line + 2)
-        snippet = '\n'.join(f"{start+i+1}: {l}" for i, l in enumerate(file_lines[start:end]))
-        note += (
-            f"ERROR: {err['msg']} at Line {se_line}, Col {err['offset']}\n"
-            f"EXACT BROKEN SNIPPET:\n```\n{snippet}\n```\n\n"
-        )
-    return note
-
-
-# --- Structural Validation (all languages) ---
+# ═══════════════════════════════════════════════════════════════════════════════
+# STRUCTURAL VALIDATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _strip_string_literals(line: str) -> str:
-    """Remove string/char literals from a line to avoid false positives in brace counting."""
-    result = []
+    """Remove string/char literals from a line to avoid false-positives in brace counting."""
+    result: list[str] = []
     in_string = False
-    string_char = None
+    string_char: str | None = None
     escaped = False
+
     for ch in line:
         if escaped:
             escaped = False
@@ -642,69 +723,77 @@ def _strip_string_literals(line: str) -> str:
     return ''.join(result)
 
 
-def validate_code_structure(source: str, ext: str) -> list:
-    """Validate structural integrity of code: brace balance, unreachable code, indentation.
+def validate_code_structure(source: str, ext: str) -> list[dict]:
+    """Validate structural integrity: brace balance, unreachable code, indentation.
 
-    Works for all brace-based languages (Go, C, C++, Rust, JS, TS, Java, etc.).
-    Returns list of issue dicts: {'type', 'msg', 'lineno', 'severity'}.
+    Returns list of ``{'type', 'msg', 'lineno', 'severity'}`` dicts.
     """
-    issues = []
     lines = source.split('\n')
+    issues: list[dict] = []
+    issues.extend(_check_brace_balance(lines, ext))
+    issues.extend(_check_unreachable_code(lines))
+    issues.extend(_check_mixed_indentation(lines))
+    return issues
 
-    # --- 1. Brace balance ---
-    if ext in BRACE_LANGUAGES:
-        brace_stack = []  # stores (line_number, char) for each opening brace
-        for i, line in enumerate(lines):
-            stripped = _strip_string_literals(line)
-            # Remove single-line comments
-            comment_idx = stripped.find('//')
-            if comment_idx != -1:
-                stripped = stripped[:comment_idx]
-            for ch in stripped:
-                if ch == '{':
-                    brace_stack.append(i + 1)
-                elif ch == '}':
-                    if brace_stack:
-                        brace_stack.pop()
-                    else:
-                        issues.append({
-                            'type': 'extra_closing_brace',
-                            'msg': f'Extra closing brace at line {i + 1} — no matching opening brace',
-                            'lineno': i + 1,
-                            'severity': 'error',
-                        })
-        for open_line in brace_stack:
-            issues.append({
-                'type': 'unclosed_brace',
-                'msg': f'Unclosed opening brace from line {open_line} — missing closing brace',
-                'lineno': open_line,
-                'severity': 'error',
-            })
 
-    # --- 2. Unreachable code detection ---
-    _RETURN_KW = {'return', 'break', 'continue'}
+def _check_brace_balance(lines: list[str], ext: str) -> list[dict]:
+    """Check for unmatched braces in brace-based languages."""
+    if ext not in BRACE_LANGUAGES:
+        return []
+
+    issues: list[dict] = []
+    brace_stack: list[int] = []
+
+    for i, line in enumerate(lines):
+        stripped = _strip_string_literals(line)
+        comment_idx = stripped.find('//')
+        if comment_idx != -1:
+            stripped = stripped[:comment_idx]
+        for ch in stripped:
+            if ch == '{':
+                brace_stack.append(i + 1)
+            elif ch == '}':
+                if brace_stack:
+                    brace_stack.pop()
+                else:
+                    issues.append({
+                        'type': 'extra_closing_brace',
+                        'msg': f'Extra closing brace at line {i + 1} -- no matching opening brace',
+                        'lineno': i + 1,
+                        'severity': 'error',
+                    })
+
+    for open_line in brace_stack:
+        issues.append({
+            'type': 'unclosed_brace',
+            'msg': f'Unclosed opening brace from line {open_line} -- missing closing brace',
+            'lineno': open_line,
+            'severity': 'error',
+        })
+    return issues
+
+
+def _check_unreachable_code(lines: list[str]) -> list[dict]:
+    """Detect statements immediately following ``return`` / ``break`` / ``continue``."""
+    issues: list[dict] = []
     for i, line in enumerate(lines):
         stripped = line.strip()
         if not stripped:
             continue
         word = stripped.split('(')[0].split(' ')[0]
-        if word not in _RETURN_KW:
+        if word not in _RETURN_KEYWORDS:
             continue
         indent = len(line) - len(line.lstrip())
-        # Look at the next non-empty, non-comment line
         for j in range(i + 1, min(i + 10, len(lines))):
-            next_line = lines[j]
-            next_stripped = next_line.strip()
-            if not next_stripped or next_stripped.startswith('//') or next_stripped.startswith('#'):
+            nxt = lines[j]
+            nxt_stripped = nxt.strip()
+            if not nxt_stripped or nxt_stripped.startswith('//') or nxt_stripped.startswith('#'):
                 continue
-            # Closing brace/bracket at same or lower indent is fine
-            if next_stripped in ('}', ')', ']'):
+            if nxt_stripped in ('}', ')', ']'):
                 break
-            # New function/class definition is fine
-            if FUNC_PATTERN.match(next_line):
+            if FUNC_PATTERN.match(nxt):
                 break
-            next_indent = len(next_line) - len(next_line.lstrip())
-            if next_indent >= indent:
+            if (len(nxt) - len(nxt.lstrip())) >= indent:
                 issues.append({
                     'type': 'unreachable_code',
                     'msg': f'Unreachable code at line {j + 1} (after `{word}` at line {i + 1})',
@@ -712,49 +801,44 @@ def validate_code_structure(source: str, ext: str) -> list:
                     'severity': 'warning',
                 })
             break
+    return issues
 
-    # --- 3. Indentation consistency ---
-    has_tabs = False
-    has_spaces = False
-    for line in lines:
-        if not line or not line.strip():
-            continue
-        if line[0] == '\t':
-            has_tabs = True
-        elif line.startswith('  '):
-            has_spaces = True
+
+def _check_mixed_indentation(lines: list[str]) -> list[dict]:
+    """Flag files that mix tabs and spaces."""
+    has_tabs = any(line and line[0] == '\t' for line in lines if line.strip())
+    has_spaces = any(line.startswith('  ') for line in lines if line.strip())
     if has_tabs and has_spaces:
-        issues.append({
+        return [{
             'type': 'mixed_indentation',
             'msg': 'File mixes tabs and spaces for indentation',
             'lineno': 0,
             'severity': 'warning',
-        })
+        }]
+    return []
 
-    return issues
 
-
-def build_structural_issue_note(issues: list, file_lines: list) -> str:
-    """Build a formatted prompt note describing structural code issues for LLM repair."""
+def build_structural_issue_note(issues: list[dict], file_lines: list[str]) -> str:
+    """Build a formatted prompt note describing structural code issues."""
     if not issues:
         return ""
 
-    note = "STRUCTURAL ISSUES DETECTED (fix ALL of them):\n\n"
+    parts = ["STRUCTURAL ISSUES DETECTED (fix ALL of them):\n"]
     for issue in issues:
         lineno = issue.get('lineno', 0)
         if lineno > 0:
             start = max(0, lineno - 3)
             end = min(len(file_lines), lineno + 2)
-            snippet = '\n'.join(f"{start+i+1}: {l}" for i, l in enumerate(file_lines[start:end]))
-            note += (
+            snippet = '\n'.join(f"{start + i + 1}: {l}" for i, l in enumerate(file_lines[start:end]))
+            parts.append(
                 f"  {issue['type'].upper()}: {issue['msg']}\n"
-                f"  CONTEXT:\n```\n{snippet}\n```\n\n"
+                f"  CONTEXT:\n```\n{snippet}\n```\n"
             )
         else:
-            note += f"  {issue['type'].upper()}: {issue['msg']}\n\n"
+            parts.append(f"  {issue['type'].upper()}: {issue['msg']}\n")
 
-    note += (
+    parts.append(
         "Fix each structural issue with a SEARCH/REPLACE block.\n"
         "Common fixes: remove unreachable code after return, add/remove braces to balance, fix indentation.\n"
     )
-    return note
+    return "\n".join(parts)

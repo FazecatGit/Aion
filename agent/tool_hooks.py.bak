@@ -6,7 +6,6 @@ suitable for feeding back into the agent's edit loop.
 """
 
 import os
-import re
 import json
 import logging
 import subprocess
@@ -17,9 +16,7 @@ from typing import Optional
 logger = logging.getLogger("tool_hooks")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _run(cmd: list[str], cwd: str | None = None, timeout: int = 60) -> dict:
     """Run a command and return {stdout, stderr, returncode}."""
@@ -164,24 +161,19 @@ def run_tsc_check(file_path: str) -> dict:
 
 def lint_file(file_path: str, fix: bool = False) -> dict:
     """Auto-detect language and run the appropriate linter."""
-    _LINTER_DISPATCH = {
-        "python":     lambda fp, fx: run_ruff(fp, fix=fx),
-        "go":         lambda fp, fx: run_go_vet(fp),
-        "typescript": lambda fp, fx: run_eslint(fp, fix=fx),
-        "javascript": lambda fp, fx: run_eslint(fp, fix=fx),
-    }
-
     lang = _detect_language(file_path)
-    handler = _LINTER_DISPATCH.get(lang)
-    if handler:
-        return handler(file_path, fix)
-
-    if lang in ("cpp", "c"):
+    if lang == "python":
+        return run_ruff(file_path, fix=fix)
+    elif lang == "go":
+        return run_go_vet(file_path)
+    elif lang in ("typescript", "javascript"):
+        return run_eslint(file_path, fix=fix)
+    elif lang == "cpp" or lang == "c":
+        # Basic: compile with warnings
         compiler = "g++" if lang == "cpp" else "gcc"
         result = _run([compiler, "-fsyntax-only", "-Wall", "-Wextra", file_path])
         issues = [line for line in result["stderr"].splitlines() if line.strip()]
         return {"tool": compiler, "file": file_path, "diagnostics": issues, "count": len(issues)}
-
     return {"tool": "none", "file": file_path, "diagnostics": [], "count": 0, "message": f"No linter for {lang}"}
 
 
@@ -276,6 +268,7 @@ def compare_test_results(current: dict, previous: dict) -> dict:
 
 def parse_structured_logs(log_text: str, max_groups: int = 20) -> dict:
     """Parse structured logs, group repeated errors, and summarize."""
+    import re
     lines = log_text.splitlines()
     error_patterns: dict[str, list[int]] = {}
     errors = []

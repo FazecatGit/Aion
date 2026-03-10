@@ -15,20 +15,17 @@ Strategy for clean output:
 
 """
 
-import base64
-import io
-import logging
 import os
+import io
 import re
+import logging
 import tempfile
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple, List
 
 logger = logging.getLogger("ocr")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LAZY STATE
-# ═══════════════════════════════════════════════════════════════════════════════──
+# ── Lazy state ───────────────────────────────────────────────────────────────
 
 _easyocr_reader = None
 
@@ -45,9 +42,7 @@ def _get_reader(languages: List[str] = None):
     return _easyocr_reader
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# IMAGE PRE-PROCESSING
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── Image pre-processing ────────────────────────────────────────────────────
 
 def preprocess_image(image_bytes: bytes) -> bytes:
     """Pre-process image for better OCR accuracy.
@@ -94,9 +89,7 @@ def preprocess_image(image_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONTENT TYPE DETECTION
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── Content type detection ───────────────────────────────────────────────────
 
 def _classify_content(texts: List[str]) -> str:
     """Classify what the image contains based on OCR text.
@@ -142,9 +135,7 @@ def _classify_content(texts: List[str]) -> str:
     return "problem_statement"  # default
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CODE OCR POST-PROCESSING
-# ═══════════════════════════════════════════════════════════════════════════════──
+# ── Code-specific OCR post-processing ────────────────────────────────────────
 
 def _fix_code_ocr_errors(text: str) -> str:
     """Fix common OCR misreads in code.
@@ -248,9 +239,7 @@ def _reconstruct_code_layout(detections: list) -> str:
     return "\n".join(result_lines)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DIAGRAM UNDERSTANDING
-# ═══════════════════════════════════════════════════════════════════════════════──
+# ── Diagram understanding ────────────────────────────────────────────────────
 
 def describe_diagram(image_bytes: bytes) -> str:
     """Use Ollama vision model to describe a diagram/flowchart.
@@ -259,6 +248,7 @@ def describe_diagram(image_bytes: bytes) -> str:
     """
     from langchain_ollama import OllamaLLM
     from brain.config import LLM_MODEL
+    import base64
 
     b64 = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -282,9 +272,7 @@ def describe_diagram(image_bytes: bytes) -> str:
         return ""
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PUBLIC API
-# ═══════════════════════════════════════════════════════════════════════════════──
+# ── Public API ───────────────────────────────────────────────────────────────
 
 def extract_text_from_image(
     image_bytes: bytes,
@@ -367,9 +355,7 @@ def extract_text_from_file(image_path: str, mode: str = "auto") -> dict:
         return extract_text_from_image(f.read(), mode)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# IMAGE-AS-CONTEXT FOR LLM REASONING
-# ═══════════════════════════════════════════════════════════════════════════════──
+# ── Image-as-context for LLM reasoning ──────────────────────────────────────
 
 def analyze_image_with_context(
     image_bytes: bytes,
@@ -390,6 +376,7 @@ def analyze_image_with_context(
             "confidence": float,
         }
     """
+    import base64
     from langchain_ollama import OllamaLLM
     from brain.config import LLM_MODEL
 
