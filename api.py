@@ -31,6 +31,27 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+
+@app.get("/health")
+async def health_check():
+    """Check if the backend is up and the LLM (Ollama) is reachable."""
+    from brain.config import LLM_MODEL
+    import httpx
+    llm_ok = False
+    llm_model = LLM_MODEL
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get("http://localhost:11434/api/tags")
+            if resp.status_code == 200:
+                data = resp.json()
+                available = [m.get("name", "") for m in data.get("models", [])]
+                # Check if our configured model is available (handle tag suffixes)
+                llm_ok = any(LLM_MODEL in name for name in available)
+    except Exception:
+        pass
+    return {"status": "ok", "llm_connected": llm_ok, "llm_model": llm_model}
+
+
 class QueryRequest(BaseModel):
     question: str
     verbose: bool = False

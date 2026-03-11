@@ -200,7 +200,88 @@ Make the lesson practical and concrete. Use {language}-specific syntax and idiom
                 "example_explanation": "",
             "key_terms": [],
         }
+    # Sanitize lesson fields — unwrap any JSON strings
+    if isinstance(lesson.get("explanation"), str):
+        lesson["explanation"] = _try_unwrap_json_string(lesson["explanation"])
     return lesson
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROBLEM SANITISATION — prevent JSON slop from reaching the frontend
+# ═══════════════════════════════════════════════════════════════════════════════────
+
+def _try_unwrap_json_string(value: str) -> str:
+    """If a string value is itself a JSON object, extract the meaningful text from it."""
+    v = value.strip()
+    if not (v.startswith('{') and v.endswith('}')):
+        return value
+    try:
+        parsed = json.loads(v)
+        if isinstance(parsed, dict):
+            # Try common keys that hold the real text
+            for key in ('question', 'text', 'content', 'explanation', 'code_snippet', 'code'):
+                if key in parsed and isinstance(parsed[key], str):
+                    return parsed[key]
+            # Fall back to joining all string values
+            parts = [str(val) for val in parsed.values() if isinstance(val, str) and len(str(val)) > 10]
+            if parts:
+                return "\n".join(parts)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return value
+
+
+def _sanitize_problem(problem: dict, style: str) -> dict:
+    """Clean up a parsed problem dict so no field contains raw JSON slop."""
+    # Clean question
+    q = problem.get("question", "")
+    if isinstance(q, str):
+        problem["question"] = _try_unwrap_json_string(q)
+
+    # Clean code_snippet
+    cs = problem.get("code_snippet", "")
+    if isinstance(cs, str):
+        problem["code_snippet"] = _try_unwrap_json_string(cs)
+
+    # Clean explanation
+    exp = problem.get("explanation", "")
+    if isinstance(exp, str):
+        problem["explanation"] = _try_unwrap_json_string(exp)
+
+    # Clean options — each must be a plain string like "A) ..."
+    if style == "mcq":
+        raw_opts = problem.get("options", [])
+        if isinstance(raw_opts, list):
+            cleaned_opts = []
+            for i, opt in enumerate(raw_opts):
+                if isinstance(opt, dict):
+                    # LLM returned {label: ..., text: ...} instead of a string
+                    label = chr(65 + i)  # A, B, C, D
+                    text = opt.get("text", opt.get("label", str(opt)))
+                    cleaned_opts.append(f"{label}) {text}")
+                elif isinstance(opt, str):
+                    cleaned_opts.append(opt)
+                else:
+                    cleaned_opts.append(str(opt))
+            problem["options"] = cleaned_opts
+
+    # Clean hints
+    hints = problem.get("hints", [])
+    if isinstance(hints, list):
+        problem["hints"] = [str(h) for h in hints if h]
+    elif isinstance(hints, str):
+        problem["hints"] = [hints]
+
+    # Ensure correct_answer is a simple letter for MCQ
+    if style == "mcq":
+        ca = problem.get("correct_answer", "")
+        if isinstance(ca, str) and ca:
+            # Normalize to just the letter
+            ca = ca.strip().upper()
+            if ca and ca[0] in "ABCD":
+                problem["correct_answer"] = ca[0]
+
+    return problem
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -322,6 +403,10 @@ Return ONLY a JSON object with this EXACT structure:
             "correct_answer": "",
             "hints": [],
         }
+
+    # ── Validate and clean the parsed problem fields ──────────────────────────
+    # Prevents JSON slop from reaching the frontend.
+    problem = _sanitize_problem(problem, style)
 
     session_id = str(uuid.uuid4())
     state = {

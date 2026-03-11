@@ -485,13 +485,28 @@ def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cro
         if ext in LANG_QUERY_ENHANCEMENT:
             enhanced_query = f"{LANG_QUERY_ENHANCEMENT[ext]} {instruction}"
             logger.info("[RAG] Enhanced query: %s", LANG_QUERY_ENHANCEMENT[ext])
+
+    # Detect if this is an algorithm/DS problem to filter relevant PDFs
+    _algo_keywords = [
+        'algorithm', 'dynamic programming', 'dp', 'backtracking', 'greedy',
+        'binary search', 'recursion', 'graph', 'tree', 'bfs', 'dfs',
+        'sorting', 'heap', 'trie', 'hash', 'linked list', 'stack', 'queue',
+        'sliding window', 'two pointer', 'divide and conquer', 'memoization',
+        'knapsack', 'shortest path', 'topological', 'segment tree',
+        'leetcode', 'competitive', 'time complexity', 'space complexity',
+    ]
+    _inst_lower = instruction.lower()
+    algo_topic_filter = None
+    if any(kw in _inst_lower for kw in _algo_keywords):
+        algo_topic_filter = ["algorithms"]
+        logger.info("[RAG] Detected algorithm-related instruction, adding topic filter")
     
     # --- BM25 Search (keyword-based) ---
     bm25_results = []
     if search_method in ("bm25", "both"):
         logger.info("[RAG] Running BM25 search...")
         try:
-            results = fast_topic_search(enhanced_query, rerank_method=rerank_method)
+            results = fast_topic_search(enhanced_query, rerank_method=rerank_method, topic_filter=algo_topic_filter)
             if results:
                 # Language pre-filter before limiting
                 if file_path:

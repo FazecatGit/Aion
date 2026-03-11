@@ -103,90 +103,120 @@ def _write_index_metadata(doc_count: int) -> None:
     with open(INDEX_META_PATH, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, sort_keys=True)
 
-def extract_keywords_from_corpus(docs: List[Any]) -> Dict[str, int]:
-    stop_words = {
-        # ── Articles / determiners ──
-        'the', 'a', 'an', 'this', 'that', 'these', 'those', 'every', 'each',
-        'some', 'any', 'all', 'both', 'either', 'neither', 'no', 'much',
-        'many', 'few', 'little', 'several', 'enough', 'most', 'other',
-        'another', 'such', 'own',
-        # ── Pronouns ──
-        'i', 'me', 'my', 'mine', 'myself', 'we', 'us', 'our', 'ours', 'ourselves',
-        'you', 'your', 'yours', 'yourself', 'yourselves',
-        'he', 'him', 'his', 'himself', 'she', 'her', 'hers', 'herself',
-        'it', 'its', 'itself', 'they', 'them', 'their', 'theirs', 'themselves',
-        'who', 'whom', 'whose', 'which', 'what', 'whatever', 'whoever',
-        'one', 'ones', 'something', 'anything', 'nothing', 'everything',
-        'someone', 'anyone', 'nobody', 'everybody', 'everyone', 'somewhere',
-        'anywhere', 'nowhere', 'anybody',
-        # ── Prepositions ──
-        'of', 'in', 'to', 'for', 'with', 'on', 'at', 'by', 'from', 'as',
-        'into', 'through', 'during', 'before', 'after', 'above', 'below',
-        'between', 'under', 'over', 'about', 'against', 'without', 'within',
-        'along', 'across', 'behind', 'beyond', 'among', 'around', 'toward',
-        'towards', 'upon', 'onto', 'throughout', 'beside', 'besides',
-        'despite', 'except', 'since', 'until', 'unless', 'per', 'via',
-        # ── Conjunctions ──
-        'and', 'or', 'but', 'nor', 'yet', 'so', 'because', 'although',
-        'though', 'while', 'whereas', 'whether', 'however', 'therefore',
-        'moreover', 'furthermore', 'nevertheless', 'meanwhile', 'otherwise',
-        'hence', 'thus', 'still', 'also', 'too', 'then', 'else',
-        # ── Be / have / do auxiliaries ──
-        'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am',
-        'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'done',
-        # ── Modal verbs ──
-        'will', 'would', 'shall', 'should', 'can', 'could', 'may', 'might',
-        'must', 'need', 'dare', 'ought',
-        # ── Common verbs / verb forms ──
-        'get', 'got', 'gets', 'getting', 'make', 'makes', 'made', 'making',
-        'go', 'goes', 'going', 'went', 'gone', 'come', 'came', 'comes',
-        'take', 'takes', 'took', 'taken', 'give', 'gave', 'given',
-        'say', 'said', 'says', 'see', 'saw', 'seen', 'know', 'knew', 'known',
-        'think', 'thought', 'let', 'put', 'keep', 'kept', 'tell', 'told',
-        'find', 'found', 'want', 'seem', 'show', 'shown', 'try', 'tried',
-        'leave', 'left', 'call', 'called', 'ask', 'asked',
-        'look', 'looked', 'looking', 'use', 'used', 'using', 'work', 'worked',
-        # ── Adverbs / filler ──
-        'not', 'just', 'only', 'very', 'really', 'quite', 'rather', 'already',
-        'always', 'never', 'often', 'sometimes', 'usually', 'perhaps', 'maybe',
-        'anyway', 'actually', 'basically', 'simply', 'certainly', 'clearly',
-        'probably', 'possibly', 'especially', 'particularly', 'generally',
-        'typically', 'essentially', 'definitely', 'obviously', 'apparently',
-        'exactly', 'nearly', 'almost', 'well', 'even', 'ever', 'here', 'there',
-        'now', 'then', 'when', 'where', 'how', 'why', 'again', 'further',
-        'once', 'soon', 'later', 'early', 'far', 'long', 'way', 'back',
-        'down', 'up', 'out', 'off', 'away', 'together', 'apart',
-        # ── Common adjectives / filler adjectives ──
-        'new', 'old', 'good', 'bad', 'great', 'small', 'large', 'big',
-        'high', 'low', 'same', 'different', 'important', 'main', 'major',
-        'first', 'last', 'next', 'previous', 'following', 'possible',
-        'available', 'able', 'likely', 'certain', 'sure', 'true', 'right',
-        'real', 'full', 'whole', 'common', 'simple', 'easy', 'hard',
-        'less', 'least', 'more', 'most', 'than', 'better', 'best', 'worse',
-        # ── Textbook / document filler ──
-        'example', 'figure', 'chapter', 'section', 'page', 'note', 'notes',
-        'table', 'see', 'shown', 'given', 'used', 'using', 'like',
-        'consider', 'case', 'cases', 'called', 'known', 'means', 'way',
-        'number', 'order', 'part', 'parts', 'form', 'point', 'end',
-        'time', 'set', 'problem', 'result', 'results', 'step', 'following',
-        'two', 'three', 'four', 'five', 'second', 'third',
-        'may', 'must', 'often', 'etc', 'e.g', 'i.e',
-    }
+_STOP_WORDS = {
+    # ── Articles / determiners ──
+    'the', 'a', 'an', 'this', 'that', 'these', 'those', 'every', 'each',
+    'some', 'any', 'all', 'both', 'either', 'neither', 'no', 'much',
+    'many', 'few', 'little', 'several', 'enough', 'most', 'other',
+    'another', 'such', 'own',
+    # ── Pronouns ──
+    'i', 'me', 'my', 'mine', 'myself', 'we', 'us', 'our', 'ours', 'ourselves',
+    'you', 'your', 'yours', 'yourself', 'yourselves',
+    'he', 'him', 'his', 'himself', 'she', 'her', 'hers', 'herself',
+    'it', 'its', 'itself', 'they', 'them', 'their', 'theirs', 'themselves',
+    'who', 'whom', 'whose', 'which', 'what', 'whatever', 'whoever',
+    'one', 'ones', 'something', 'anything', 'nothing', 'everything',
+    'someone', 'anyone', 'nobody', 'everybody', 'everyone', 'somewhere',
+    'anywhere', 'nowhere', 'anybody',
+    # ── Prepositions ──
+    'of', 'in', 'to', 'for', 'with', 'on', 'at', 'by', 'from', 'as',
+    'into', 'through', 'during', 'before', 'after', 'above', 'below',
+    'between', 'under', 'over', 'about', 'against', 'without', 'within',
+    'along', 'across', 'behind', 'beyond', 'among', 'around', 'toward',
+    'towards', 'upon', 'onto', 'throughout', 'beside', 'besides',
+    'despite', 'except', 'since', 'until', 'unless', 'per', 'via',
+    # ── Conjunctions ──
+    'and', 'or', 'but', 'nor', 'yet', 'so', 'because', 'although',
+    'though', 'while', 'whereas', 'whether', 'however', 'therefore',
+    'moreover', 'furthermore', 'nevertheless', 'meanwhile', 'otherwise',
+    'hence', 'thus', 'still', 'also', 'too', 'then', 'else',
+    # ── Be / have / do auxiliaries ──
+    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am',
+    'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'done',
+    # ── Modal verbs ──
+    'will', 'would', 'shall', 'should', 'can', 'could', 'may', 'might',
+    'must', 'need', 'dare', 'ought',
+    # ── Common verbs / verb forms ──
+    'get', 'got', 'gets', 'getting', 'make', 'makes', 'made', 'making',
+    'go', 'goes', 'going', 'went', 'gone', 'come', 'came', 'comes',
+    'take', 'takes', 'took', 'taken', 'give', 'gave', 'given',
+    'say', 'said', 'says', 'see', 'saw', 'seen', 'know', 'knew', 'known',
+    'think', 'thought', 'let', 'put', 'keep', 'kept', 'tell', 'told',
+    'find', 'found', 'want', 'seem', 'show', 'shown', 'try', 'tried',
+    'leave', 'left', 'call', 'called', 'ask', 'asked',
+    'look', 'looked', 'looking', 'use', 'used', 'using', 'work', 'worked',
+    # ── Adverbs / filler ──
+    'not', 'just', 'only', 'very', 'really', 'quite', 'rather', 'already',
+    'always', 'never', 'often', 'sometimes', 'usually', 'perhaps', 'maybe',
+    'anyway', 'actually', 'basically', 'simply', 'certainly', 'clearly',
+    'probably', 'possibly', 'especially', 'particularly', 'generally',
+    'typically', 'essentially', 'definitely', 'obviously', 'apparently',
+    'exactly', 'nearly', 'almost', 'well', 'even', 'ever', 'here', 'there',
+    'now', 'then', 'when', 'where', 'how', 'why', 'again', 'further',
+    'once', 'soon', 'later', 'early', 'far', 'long', 'way', 'back',
+    'down', 'up', 'out', 'off', 'away', 'together', 'apart',
+    # ── Common adjectives / filler adjectives ──
+    'new', 'old', 'good', 'bad', 'great', 'small', 'large', 'big',
+    'high', 'low', 'same', 'different', 'important', 'main', 'major',
+    'first', 'last', 'next', 'previous', 'following', 'possible',
+    'available', 'able', 'likely', 'certain', 'sure', 'true', 'right',
+    'real', 'full', 'whole', 'common', 'simple', 'easy', 'hard',
+    'less', 'least', 'more', 'most', 'than', 'better', 'best', 'worse',
+    # ── Textbook / document filler ──
+    'example', 'figure', 'chapter', 'section', 'page', 'note', 'notes',
+    'table', 'see', 'shown', 'given', 'used', 'using', 'like',
+    'consider', 'case', 'cases', 'called', 'known', 'means', 'way',
+    'number', 'order', 'part', 'parts', 'form', 'point', 'end',
+    'time', 'set', 'problem', 'result', 'results', 'step', 'following',
+    'two', 'three', 'four', 'five', 'second', 'third',
+    'may', 'must', 'often', 'etc', 'e.g', 'i.e',
+}
 
-    tokenized_docs = [doc.page_content.lower().split() for doc in docs]
-    # Strip punctuation from tokens and filter noise
+
+def _extract_keywords_for_chunks(chunks: List[Any], max_keywords: int = 500) -> Dict[str, int]:
+    """Extract top keywords from a list of chunks (used per-PDF or per-group).
+    Returns up to max_keywords, skipping noise. Fewer if the PDF is small."""
     cleaned = []
-    for doc_tokens in tokenized_docs:
-        for raw in doc_tokens:
+    for doc in chunks:
+        for raw in doc.page_content.lower().split():
             token = re.sub(r'^[^a-z0-9]+|[^a-z0-9]+$', '', raw)
-            if token and token not in stop_words and len(token) > 2 and not token.isdigit():
+            if token and token not in _STOP_WORDS and len(token) > 2 and not token.isdigit():
                 cleaned.append(token)
 
-    word_freq = Counter(cleaned).most_common(500)
-    
-    scores = [freq for _, freq in word_freq]
-    
-    return dict(zip([w for w, f in word_freq], scores))
+    word_freq = Counter(cleaned).most_common(max_keywords)
+    return dict(word_freq)
+
+
+def extract_keywords_per_pdf(docs: List[Any]) -> Dict[str, Dict[str, int]]:
+    """Extract keywords PER PDF source file instead of globally.
+
+    Returns a dict: { "filename.pdf": { "keyword": freq, ... }, ... }
+    Each PDF gets up to 500 keywords from its own chunks only.
+    """
+    # Group chunks by source PDF
+    by_source: Dict[str, List[Any]] = {}
+    for doc in docs:
+        md = getattr(doc, 'metadata', {})
+        source = md.get('source') or md.get('file_path') or 'unknown'
+        source_name = Path(source).name
+        by_source.setdefault(source_name, []).append(doc)
+
+    per_pdf_keywords: Dict[str, Dict[str, int]] = {}
+    for source_name, source_chunks in by_source.items():
+        keywords = _extract_keywords_for_chunks(source_chunks, max_keywords=500)
+        per_pdf_keywords[source_name] = keywords
+
+    return per_pdf_keywords
+
+
+def extract_keywords_from_corpus(docs: List[Any]) -> Dict[str, int]:
+    """Legacy: global keyword extraction. Preserved for backward compatibility.
+    Merges per-PDF keywords, keeping the top 500 globally."""
+    per_pdf = extract_keywords_per_pdf(docs)
+    merged: Counter = Counter()
+    for pdf_keywords in per_pdf.values():
+        merged.update(pdf_keywords)
+    return dict(merged.most_common(500))
 
 CHROMA_BATCH_SIZE = 500  # embed in batches to avoid OOM
 CHROMA_PROGRESS_PATH = Path("cache/chroma_progress.json")
@@ -374,9 +404,19 @@ def ingest_docs(force: bool = False):
 
     _log(f"Split into {len(new_splits)} new chunks (total {len(combined_splits)})")
 
-    _log("Extracting keywords from corpus...")
+    _log("Extracting keywords per PDF...")
+    per_pdf_keywords = extract_keywords_per_pdf(combined_splits)
+    total_kw = sum(len(v) for v in per_pdf_keywords.values())
+    _log(f"Extracted keywords for {len(per_pdf_keywords)} PDFs ({total_kw} total across all)")
+
+    # Save per-PDF keyword map (the main index now)
+    per_pdf_map_path = Path("cache/per_pdf_keywords.json")
+    with open(per_pdf_map_path, 'w') as f:
+        json.dump(per_pdf_keywords, f, indent=2)
+    _log(f"Saved per-PDF keyword map to {per_pdf_map_path}")
+
+    # Also save legacy global map for backward compatibility
     top_keywords = extract_keywords_from_corpus(combined_splits)
-    _log(f"Found {len(top_keywords)} keywords")
 
     # rebuild BM25 from combined splits
     _log("Building BM25 index...")
@@ -515,6 +555,12 @@ def ingest_file(file_path: str):
     top_keywords = extract_keywords_from_corpus(combined_splits)
     with open(TOPIC_MAP_PATH, 'w') as f:
         json.dump(top_keywords, f, indent=2)
+
+    # Update per-PDF keyword map
+    per_pdf_keywords = extract_keywords_per_pdf(combined_splits)
+    per_pdf_map_path = Path("cache/per_pdf_keywords.json")
+    with open(per_pdf_map_path, 'w') as f:
+        json.dump(per_pdf_keywords, f, indent=2)
 
     return documents, top_keywords
 

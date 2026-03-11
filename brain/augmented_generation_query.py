@@ -21,7 +21,28 @@ _KNOWN_TOPICS = [
     'c++', 'cpp', 'go', 'golang', 'python', 'rust', 'typescript', 'javascript',
     'java', 'blender', 'angular', 'calculus', 'derivative', 'integration',
     'refactoring', 'concurrency', 'threading', 'multithreading',
+    'linear algebra', 'matrix', 'vector', 'statistics', 'probability',
+    'discrete math', 'geometry', 'optimization', 'number theory',
+    'algorithm', 'data structure', 'dynamic programming', 'graph',
+    'security', 'cryptography', 'database', 'sql', 'networking',
 ]
+
+# Topics that are mathematics/science rather than programming
+_MATH_TOPICS = {
+    'calculus', 'derivative', 'integration', 'integral', 'differentiation',
+    'linear algebra', 'matrix', 'matrices', 'vector', 'eigenvalue',
+    'statistics', 'probability', 'discrete math', 'geometry',
+    'optimization', 'number theory', 'combinatorics',
+    'product rule', 'chain rule', 'quotient rule', 'limit', 'continuity',
+    'taylor series', 'fourier', 'laplace', 'differential equation',
+    'partial derivative', 'gradient', 'divergence', 'curl',
+}
+
+
+def _is_math_query(query: str) -> bool:
+    """Detect if the query is about mathematics rather than programming."""
+    q = query.lower()
+    return any(topic in q for topic in _MATH_TOPICS)
 
 
 def _extract_query_topics(query: str) -> list[str]:
@@ -220,12 +241,23 @@ async def answer_question(query: str, formatted_docs: str, llm_model: str, sessi
     else:
         length_instruction = "- Keep it to 2-4 sentences maximum"
 
-    prompt = f"""You are an expert programming assistant with deep knowledge of software engineering.
-
+    # Adapt persona based on query domain
+    is_math = _is_math_query(query)
+    if is_math:
+        persona = """You are an expert mathematics tutor and educator.
+Your goal is to help the student UNDERSTAND the concept, not just state a formula.
+- Explain the rule/concept in plain language first
+- Show the formal definition/formula
+- Walk through a concrete example step by step
+- Mention when and why this concept is used"""
+    else:
+        persona = """You are an expert assistant with deep knowledge of software engineering and computer science.
 Using the provided context chunks, answer the question directly and concisely.
 - If the context contains the answer, use it and cite the source
 - If the context is partially relevant, supplement with your own knowledge
-- If the documents don't contain enough information, say so honestly.
+- If the documents don't contain enough information, say so honestly."""
+
+    prompt = f"""{persona}
 {length_instruction}
 
 previous conversation (if relevant):
@@ -248,11 +280,16 @@ async def summarize_documents(query: str, formatted_docs: str, llm_model: str, s
         for msg in session_chat_history[-3:] if len(msg['content']) > 50
     ]) if session_chat_history else ""
 
+    is_math = _is_math_query(query)
+    if is_math:
+        domain_note = "- If this is a math concept, summarize the key formula, when to use it, and one quick example"
+    else:
+        domain_note = "- Only include points directly relevant to the question"
 
-    prompt = f"""You are an expert programming assistant.
+    prompt = f"""You are an expert assistant.
 
 Summarize the key points relevant to the question using the documents and your own knowledge.
-- Only include points directly relevant to the question
+{domain_note}
 - Do not repeat what was already said in the direct answer
 - NEVER mention what the documents do or do not contain — just answer
 - If the documents are thin on this topic, use your own expertise to fill the gaps
@@ -305,12 +342,26 @@ async def detailed_answer(query: str, formatted_docs: str, llm_model: str, sessi
 
     history_text = "\n".join(history_str)
 
-    prompt = f"""You are an expert programming assistant.
+    is_math = _is_math_query(query)
+    if is_math:
+        persona_instruction = """You are an expert mathematics tutor.
+
+Provide a DETAILED step-by-step explanation that helps the student truly understand the concept.
+- Start with the intuition: WHY does this rule/concept exist?
+- Show the formal definition with proper notation
+- Walk through a COMPLETE worked example with every step shown
+- Show a second example that is slightly harder
+- Mention common mistakes students make
+- If relevant, connect to related concepts (e.g., how product rule relates to chain rule)"""
+    else:
+        persona_instruction = """You are an expert programming assistant.
 
 Provide a detailed explanation that ADDS NEW INFORMATION beyond the direct answer.
 - Do NOT repeat what was already covered in the direct answer
 - Include code examples if helpful
-- Cover edge cases, gotchas, or practical usage tips
+- Cover edge cases, gotchas, or practical usage tips"""
+
+    prompt = f"""{persona_instruction}
 - If this is a follow-up question, use the PREVIOUS CONVERSATION HISTORY for context
 - If the direct answer already covered everything, just add a practical example
 
@@ -330,13 +381,19 @@ Detailed Explanation:"""
 
 async def fast_pipeline(query: str, llm_model: str, session_chat_history: list[dict] | None = None):
     topics = _extract_query_topics(query)
+    is_math = _is_math_query(query)
+
+    # Determine topic filter to boost relevant PDFs
+    topic_filter = None
+    if is_math:
+        topic_filter = ["mathematics"]
 
     if len(topics) >= 2:
         # Multi-topic query: retrieve docs per-topic to guarantee each topic has coverage
         seen_keys: set = set()
         merged_docs = []
         for topic in topics:
-            topic_results = fast_topic_search(topic)
+            topic_results = fast_topic_search(topic, topic_filter=topic_filter)
             for doc in topic_results[:4]:  # up to 4 docs per topic
                 key = (doc.metadata.get('source', ''), doc.metadata.get('page', ''))
                 if key not in seen_keys:
@@ -344,8 +401,8 @@ async def fast_pipeline(query: str, llm_model: str, session_chat_history: list[d
                     merged_docs.append(doc)
         top_docs = merged_docs[:10]  # cap total
     else:
-        results = fast_topic_search(query)
-        top_docs = results[:5]  # slightly more than before for single-topic too
+        results = fast_topic_search(query, topic_filter=topic_filter)
+        top_docs = results[:5]
 
     formatted_docs = _format_search_results_for_prompt(top_docs)
 

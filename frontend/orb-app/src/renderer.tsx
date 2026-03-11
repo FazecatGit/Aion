@@ -100,6 +100,30 @@ function App() {
   const [toolsOutput, setToolsOutput] = useState<string | null>(null);
   const [toolsLoading, setToolsLoading] = useState(false);
 
+  // ── LLM connection status ──────────────────────────────────────────────────
+  const [llmConnected, setLlmConnected] = useState<boolean | null>(null);  // null = unknown
+  const [llmModel, setLlmModel] = useState<string>('');
+
+  useEffect(() => {
+    const checkHealth = async () => {
+      try {
+        const res = await fetch('http://localhost:8000/health');
+        if (res.ok) {
+          const data = await res.json();
+          setLlmConnected(data.llm_connected ?? false);
+          setLlmModel(data.llm_model ?? '');
+        } else {
+          setLlmConnected(false);
+        }
+      } catch {
+        setLlmConnected(false);
+      }
+    };
+    checkHealth();
+    const interval = setInterval(checkHealth, 15000);  // poll every 15s
+    return () => clearInterval(interval);
+  }, []);
+
   // Type declaration for electronAPI exposed from preload
   const electronAPI = (window as any).electronAPI as { captureScreen: () => Promise<string | null>; sendCropResult: (rect: any) => void; openFileDialog: (opts?: { multiple?: boolean }) => Promise<string | string[] | null> } | undefined;
 
@@ -2327,25 +2351,36 @@ return (
       )}
 
       {/* Mode toggle — always visible */}
-      <button
-        onClick={() => {
-          const modes: ActiveMode[] = ['query', 'agent', 'tutor'];
-          const idx = modes.indexOf(activeMode);
-          setActiveMode(modes[(idx + 1) % modes.length]);
-        }}
-        disabled={mode !== 'idle'}
-        style={{
-          position: 'fixed', bottom: '28px', right: '40px', zIndex: 50,
-          padding: '10px 14px', borderRadius: '12px', border: '2px solid',
-          borderColor: activeMode === 'agent' ? '#ff00ff' : activeMode === 'tutor' ? '#00cc88' : '#5533ff',
-          backgroundColor: activeMode === 'agent' ? 'rgba(255,0,255,0.1)' : activeMode === 'tutor' ? 'rgba(0,204,136,0.1)' : 'rgba(85,51,255,0.1)',
-          color: activeMode === 'agent' ? '#ff00ff' : activeMode === 'tutor' ? '#00cc88' : '#5533ff',
-          cursor: 'pointer', fontSize: '12px', fontWeight: 'bold', textTransform: 'uppercase', transition: 'all 0.3s',
-          backdropFilter: 'blur(10px)',
-        }}
-      >
-        {activeMode === 'agent' ? '🤖 Agent' : activeMode === 'tutor' ? '📚 Tutor' : '🔍 Query'}
-      </button>
+      <div style={{ position: 'fixed', bottom: '28px', right: '40px', zIndex: 50, display: 'flex', alignItems: 'center', gap: '10px' }}>
+        {/* LLM connection status indicator */}
+        <div
+          title={llmConnected === null ? 'Checking LLM...' : llmConnected ? `LLM connected: ${llmModel}` : 'LLM offline — queries will fail'}
+          style={{
+            width: '10px', height: '10px', borderRadius: '50%',
+            backgroundColor: llmConnected === null ? '#888' : llmConnected ? '#00cc88' : '#ff3333',
+            boxShadow: llmConnected ? '0 0 6px #00cc88' : llmConnected === false ? '0 0 6px #ff3333' : 'none',
+            transition: 'all 0.3s',
+          }}
+        />
+        <button
+          onClick={() => {
+            const modes: ActiveMode[] = ['query', 'agent', 'tutor'];
+            const idx = modes.indexOf(activeMode);
+            setActiveMode(modes[(idx + 1) % modes.length]);
+          }}
+          disabled={mode !== 'idle'}
+          style={{
+            padding: '10px 14px', borderRadius: '12px', border: '2px solid',
+            borderColor: activeMode === 'agent' ? '#ff00ff' : activeMode === 'tutor' ? '#00cc88' : '#5533ff',
+            backgroundColor: activeMode === 'agent' ? 'rgba(255,0,255,0.1)' : activeMode === 'tutor' ? 'rgba(0,204,136,0.1)' : 'rgba(85,51,255,0.1)',
+            color: activeMode === 'agent' ? '#ff00ff' : activeMode === 'tutor' ? '#00cc88' : '#5533ff',
+            cursor: 'pointer', fontSize: '12px', fontWeight: 'bold', textTransform: 'uppercase', transition: 'all 0.3s',
+            backdropFilter: 'blur(10px)',
+          }}
+        >
+          {activeMode === 'agent' ? '🤖 Agent' : activeMode === 'tutor' ? '📚 Tutor' : '🔍 Query'}
+        </button>
+      </div>
 
       {/* Input bar fixed at bottom center */}
       {activeMode !== 'tutor' && (
