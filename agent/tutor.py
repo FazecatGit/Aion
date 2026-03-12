@@ -10,6 +10,7 @@ import re
 import uuid
 import random
 import logging
+import math as _math_module
 from datetime import datetime
 from typing import Optional
 
@@ -24,6 +25,34 @@ _tutor_sessions: dict[str, dict] = {}
 # Track recently generated questions per topic to avoid repetition
 # Key: (topic, difficulty, style), Value: list of question summaries
 _question_history: dict[tuple, list] = {}
+
+
+def _fetch_rag_context(topic: str, max_chunks: int = 3) -> str:
+    """Search ingested documents for content relevant to the tutor topic.
+
+    Returns a string block of relevant excerpts to inject into prompts.
+    """
+    try:
+        from brain.fast_search import fast_topic_search
+        results = fast_topic_search(topic)
+        if not results:
+            return ""
+        chunks = []
+        for doc in results[:max_chunks]:
+            text = doc.page_content if hasattr(doc, "page_content") else str(doc)
+            if text and len(text.strip()) > 20:
+                chunks.append(text.strip()[:800])
+        if chunks:
+            logger.info("[RAG] Found %d relevant document chunks for topic '%s'", len(chunks), topic)
+            return (
+                "\n\nRELEVANT MATERIAL FROM STUDENT'S DOCUMENTS:\n"
+                + "\n---\n".join(chunks)
+                + "\n\nUse these materials to inform the lesson and problems. "
+                "Ground your questions and examples in this content where relevant.\n"
+            )
+    except Exception as e:
+        logger.debug("[RAG] Could not fetch context for tutor: %s", e)
+    return ""
 
 
 def _llm(temperature: float = 0.3) -> OllamaLLM:
@@ -87,7 +116,30 @@ def _parse_json_from_llm(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
+    # Strategy 5: Regex-extract individual fields when JSON structure is broken
+    extracted = _regex_extract_json_fields(text)
+    if extracted.get("question"):
+        return extracted
+
     raise json.JSONDecodeError("Could not parse JSON from LLM output", text, 0)
+
+
+def _regex_extract_json_fields(text: str) -> dict:
+    """Last-resort: pull key fields out of malformed JSON using regex."""
+    result = {}
+    # Extract common string fields
+    for key in ('question', 'correct_answer', 'explanation', 'title'):
+        m = re.search(rf'"{ key }"\s*:\s*"((?:[^"\\]|\\.)*)"', text, re.DOTALL)
+        if m:
+            val = m.group(1).replace('\\n', '\n').replace('\\"', '"')
+            result[key] = val
+    # Extract array fields (steps, hints, options, rules, key_terms)
+    for key in ('steps', 'hints', 'options', 'related_formulas', 'rules', 'key_terms'):
+        m = re.search(rf'"{ key }"\s*:\s*\[(.*?)\]', text, re.DOTALL)
+        if m:
+            items = re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))
+            result[key] = [item.replace('\\n', '\n').replace('\\"', '"') for item in items]
+    return result
 
 
 def _fix_json_newlines(text: str) -> str:
@@ -729,9 +781,11 @@ def generate_math_problem(
       session_id, style, question, correct_answer, steps, hints, lesson
     """
     logger.info("[MATH] Generating %s problem — topic=%s, difficulty=%s", style, topic, difficulty)
+    # Fetch relevant content from ingested documents
+    rag_context = _fetch_rag_context(topic)
     # Generate a math lesson first
     logger.info("[MATH] Step 1/3: Generating lesson for '%s'...", topic)
-    lesson = _generate_math_lesson(topic, difficulty)
+    lesson = _generate_math_lesson(topic, difficulty, rag_context=rag_context)
     logger.info("[MATH] Step 1/3: Lesson generated ✓")
 
     # Build variation context
@@ -764,6 +818,9 @@ def generate_math_problem(
 
 Angle: {random_angle}
 {variation_note}
+{rag_context}
+IMPORTANT: After generating options, VERIFY your answer by solving the problem step by step.
+Double-check arithmetic carefully. The correct_answer letter MUST match the option that equals your computed result.
 Return ONLY a JSON object:
 {{
   "question": "The math question with any necessary equations (use plain text math notation)",
@@ -782,6 +839,7 @@ Return ONLY a JSON object:
 
 Angle: {random_angle}
 {variation_note}
+{rag_context}
 Return ONLY a JSON object:
 {{
   "question": "Prove that ... (clear statement of what to prove)",
@@ -800,7 +858,15 @@ Return ONLY a JSON object:
 
 Angle: {random_angle}
 {variation_note}
+{rag_context}
 The problem should require step-by-step computation. Provide specific numbers.
+
+CRITICAL INSTRUCTIONS:
+1. Work through the ENTIRE solution yourself FIRST with full arithmetic before writing the JSON.
+2. Show ALL intermediate calculations in the steps (do not skip any arithmetic).
+3. VERIFY: re-check each differentiation, multiplication, and evaluation step.
+4. The correct_answer MUST match what you computed in the final step.
+5. If the problem involves evaluating at a point, substitute and compute carefully.
 
 Return ONLY a JSON object:
 {{
@@ -808,9 +874,9 @@ Return ONLY a JSON object:
   "correct_answer": "The final numerical or symbolic answer",
   "steps": [
     "Step 1: Identify what we need to find and write the equation",
-    "Step 2: Apply the relevant formula or technique",
-    "Step 3: Simplify or compute",
-    "Step 4: State the final answer"
+    "Step 2: Apply the relevant formula or technique with full arithmetic",
+    "Step 3: Simplify or compute — show all intermediate values",
+    "Step 4: State the final answer and verify it matches correct_answer"
   ],
   "hints": ["First hint about what technique to use", "Second hint with more detail", "Third hint nearly giving the approach"],
   "related_formulas": ["Formula 1: description", "Formula 2: description"]
@@ -832,6 +898,12 @@ Return ONLY a JSON object:
 
     # Sanitize
     problem = _sanitize_problem(problem, style)
+
+    # Verify MCQ answer correctness — the LLM often gets math answers wrong
+    if style == "mcq":
+        problem = _verify_math_mcq(problem, topic, llm)
+    elif style in ("solve", "proof"):
+        problem = _verify_math_solve(problem, topic, llm)
 
     session_id = str(uuid.uuid4())
     logger.info("[MATH] Problem ready — session=%s", session_id)
@@ -872,11 +944,13 @@ Return ONLY a JSON object:
     return resp
 
 
-def _generate_math_lesson(topic: str, difficulty: str = "medium") -> dict:
+def _generate_math_lesson(topic: str, difficulty: str = "medium", rag_context: str = "") -> dict:
     """Generate a math lesson (not code-based)."""
     logger.info("[MATH] Generating lesson for '%s' (%s)...", topic, difficulty)
     llm = _llm(temperature=0.4)
     prompt = f"""You are an expert math tutor. Generate a concise lesson about "{topic}" at {difficulty} difficulty.
+{rag_context}
+IMPORTANT: Verify all mathematical computations in your example. Double-check arithmetic.
 
 Return ONLY a JSON object:
 {{
@@ -910,6 +984,119 @@ Use plain text math notation: x^2 for powers, sqrt(x) for roots, dy/dx for deriv
             "key_terms": [],
         }
     return lesson
+
+
+def _verify_math_mcq(problem: dict, topic: str, llm: OllamaLLM) -> dict:
+    """Verify and fix MCQ math answers using a second LLM pass.
+
+    The initial generation often produces wrong answers. This re-checks
+    by asking the LLM to solve from scratch and corrects mismatches.
+    """
+    question = problem.get("question", "")
+    options = problem.get("options", [])
+    if not question or not options:
+        return problem
+
+    logger.info("[MATH] Verifying MCQ answer correctness...")
+    options_text = "\n".join(options)
+    prompt = f"""Solve this math problem step by step, then select the correct answer.
+
+Question: {question}
+
+Options:
+{options_text}
+
+Work through the problem carefully showing each step. Then state which option letter (A, B, C, or D) is correct.
+
+Return ONLY a JSON object:
+{{
+  "work": "Show your step-by-step work here",
+  "computed_answer": "The numerical/symbolic answer you computed",
+  "correct_letter": "A or B or C or D",
+  "explanation": "Why this option matches your computed answer"
+}}"""
+
+    try:
+        raw = llm.invoke(prompt)
+        result = _parse_json_from_llm(raw)
+        verified_letter = result.get("correct_letter", "").strip().upper()
+        original_letter = problem.get("correct_answer", "").strip().upper()
+        if verified_letter and verified_letter[0] in "ABCD":
+            verified_letter = verified_letter[0]
+            if original_letter and original_letter[0] != verified_letter:
+                logger.warning(
+                    "[MATH] Answer mismatch! Original=%s, Verified=%s — updating",
+                    original_letter, verified_letter,
+                )
+                problem["correct_answer"] = verified_letter
+                # Update explanation with the verified work
+                if result.get("explanation"):
+                    problem["explanation"] = result["explanation"]
+                if result.get("work"):
+                    # Prepend the work to steps
+                    work_steps = [s.strip() for s in result["work"].split("\n") if s.strip()]
+                    problem["steps"] = work_steps + problem.get("steps", [])
+            else:
+                logger.info("[MATH] Answer verified correct: %s ✓", verified_letter)
+    except Exception as e:
+        logger.warning("[MATH] Verification failed: %s — keeping original answer", e)
+
+    return problem
+
+
+def _verify_math_solve(problem: dict, topic: str, llm: OllamaLLM) -> dict:
+    """Verify solve/proof answer by re-solving and checking against the generated answer."""
+    question = problem.get("question", "")
+    original_answer = problem.get("correct_answer", "")
+    if not question:
+        return problem
+
+    logger.info("[MATH] Verifying solve answer correctness...")
+    prompt = f"""Solve this {topic} math problem step by step. Show ALL arithmetic.
+
+Problem: {question}
+
+IMPORTANT: Be very careful with each computation step. Double-check every derivative, substitution, and arithmetic operation.
+
+Return ONLY a JSON object:
+{{
+  "steps": [
+    "Step 1: ...",
+    "Step 2: ...",
+    "Step 3: ...",
+    "Step 4: Final answer = ..."
+  ],
+  "correct_answer": "the final numerical or symbolic answer"
+}}"""
+
+    try:
+        raw = llm.invoke(prompt)
+        result = _parse_json_from_llm(raw)
+        verified_answer = str(result.get("correct_answer", "")).strip()
+        verified_steps = result.get("steps", [])
+
+        if verified_answer and original_answer:
+            # Normalize for comparison: strip whitespace, lowercase
+            norm_orig = original_answer.strip().lower().replace(" ", "")
+            norm_ver = verified_answer.strip().lower().replace(" ", "")
+            if norm_orig != norm_ver:
+                logger.warning(
+                    "[MATH] Solve answer mismatch! Original=%s, Verified=%s — updating",
+                    original_answer, verified_answer,
+                )
+                problem["correct_answer"] = verified_answer
+                if verified_steps:
+                    problem["steps"] = verified_steps
+            else:
+                logger.info("[MATH] Solve answer verified correct: %s ✓", verified_answer)
+        elif verified_answer and not original_answer:
+            problem["correct_answer"] = verified_answer
+            if verified_steps:
+                problem["steps"] = verified_steps
+    except Exception as e:
+        logger.warning("[MATH] Solve verification failed: %s — keeping original", e)
+
+    return problem
 
 
 def check_math_answer(session_id: str, user_answer: str) -> dict:
@@ -992,7 +1179,7 @@ Return ONLY a JSON object:
 def get_math_step_by_step(session_id: str) -> dict:
     """Return the full step-by-step solution for a math problem.
 
-    Only available after solving or after max hints used.
+    Generates steps on-the-fly via LLM if the original parse didn't produce any.
     """
     logger.info("[MATH] Fetching step-by-step for session=%s", session_id)
     state = _tutor_sessions.get(session_id)
@@ -1004,16 +1191,45 @@ def get_math_step_by_step(session_id: str) -> dict:
     steps = problem.get("steps", [])
     correct_answer = problem.get("correct_answer", "")
 
-    if state["solved"] or state["attempts"] >= 3:
-        return {
-            "steps": steps,
-            "correct_answer": correct_answer,
-            "explanation": problem.get("explanation", ""),
-        }
+    # If steps are empty (e.g. JSON parse failed), generate them now
+    if not steps:
+        logger.info("[MATH] No steps stored — generating via LLM...")
+        question = problem.get("question", "")
+        if question:
+            llm = _llm(temperature=0.3)
+            prompt = f"""Solve the following math problem step by step.
+
+Problem: {question}
+
+Return ONLY a JSON object:
+{{
+  "steps": [
+    "Step 1: ...",
+    "Step 2: ...",
+    "Step 3: ...",
+    "Step 4: State the final answer"
+  ],
+  "correct_answer": "the final answer"
+}}"""
+            raw = llm.invoke(prompt)
+            try:
+                parsed = _parse_json_from_llm(raw)
+                steps = parsed.get("steps", [])
+                if not correct_answer:
+                    correct_answer = parsed.get("correct_answer", "")
+                # Cache back into the session so subsequent calls are instant
+                problem["steps"] = steps
+                if not problem.get("correct_answer"):
+                    problem["correct_answer"] = correct_answer
+                logger.info("[MATH] Generated %d steps via LLM ✓", len(steps))
+            except (json.JSONDecodeError, ValueError):
+                logger.warning("[MATH] Step generation LLM parse failed")
+                steps = [raw.strip()]
 
     return {
-        "message": "Solve the problem or use hints first. Step-by-step available after 3 attempts.",
-        "attempts": state["attempts"],
+        "steps": steps,
+        "correct_answer": correct_answer,
+        "explanation": problem.get("explanation", ""),
     }
 
 
@@ -1046,15 +1262,33 @@ def evaluate_math_expression(expression: str, variable: str = "x", values: list 
     }
 
     # Block anything with dunder, import, exec, eval, os, sys, etc.
-    _BLOCKED = {'import', 'exec', 'eval', 'compile', 'open', 'os', 'sys',
-                '__', 'globals', 'locals', 'getattr', 'setattr', 'delattr'}
+    # Use word boundaries or special checks so "cos" doesn't match "os", etc.
+    _BLOCKED_WORDS = {'import', 'exec', 'eval', 'compile', 'open', 'globals', 'locals',
+                      'getattr', 'setattr', 'delattr'}
+    _BLOCKED_SUBSTRINGS = {'__'}  # dunder always blocked as substring
     expr_lower = expression.lower()
-    for blocked in _BLOCKED:
+    for blocked in _BLOCKED_SUBSTRINGS:
         if blocked in expr_lower:
             return {"error": f"Expression contains blocked keyword: {blocked}"}
+    for blocked in _BLOCKED_WORDS:
+        if re.search(rf'\b{blocked}\b', expr_lower):
+            return {"error": f"Expression contains blocked keyword: {blocked}"}
+    # Block bare 'os' and 'sys' only as standalone tokens (not inside cos, cosh, system, etc.)
+    for kw in ('os', 'sys'):
+        if re.search(rf'(?<![a-zA-Z]){kw}(?![a-zA-Z])', expr_lower):
+            return {"error": f"Expression contains blocked keyword: {kw}"}
 
     # Normalize expression for Python eval
     normalized = expression.replace('^', '**')
+    # Handle implicit multiplication: 2x → 2*x, 3sin → 3*sin
+    normalized = re.sub(r'(\d)([a-zA-Z])', r'\1*\2', normalized)
+    # Handle func shorthand: sinx → sin(x), cos x → cos(x)
+    _func_names = ['sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'sinh', 'cosh', 'tanh',
+                   'sqrt', 'log', 'log2', 'log10', 'exp', 'abs', 'floor', 'ceil']
+    for fn in _func_names:
+        # e.g. "sinx" → "sin(x)", "sin x" → "sin(x)"
+        normalized = re.sub(rf'\b{fn}\s+({re.escape(variable)}\b)', rf'{fn}(\1)', normalized)
+        normalized = re.sub(rf'\b{fn}({re.escape(variable)})\b', rf'{fn}(\1)', normalized)
 
     # Try to compute a symbolic derivative using simple rules
     derivative_expr = _symbolic_derivative(expression, variable)

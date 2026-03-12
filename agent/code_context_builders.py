@@ -586,10 +586,10 @@ def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cro
             score_str = f"{score:.1f}" if isinstance(score, (int, float)) else str(score)
             rag_context += f"[{i+1}] {doc_source} (score:{score_str})\n{doc.page_content[:300]}...\n\n"
             citations.append(f"[{i+1}] {doc_source} (score:{score_str})")
-        print(f"[RAG] Final: {len(final_results)} chunks from hybrid retrieval")
+        logger.info("[RAG] Final: %d chunks from hybrid retrieval", len(final_results))
     else:
         rag_context = "No relevant matches—use general principles.\n"
-        print("[RAG] No results from any search method")
+        logger.info("[RAG] No results from any search method")
 
     return rag_context, citations
 

@@ -1,6 +1,9 @@
 from pathlib import Path
 import pickle
+import logging
 from typing import Any, List, Dict
+
+logger = logging.getLogger("fast_search")
 
 BM25_IDX = None
 BM25_CHUNKS = None
@@ -8,13 +11,13 @@ BM25_CHUNKS = None
 def load_bm25_index(index_path: str = "cache/global_bm25.pkl") -> Any:
     try:
         bm25_idx = pickle.load(Path(index_path).open('rb'))
-        print(f"[FAST_SEARCH] BM25 Index Loaded: {bm25_idx}")
+        logger.info("[FAST_SEARCH] BM25 Index Loaded: %s", bm25_idx)
         return bm25_idx
     except FileNotFoundError:
-        print(f"[FAST_SEARCH] Error: BM25 index not found at {index_path}")
+        logger.error("[FAST_SEARCH] Error: BM25 index not found at %s", index_path)
         return None
     except Exception as e:
-        print(f"[FAST_SEARCH] Error loading BM25 index: {e}")
+        logger.error("[FAST_SEARCH] Error loading BM25 index: %s", e)
         return None
 
 def get_bm25_scores(query: str, bm25_idx: Any) -> List[float]:
@@ -24,16 +27,16 @@ def get_bm25_scores(query: str, bm25_idx: Any) -> List[float]:
         scores = bm25_idx.get_scores(query_tokenized)
         return scores
     except Exception as e:
-        print(f"[FAST_SEARCH] Error: {e}")
+        logger.error("[FAST_SEARCH] Error: %s", e)
         return []
     
 def sort_and_limit_results(scores: List[float]) -> List[int]:
     try:
         sorted_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:10]
-        print(f"[FAST_SEARCH] Sorted Indices: {sorted_indices}")
+        logger.debug("[FAST_SEARCH] Sorted Indices: %s", sorted_indices)
         return sorted_indices
     except Exception as e:
-        print(f"[FAST_SEARCH] Error sorting and limiting results: {e}")
+        logger.error("[FAST_SEARCH] Error sorting and limiting results: %s", e)
         return []
 
 
@@ -125,7 +128,7 @@ def fast_topic_search(query: str, return_scores: bool = False, top_k: int = 20, 
         verbose=False
     )
 
-    print(f"[FAST_SEARCH] {len(variants)} query variant(s), {len(candidates)} candidates -> top {top_k} after {rerank_method} rerank")
+    logger.info("[FAST_SEARCH] %d query variant(s), %d candidates -> top %d after %s rerank", len(variants), len(candidates), top_k, rerank_method)
     return reranked[:top_k]
 
 def initialize_bm25(raw_docs=None):

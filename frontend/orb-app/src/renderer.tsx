@@ -99,12 +99,33 @@ function App() {
   type GraphPoint = { x: number; y: number };
   const [isMathMode, setIsMathMode] = useState(false);
   const [mathExpression, setMathExpression] = useState('x^2');
+  const [mathExpression2, setMathExpression2] = useState('');  // g(x)
   const [mathGraphPoints, setMathGraphPoints] = useState<GraphPoint[]>([]);
+  const [mathGraph2Points, setMathGraph2Points] = useState<GraphPoint[]>([]);  // g(x) points
   const [mathDerivPoints, setMathDerivPoints] = useState<GraphPoint[]>([]);
   const [mathDerivExpr, setMathDerivExpr] = useState('');
   const [mathHoverX, setMathHoverX] = useState<number | null>(null);
   const [mathSteps, setMathSteps] = useState<string[] | null>(null);
   const [showMathGraph, setShowMathGraph] = useState(false);
+  const tutorAbortRef = useRef<AbortController | null>(null);  // for stop button
+  const [pulsingBtn, setPulsingBtn] = useState<string | null>(null);  // tracks which button is pulsing
+
+  // ── Math Visualization Tools ───────────────────────────────────────────────
+  const [showMathViz, setShowMathViz] = useState(false);
+  type MathVizType = 'vector' | 'circle' | 'triangle' | 'unitcircle' | null;
+  const [mathVizType, setMathVizType] = useState<MathVizType>(null);
+  // Vector: {x, y} endpoints
+  const [vizVectors, setVizVectors] = useState<{x: number; y: number; label: string; color: string}[]>([
+    { x: 3, y: 2, label: 'a', color: '#00cc88' }, { x: -1, y: 4, label: 'b', color: '#22aaff' }
+  ]);
+  // Circle: center + radius
+  const [vizCircle, setVizCircle] = useState({ cx: 0, cy: 0, r: 5 });
+  // Triangle: three vertices
+  const [vizTriangle, setVizTriangle] = useState<{x: number; y: number}[]>([
+    { x: 0, y: 0 }, { x: 6, y: 0 }, { x: 3, y: 5 }
+  ]);
+  // Unit circle angle in degrees
+  const [vizAngle, setVizAngle] = useState(45);
 
   // ── Tools panel state ──────────────────────────────────────────────────────
   const [showToolsPanel, setShowToolsPanel] = useState(false);
@@ -440,12 +461,14 @@ function App() {
     setTutorLoading(true);
     setTutorProblem(null); setTutorFeedback(null); setTutorHint(null);
     setTutorCode(''); setTutorAnswer(''); setTutorCodeResults(null);
+    setMathSteps(null);
     try {
       const endpoint = isMathMode ? 'http://localhost:8000/math/start' : 'http://localhost:8000/tutor/start';
       const payload = isMathMode
         ? { topic: tutorTopic, difficulty: tutorDifficulty, style: tutorStyle === 'mcq' ? 'mcq' : tutorStyle === 'proof' ? 'proof' : 'solve' }
         : { topic: tutorTopic, difficulty: tutorDifficulty, language: tutorLanguage, style: tutorStyle };
       const controller = new AbortController();
+      tutorAbortRef.current = controller;
       const timeout = setTimeout(() => controller.abort(), 120_000);
       const res = await fetch(endpoint, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -519,13 +542,32 @@ function App() {
         setMessages(prev => [...prev, { role: 'ai', text: `[TUTOR] Error: ${data.error || 'unknown'}` }]);
       }
     } catch (err: any) {
-      const msg = err?.name === 'AbortError' ? '[TUTOR] Request timed out. The LLM may be slow — try again.' : '[TUTOR] Failed to connect to server.';
-      setMessages(prev => [...prev, { role: 'ai', text: msg }]);
+      if (err?.name === 'AbortError') {
+        setMessages(prev => [...prev, { role: 'ai', text: '[TUTOR] Request stopped.' }]);
+      } else {
+        setMessages(prev => [...prev, { role: 'ai', text: '[TUTOR] Failed to connect to server.' }]);
+      }
+    }
+    tutorAbortRef.current = null;
+    setTutorLoading(false);
+  };
+
+  // Stop all tutor processes
+  const handleStopAll = () => {
+    if (tutorAbortRef.current) {
+      tutorAbortRef.current.abort();
+      tutorAbortRef.current = null;
     }
     setTutorLoading(false);
   };
 
-  // Evaluate math expression for graphing
+  // Pulse animation helper for buttons
+  const triggerPulse = (btnId: string) => {
+    setPulsingBtn(btnId);
+    setTimeout(() => setPulsingBtn(null), 600);
+  };
+
+  // Evaluate math expression for graphing (f(x) and optionally g(x))
   const handleMathGraph = async (expr?: string) => {
     const expression = expr || mathExpression;
     if (!expression.trim()) return;
@@ -541,6 +583,19 @@ function App() {
         setMathDerivPoints(data.derivative_points || []);
         setMathDerivExpr(data.derivative_expression || '');
         setShowMathGraph(true);
+      }
+      // Also evaluate g(x) if provided
+      if (mathExpression2.trim()) {
+        const res2 = await fetch('http://localhost:8000/math/evaluate', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ expression: mathExpression2, variable: 'x', values }),
+        });
+        const data2 = await res2.json();
+        if (data2.status === 'ok') {
+          setMathGraph2Points(data2.points || []);
+        }
+      } else {
+        setMathGraph2Points([]);
       }
     } catch { /* ignore graph errors */ }
   };
@@ -1645,10 +1700,19 @@ return (
               {isMathMode && <option value="solve">Solve</option>}
               {isMathMode && <option value="proof">Proof</option>}
             </select>
-            <button onClick={() => { handleTutorGenerate(); setShowLesson(true); }} disabled={tutorLoading || !tutorTopic.trim()}
-              style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1 }}>
+            <button onClick={() => { triggerPulse('generate'); handleTutorGenerate(); setShowLesson(true); }} disabled={tutorLoading || !tutorTopic.trim()}
+              style={{
+                padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1,
+                animation: pulsingBtn === 'generate' ? 'greenPulse 0.6s ease-out' : undefined,
+              }}>
               {tutorLoading ? '...' : 'Generate Problem'}
             </button>
+            {tutorLoading && (
+              <button onClick={handleStopAll}
+                style={{ padding: '8px 16px', borderRadius: '8px', border: '2px solid #ff4444', backgroundColor: 'rgba(255,68,68,0.15)', color: '#ff4444', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px' }}>
+                ⏹ Stop
+              </button>
+            )}
             <button onClick={() => handleFetchLearnings()}
               style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#b388ff', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px' }}>
               📚 Learnings
@@ -1879,6 +1943,29 @@ return (
                 </div>
               )}
 
+              {/* Solve / Proof input (math mode) */}
+              {(tutorProblem.style === 'solve' || tutorProblem.style === 'proof') && (
+                <div style={{ marginBottom: '12px' }}>
+                  <div style={{ fontSize: '12px', color: '#888', marginBottom: '6px' }}>
+                    {tutorProblem.style === 'proof' ? 'Write your proof below:' : 'Enter your answer:'}
+                  </div>
+                  <textarea value={tutorAnswer} onChange={e => setTutorAnswer(e.target.value)}
+                    placeholder={tutorProblem.style === 'proof'
+                      ? 'Write your mathematical proof step by step...'
+                      : 'Enter your final answer (e.g. 42, 3x+1, -2/3)...'}
+                    rows={tutorProblem.style === 'proof' ? 6 : 2}
+                    style={{ width: '100%', padding: '12px', borderRadius: '10px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px', resize: 'vertical', boxSizing: 'border-box', fontFamily: 'monospace' }} />
+                  <button onClick={() => { triggerPulse('submit-math'); handleTutorCheckAnswer(tutorAnswer); }}
+                    disabled={tutorLoading || !tutorAnswer.trim() || (tutorFeedback?.solved ?? false)}
+                    style={{
+                      marginTop: '8px', padding: '8px 20px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px',
+                      animation: pulsingBtn === 'submit-math' ? 'greenPulse 0.6s ease-out' : undefined,
+                    }}>
+                    Submit {tutorProblem.style === 'proof' ? 'Proof' : 'Answer'}
+                  </button>
+                </div>
+              )}
+
               {/* Feedback */}
               {tutorFeedback && (
                 <div style={{
@@ -1908,25 +1995,46 @@ return (
 
               {/* Hint / Next / Steps buttons */}
               <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                <button onClick={handleTutorHint} disabled={tutorLoading || (tutorFeedback?.solved ?? false)}
-                  style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#5533ff', cursor: 'pointer', fontSize: '12px' }}>
+                <button onClick={() => { triggerPulse('hint'); handleTutorHint(); }} disabled={tutorLoading || (tutorFeedback?.solved ?? false)}
+                  style={{
+                    padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#5533ff', cursor: 'pointer', fontSize: '12px',
+                    animation: pulsingBtn === 'hint' ? 'greenPulse 0.6s ease-out' : undefined,
+                  }}>
                   💡 Hint
                 </button>
                 {isMathMode && (
-                  <button onClick={handleMathSteps}
-                    style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #00cc8866', backgroundColor: 'transparent', color: '#00cc88', cursor: 'pointer', fontSize: '12px' }}>
+                  <button onClick={() => { triggerPulse('steps'); handleMathSteps(); }}
+                    style={{
+                      padding: '8px 16px', borderRadius: '8px', border: '1px solid #00cc8866', backgroundColor: 'transparent', color: '#00cc88', cursor: 'pointer', fontSize: '12px',
+                      animation: pulsingBtn === 'steps' ? 'greenPulse 0.6s ease-out' : undefined,
+                    }}>
                     📝 Step-by-Step
                   </button>
                 )}
                 {isMathMode && (
-                  <button onClick={() => setShowMathGraph(g => !g)}
-                    style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #ff990066', backgroundColor: showMathGraph ? 'rgba(255,153,0,0.15)' : 'transparent', color: '#ff9900', cursor: 'pointer', fontSize: '12px' }}>
+                  <button onClick={() => { triggerPulse('graph'); setShowMathGraph(g => { if (!g) handleMathGraph(); return !g; }); }}
+                    style={{
+                      padding: '8px 16px', borderRadius: '8px', border: '1px solid #ff990066', backgroundColor: showMathGraph ? 'rgba(255,153,0,0.15)' : 'transparent', color: '#ff9900', cursor: 'pointer', fontSize: '12px',
+                      animation: pulsingBtn === 'graph' ? 'greenPulse 0.6s ease-out' : undefined,
+                    }}>
                     📈 Graph
                   </button>
                 )}
+                {isMathMode && (
+                  <button onClick={() => { triggerPulse('mathviz'); setShowMathViz(v => !v); }}
+                    style={{
+                      padding: '8px 16px', borderRadius: '8px', border: '1px solid #b388ff66', backgroundColor: showMathViz ? 'rgba(179,136,255,0.15)' : 'transparent', color: '#b388ff', cursor: 'pointer', fontSize: '12px',
+                      animation: pulsingBtn === 'mathviz' ? 'greenPulse 0.6s ease-out' : undefined,
+                    }}>
+                    🔧 Math Tools
+                  </button>
+                )}
                 {tutorFeedback?.solved && (
-                  <button onClick={handleTutorGenerate}
-                    style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '12px' }}>
+                  <button onClick={() => { triggerPulse('next'); handleTutorGenerate(); }}
+                    style={{
+                      padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '12px',
+                      animation: pulsingBtn === 'next' ? 'greenPulse 0.6s ease-out' : undefined,
+                    }}>
                     Next Problem →
                   </button>
                 )}
@@ -1950,11 +2058,18 @@ return (
           {isMathMode && showMathGraph && (
             <div style={{ marginTop: '16px', padding: '16px', borderRadius: '12px', backgroundColor: 'rgba(255,153,0,0.04)', border: '1px solid rgba(255,153,0,0.2)' }}>
               <div style={{ fontSize: '14px', fontWeight: 'bold', color: '#ff9900', marginBottom: '10px' }}>📈 Interactive Graph</div>
-              <div style={{ display: 'flex', gap: '8px', marginBottom: '12px', alignItems: 'center' }}>
-                <span style={{ color: '#888', fontSize: '12px' }}>f(x) =</span>
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '8px', alignItems: 'center' }}>
+                <span style={{ color: '#00cc88', fontSize: '12px', fontWeight: 'bold' }}>f(x) =</span>
                 <input value={mathExpression} onChange={e => setMathExpression(e.target.value)}
                   onKeyDown={e => { if (e.key === 'Enter') handleMathGraph(); }}
                   placeholder="x^2, sin(x), x^3 - 3*x"
+                  style={{ flex: 1, padding: '6px 10px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px', fontFamily: 'monospace' }} />
+              </div>
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '12px', alignItems: 'center' }}>
+                <span style={{ color: '#22aaff', fontSize: '12px', fontWeight: 'bold' }}>g(x) =</span>
+                <input value={mathExpression2} onChange={e => setMathExpression2(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') handleMathGraph(); }}
+                  placeholder="(optional) second function to compare"
                   style={{ flex: 1, padding: '6px 10px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px', fontFamily: 'monospace' }} />
                 <button onClick={() => handleMathGraph()}
                   style={{ padding: '6px 14px', borderRadius: '6px', border: 'none', backgroundColor: '#ff9900', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '12px' }}>
@@ -1968,13 +2083,14 @@ return (
               )}
               {/* SVG Graph */}
               {mathGraphPoints.length > 0 && (() => {
-                const W = 600, H = 340, PAD = 40;
+                const W = 620, H = 380, PAD = 50;
                 const validPts = mathGraphPoints.filter(p => isFinite(p.y) && Math.abs(p.y) < 1000);
                 const validDeriv = mathDerivPoints.filter(p => isFinite(p.y) && Math.abs(p.y) < 1000);
+                const validG = mathGraph2Points.filter(p => isFinite(p.y) && Math.abs(p.y) < 1000);
                 if (validPts.length < 2) return <div style={{ color: '#666', fontSize: '12px' }}>No valid points to plot.</div>;
                 const xMin = Math.min(...validPts.map(p => p.x));
                 const xMax = Math.max(...validPts.map(p => p.x));
-                const allY = [...validPts.map(p => p.y), ...validDeriv.map(p => p.y)];
+                const allY = [...validPts.map(p => p.y), ...validDeriv.map(p => p.y), ...validG.map(p => p.y)];
                 const yMin = Math.min(...allY);
                 const yMax = Math.max(...allY);
                 const xRange = xMax - xMin || 1;
@@ -1982,11 +2098,19 @@ return (
                 const sx = (x: number) => PAD + ((x - xMin) / xRange) * (W - 2 * PAD);
                 const sy = (y: number) => H - PAD - ((y - yMin) / yRange) * (H - 2 * PAD);
                 const toPath = (pts: GraphPoint[]) => pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${sx(p.x).toFixed(1)},${sy(p.y).toFixed(1)}`).join(' ');
-                // Axis lines
                 const zeroX = sx(0), zeroY = sy(0);
-                // Hover point
+                // Compute nice tick marks for axes
+                const xTickStep = Math.ceil(xRange / 10) || 1;
+                const yTickStep = parseFloat((yRange / 8).toPrecision(1)) || 1;
+                const xTicks: number[] = [];
+                for (let v = Math.ceil(xMin / xTickStep) * xTickStep; v <= xMax; v += xTickStep) xTicks.push(v);
+                const yTicks: number[] = [];
+                for (let v = Math.ceil(yMin / yTickStep) * yTickStep; v <= yMax; v += yTickStep) yTicks.push(v);
+                // Hover
                 const hoverPt = mathHoverX !== null ? validPts.reduce((a, b) => Math.abs(b.x - mathHoverX!) < Math.abs(a.x - mathHoverX!) ? b : a, validPts[0]) : null;
                 const hoverDeriv = mathHoverX !== null && validDeriv.length > 0 ? validDeriv.reduce((a, b) => Math.abs(b.x - mathHoverX!) < Math.abs(a.x - mathHoverX!) ? b : a, validDeriv[0]) : null;
+                // Check if expression looks like it should show integral symbol
+                const showIntegral = /integral|∫|antiderivative/i.test(mathExpression) || /integral|∫/i.test(tutorTopic);
                 return (
                   <div>
                     <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222', cursor: 'crosshair' }}
@@ -2008,12 +2132,36 @@ return (
                         </g>;
                       })}
                       {/* Axes */}
-                      {zeroX >= PAD && zeroX <= W - PAD && <line x1={zeroX} y1={PAD} x2={zeroX} y2={H - PAD} stroke="#444" strokeWidth={1} />}
-                      {zeroY >= PAD && zeroY <= H - PAD && <line x1={PAD} y1={zeroY} x2={W - PAD} y2={zeroY} stroke="#444" strokeWidth={1} />}
+                      {zeroX >= PAD && zeroX <= W - PAD && <line x1={zeroX} y1={PAD} x2={zeroX} y2={H - PAD} stroke="#555" strokeWidth={1.5} />}
+                      {zeroY >= PAD && zeroY <= H - PAD && <line x1={PAD} y1={zeroY} x2={W - PAD} y2={zeroY} stroke="#555" strokeWidth={1.5} />}
+                      {/* X axis tick labels */}
+                      {xTicks.map(v => {
+                        const px = sx(v);
+                        if (px < PAD + 5 || px > W - PAD - 5) return null;
+                        const baseY = zeroY >= PAD && zeroY <= H - PAD ? zeroY : H - PAD;
+                        return <g key={`xt${v}`}>
+                          <line x1={px} y1={baseY - 3} x2={px} y2={baseY + 3} stroke="#666" strokeWidth={1} />
+                          <text x={px} y={baseY + 14} fill="#777" fontSize={9} fontFamily="monospace" textAnchor="middle">{v}</text>
+                        </g>;
+                      })}
+                      {/* Y axis tick labels */}
+                      {yTicks.map(v => {
+                        const py = sy(v);
+                        if (py < PAD + 5 || py > H - PAD - 5) return null;
+                        const baseX = zeroX >= PAD && zeroX <= W - PAD ? zeroX : PAD;
+                        return <g key={`yt${v}`}>
+                          <line x1={baseX - 3} y1={py} x2={baseX + 3} y2={py} stroke="#666" strokeWidth={1} />
+                          <text x={baseX - 6} y={py + 3} fill="#777" fontSize={9} fontFamily="monospace" textAnchor="end">{Number.isInteger(v) ? v : v.toFixed(1)}</text>
+                        </g>;
+                      })}
                       {/* f(x) curve */}
                       <path d={toPath(validPts)} fill="none" stroke="#00cc88" strokeWidth={2} />
+                      {/* g(x) second curve */}
+                      {validG.length > 1 && <path d={toPath(validG)} fill="none" stroke="#22aaff" strokeWidth={2} />}
                       {/* f'(x) derivative curve */}
                       {validDeriv.length > 1 && <path d={toPath(validDeriv)} fill="none" stroke="#ff6666" strokeWidth={1.5} strokeDasharray="5,3" />}
+                      {/* Integral symbol if relevant */}
+                      {showIntegral && <text x={PAD + 4} y={PAD + 18} fill="#b388ff" fontSize={22} fontFamily="serif" fontStyle="italic">∫</text>}
                       {/* Hover crosshair + values */}
                       {hoverPt && <>
                         <line x1={sx(hoverPt.x)} y1={PAD} x2={sx(hoverPt.x)} y2={H - PAD} stroke="#ffffff22" strokeWidth={1} />
@@ -2026,14 +2174,234 @@ return (
                           f'={hoverDeriv.y.toFixed(2)}
                         </text>}
                       </>}
-                      {/* Axis labels */}
-                      <text x={W - PAD + 5} y={zeroY >= PAD && zeroY <= H - PAD ? zeroY + 4 : H - PAD + 14} fill="#666" fontSize={10}>x</text>
-                      <text x={zeroX >= PAD && zeroX <= W - PAD ? zeroX - 12 : PAD - 12} y={PAD - 5} fill="#666" fontSize={10}>y</text>
+                      {/* Axis letters */}
+                      <text x={W - PAD + 5} y={zeroY >= PAD && zeroY <= H - PAD ? zeroY + 4 : H - PAD + 14} fill="#888" fontSize={11} fontWeight="bold">x</text>
+                      <text x={zeroX >= PAD && zeroX <= W - PAD ? zeroX - 14 : PAD - 14} y={PAD - 5} fill="#888" fontSize={11} fontWeight="bold">y</text>
                     </svg>
                     {/* Legend */}
-                    <div style={{ display: 'flex', gap: '16px', marginTop: '6px', fontSize: '11px' }}>
+                    <div style={{ display: 'flex', gap: '16px', marginTop: '6px', fontSize: '11px', flexWrap: 'wrap' }}>
                       <span style={{ color: '#00cc88' }}>— f(x) = {mathExpression}</span>
+                      {mathExpression2 && validG.length > 0 && <span style={{ color: '#22aaff' }}>— g(x) = {mathExpression2}</span>}
                       {mathDerivExpr && <span style={{ color: '#ff6666' }}>-- f'(x) = {mathDerivExpr}</span>}
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {/* ── Math Visualization Tools ───────────────────────────────── */}
+          {isMathMode && showMathViz && (
+            <div style={{ marginTop: '16px', padding: '16px', borderRadius: '12px', backgroundColor: 'rgba(179,136,255,0.04)', border: '1px solid rgba(179,136,255,0.2)' }}>
+              <div style={{ fontSize: '14px', fontWeight: 'bold', color: '#b388ff', marginBottom: '10px' }}>🔧 Math Visualization Tools</div>
+              <div style={{ display: 'flex', gap: '6px', marginBottom: '12px', flexWrap: 'wrap' }}>
+                {(['unitcircle', 'vector', 'triangle', 'circle'] as MathVizType[]).map(t => (
+                  <button key={t} onClick={() => setMathVizType(mathVizType === t ? null : t)}
+                    style={{ padding: '6px 14px', borderRadius: '6px', border: mathVizType === t ? '1px solid #b388ff' : '1px solid #444', backgroundColor: mathVizType === t ? 'rgba(179,136,255,0.2)' : 'transparent', color: mathVizType === t ? '#b388ff' : '#aaa', cursor: 'pointer', fontSize: '12px' }}>
+                    {t === 'unitcircle' ? '🔵 Unit Circle' : t === 'vector' ? '➡️ Vectors' : t === 'triangle' ? '📐 Triangle' : '⭕ Circle'}
+                  </button>
+                ))}
+              </div>
+
+              {/* Unit Circle visualization */}
+              {mathVizType === 'unitcircle' && (() => {
+                const W = 360, H = 360, CX = W / 2, CY = H / 2, R = 140;
+                const rad = vizAngle * Math.PI / 180;
+                const px = CX + R * Math.cos(rad), py = CY - R * Math.sin(rad);
+                const cosVal = Math.cos(rad), sinVal = Math.sin(rad), tanVal = Math.tan(rad);
+                return (
+                  <div>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '8px' }}>
+                      <span style={{ color: '#b388ff', fontSize: '12px' }}>θ =</span>
+                      <input type="range" min={0} max={360} value={vizAngle} onChange={e => setVizAngle(+e.target.value)} style={{ flex: 1 }} />
+                      <span style={{ color: '#fff', fontFamily: 'monospace', fontSize: '13px', minWidth: '40px' }}>{vizAngle}°</span>
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      {/* Grid lines */}
+                      <line x1={0} y1={CY} x2={W} y2={CY} stroke="#333" strokeWidth={1} />
+                      <line x1={CX} y1={0} x2={CX} y2={H} stroke="#333" strokeWidth={1} />
+                      {/* Circle */}
+                      <circle cx={CX} cy={CY} r={R} fill="none" stroke="#555" strokeWidth={1.5} />
+                      {/* Angle arc */}
+                      {vizAngle > 0 && vizAngle < 360 && (
+                        <path d={`M${CX + 25},${CY} A25,25 0 ${vizAngle > 180 ? 1 : 0},0 ${CX + 25 * Math.cos(rad)},${CY - 25 * Math.sin(rad)}`} fill="none" stroke="#b388ff" strokeWidth={1.5} />
+                      )}
+                      {/* Radius line */}
+                      <line x1={CX} y1={CY} x2={px} y2={py} stroke="#00cc88" strokeWidth={2} />
+                      {/* cos projection (horizontal) */}
+                      <line x1={CX} y1={CY} x2={CX + R * cosVal} y2={CY} stroke="#ff9900" strokeWidth={2} strokeDasharray="4,3" />
+                      {/* sin projection (vertical) */}
+                      <line x1={CX + R * cosVal} y1={CY} x2={px} y2={py} stroke="#22aaff" strokeWidth={2} strokeDasharray="4,3" />
+                      {/* Point on circle */}
+                      <circle cx={px} cy={py} r={5} fill="#00cc88" />
+                      {/* Labels at key positions */}
+                      <text x={CX + R + 5} y={CY + 4} fill="#888" fontSize={11}>1</text>
+                      <text x={CX - R - 14} y={CY + 4} fill="#888" fontSize={11}>-1</text>
+                      <text x={CX + 2} y={CY - R - 4} fill="#888" fontSize={11}>1</text>
+                      <text x={CX + 2} y={CY + R + 14} fill="#888" fontSize={11}>-1</text>
+                      {/* Coordinate label */}
+                      <text x={px + 8} y={py - 8} fill="#00cc88" fontSize={11} fontFamily="monospace">
+                        ({cosVal.toFixed(3)}, {sinVal.toFixed(3)})
+                      </text>
+                    </svg>
+                    <div style={{ display: 'flex', gap: '16px', marginTop: '8px', fontSize: '12px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
+                      <span style={{ color: '#ff9900' }}>cos(θ) = {cosVal.toFixed(4)}</span>
+                      <span style={{ color: '#22aaff' }}>sin(θ) = {sinVal.toFixed(4)}</span>
+                      <span style={{ color: '#ff6666' }}>tan(θ) = {isFinite(tanVal) ? tanVal.toFixed(4) : '∞'}</span>
+                      <span style={{ color: '#b388ff' }}>θ = {(rad).toFixed(4)} rad</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Vector visualization */}
+              {mathVizType === 'vector' && (() => {
+                const W = 400, H = 360, CX = W / 2, CY = H / 2, SCALE = 25;
+                const vA = vizVectors[0], vB = vizVectors[1];
+                const sumX = vA.x + vB.x, sumY = vA.y + vB.y;
+                const mag = (v: {x: number; y: number}) => Math.sqrt(v.x * v.x + v.y * v.y);
+                const dot = vA.x * vB.x + vA.y * vB.y;
+                const angleBetween = Math.acos(Math.min(1, Math.max(-1, dot / (mag(vA) * mag(vB) || 1)))) * 180 / Math.PI;
+                return (
+                  <div>
+                    <div style={{ display: 'flex', gap: '12px', marginBottom: '8px', fontSize: '12px', flexWrap: 'wrap' }}>
+                      <span style={{ color: '#00cc88' }}>a⃗ = ({vA.x}, {vA.y})</span>
+                      <span style={{ color: '#22aaff' }}>b⃗ = ({vB.x}, {vB.y})</span>
+                      <span style={{ color: '#ff9900' }}>a⃗+b⃗ = ({sumX}, {sumY})</span>
+                    </div>
+                    <div style={{ display: 'flex', gap: '6px', marginBottom: '8px', flexWrap: 'wrap' }}>
+                      {[{ label: 'ax', idx: 0, key: 'x' as const }, { label: 'ay', idx: 0, key: 'y' as const },
+                        { label: 'bx', idx: 1, key: 'x' as const }, { label: 'by', idx: 1, key: 'y' as const }].map(({ label, idx, key }) => (
+                        <label key={label} style={{ display: 'flex', alignItems: 'center', gap: '4px', color: idx === 0 ? '#00cc88' : '#22aaff', fontSize: '11px' }}>
+                          {label}:
+                          <input type="number" value={vizVectors[idx][key]}
+                            onChange={e => { const next = [...vizVectors]; next[idx] = { ...next[idx], [key]: +e.target.value }; setVizVectors(next); }}
+                            style={{ width: '50px', padding: '3px 6px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '12px', fontFamily: 'monospace' }} />
+                        </label>
+                      ))}
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      {/* Grid */}
+                      <line x1={0} y1={CY} x2={W} y2={CY} stroke="#333" strokeWidth={1} />
+                      <line x1={CX} y1={0} x2={CX} y2={H} stroke="#333" strokeWidth={1} />
+                      {/* Vector a */}
+                      <line x1={CX} y1={CY} x2={CX + vA.x * SCALE} y2={CY - vA.y * SCALE} stroke="#00cc88" strokeWidth={2} markerEnd="url(#arrowG)" />
+                      {/* Vector b */}
+                      <line x1={CX} y1={CY} x2={CX + vB.x * SCALE} y2={CY - vB.y * SCALE} stroke="#22aaff" strokeWidth={2} markerEnd="url(#arrowB)" />
+                      {/* Sum vector */}
+                      <line x1={CX} y1={CY} x2={CX + sumX * SCALE} y2={CY - sumY * SCALE} stroke="#ff9900" strokeWidth={2} strokeDasharray="5,3" markerEnd="url(#arrowO)" />
+                      {/* Parallelogram */}
+                      <line x1={CX + vA.x * SCALE} y1={CY - vA.y * SCALE} x2={CX + sumX * SCALE} y2={CY - sumY * SCALE} stroke="#444" strokeWidth={1} strokeDasharray="3,3" />
+                      <line x1={CX + vB.x * SCALE} y1={CY - vB.y * SCALE} x2={CX + sumX * SCALE} y2={CY - sumY * SCALE} stroke="#444" strokeWidth={1} strokeDasharray="3,3" />
+                      {/* Arrow markers */}
+                      <defs>
+                        <marker id="arrowG" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#00cc88" /></marker>
+                        <marker id="arrowB" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#22aaff" /></marker>
+                        <marker id="arrowO" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ff9900" /></marker>
+                      </defs>
+                      {/* Labels */}
+                      <text x={CX + vA.x * SCALE / 2 - 10} y={CY - vA.y * SCALE / 2 - 6} fill="#00cc88" fontSize={12} fontWeight="bold">a⃗</text>
+                      <text x={CX + vB.x * SCALE / 2 + 6} y={CY - vB.y * SCALE / 2 - 6} fill="#22aaff" fontSize={12} fontWeight="bold">b⃗</text>
+                    </svg>
+                    <div style={{ display: 'flex', gap: '14px', marginTop: '6px', fontSize: '11px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
+                      <span style={{ color: '#00cc88' }}>|a⃗| = {mag(vA).toFixed(3)}</span>
+                      <span style={{ color: '#22aaff' }}>|b⃗| = {mag(vB).toFixed(3)}</span>
+                      <span style={{ color: '#ff9900' }}>|a⃗+b⃗| = {mag({ x: sumX, y: sumY }).toFixed(3)}</span>
+                      <span style={{ color: '#ff6666' }}>a⃗·b⃗ = {dot}</span>
+                      <span style={{ color: '#b388ff' }}>θ = {angleBetween.toFixed(1)}°</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Triangle visualization */}
+              {mathVizType === 'triangle' && (() => {
+                const W = 400, H = 360, PAD = 40, pts = vizTriangle;
+                const maxCoord = Math.max(...pts.map(p => Math.max(Math.abs(p.x), Math.abs(p.y))), 1);
+                const scale = (Math.min(W, H) - 2 * PAD) / (2 * maxCoord);
+                const tx = (x: number) => W / 2 + x * scale;
+                const ty = (y: number) => H / 2 - y * scale;
+                const dist = (a: {x: number; y: number}, b: {x: number; y: number}) => Math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2);
+                const sideA = dist(pts[1], pts[2]), sideB = dist(pts[0], pts[2]), sideC = dist(pts[0], pts[1]);
+                const s = (sideA + sideB + sideC) / 2;
+                const area = Math.sqrt(Math.max(0, s * (s - sideA) * (s - sideB) * (s - sideC)));
+                // Angles via law of cosines
+                const angleAt = (opp: number, a: number, b: number) => Math.acos(Math.min(1, Math.max(-1, (a * a + b * b - opp * opp) / (2 * a * b || 1)))) * 180 / Math.PI;
+                const angA = angleAt(sideA, sideB, sideC), angB = angleAt(sideB, sideA, sideC), angC = angleAt(sideC, sideA, sideB);
+                return (
+                  <div>
+                    <div style={{ display: 'flex', gap: '6px', marginBottom: '8px', flexWrap: 'wrap' }}>
+                      {['A', 'B', 'C'].map((label, i) => (
+                        <span key={label} style={{ display: 'flex', alignItems: 'center', gap: '3px', fontSize: '11px' }}>
+                          <span style={{ color: '#b388ff' }}>{label}(</span>
+                          <input type="number" value={pts[i].x} onChange={e => { const n = [...pts]; n[i] = { ...n[i], x: +e.target.value }; setVizTriangle(n); }}
+                            style={{ width: '40px', padding: '2px 4px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '11px', fontFamily: 'monospace' }} />
+                          <span style={{ color: '#888' }}>,</span>
+                          <input type="number" value={pts[i].y} onChange={e => { const n = [...pts]; n[i] = { ...n[i], y: +e.target.value }; setVizTriangle(n); }}
+                            style={{ width: '40px', padding: '2px 4px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '11px', fontFamily: 'monospace' }} />
+                          <span style={{ color: '#b388ff' }}>)</span>
+                        </span>
+                      ))}
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      <line x1={0} y1={H / 2} x2={W} y2={H / 2} stroke="#222" strokeWidth={1} />
+                      <line x1={W / 2} y1={0} x2={W / 2} y2={H} stroke="#222" strokeWidth={1} />
+                      <polygon points={pts.map(p => `${tx(p.x)},${ty(p.y)}`).join(' ')} fill="rgba(179,136,255,0.08)" stroke="#b388ff" strokeWidth={2} />
+                      {pts.map((p, i) => (
+                        <g key={i}>
+                          <circle cx={tx(p.x)} cy={ty(p.y)} r={4} fill="#b388ff" />
+                          <text x={tx(p.x) + 8} y={ty(p.y) - 8} fill="#b388ff" fontSize={12} fontWeight="bold">{['A', 'B', 'C'][i]}</text>
+                        </g>
+                      ))}
+                      {/* Side labels */}
+                      <text x={(tx(pts[1].x) + tx(pts[2].x)) / 2 + 6} y={(ty(pts[1].y) + ty(pts[2].y)) / 2 - 6} fill="#ff9900" fontSize={10} fontFamily="monospace">a={sideA.toFixed(2)}</text>
+                      <text x={(tx(pts[0].x) + tx(pts[2].x)) / 2 - 30} y={(ty(pts[0].y) + ty(pts[2].y)) / 2 + 14} fill="#22aaff" fontSize={10} fontFamily="monospace">b={sideB.toFixed(2)}</text>
+                      <text x={(tx(pts[0].x) + tx(pts[1].x)) / 2 + 6} y={(ty(pts[0].y) + ty(pts[1].y)) / 2 + 14} fill="#00cc88" fontSize={10} fontFamily="monospace">c={sideC.toFixed(2)}</text>
+                    </svg>
+                    <div style={{ display: 'flex', gap: '12px', marginTop: '6px', fontSize: '11px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
+                      <span style={{ color: '#ff9900' }}>∠A = {angA.toFixed(1)}°</span>
+                      <span style={{ color: '#22aaff' }}>∠B = {angB.toFixed(1)}°</span>
+                      <span style={{ color: '#00cc88' }}>∠C = {angC.toFixed(1)}°</span>
+                      <span style={{ color: '#b388ff' }}>Area = {area.toFixed(3)}</span>
+                      <span style={{ color: '#888' }}>Perimeter = {(sideA + sideB + sideC).toFixed(3)}</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Circle visualization */}
+              {mathVizType === 'circle' && (() => {
+                const W = 360, H = 360, SCALE = 20;
+                const cx = W / 2 + vizCircle.cx * SCALE, cy = H / 2 - vizCircle.cy * SCALE;
+                const rPx = vizCircle.r * SCALE;
+                const area = Math.PI * vizCircle.r * vizCircle.r;
+                const circumference = 2 * Math.PI * vizCircle.r;
+                return (
+                  <div>
+                    <div style={{ display: 'flex', gap: '8px', marginBottom: '8px', flexWrap: 'wrap' }}>
+                      {[{ label: 'cx', key: 'cx' as const }, { label: 'cy', key: 'cy' as const }, { label: 'r', key: 'r' as const }].map(({ label, key }) => (
+                        <label key={label} style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#b388ff', fontSize: '11px' }}>
+                          {label}:
+                          <input type="number" value={vizCircle[key]} step={key === 'r' ? 0.5 : 1}
+                            onChange={e => setVizCircle({ ...vizCircle, [key]: +e.target.value })}
+                            style={{ width: '55px', padding: '3px 6px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '12px', fontFamily: 'monospace' }} />
+                        </label>
+                      ))}
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      <line x1={0} y1={H / 2} x2={W} y2={H / 2} stroke="#333" strokeWidth={1} />
+                      <line x1={W / 2} y1={0} x2={W / 2} y2={H} stroke="#333" strokeWidth={1} />
+                      <circle cx={cx} cy={cy} r={rPx} fill="rgba(179,136,255,0.06)" stroke="#b388ff" strokeWidth={2} />
+                      <circle cx={cx} cy={cy} r={3} fill="#ff9900" />
+                      {/* Radius line */}
+                      <line x1={cx} y1={cy} x2={cx + rPx} y2={cy} stroke="#00cc88" strokeWidth={1.5} strokeDasharray="4,3" />
+                      <text x={cx + rPx / 2 - 5} y={cy - 6} fill="#00cc88" fontSize={10} fontFamily="monospace">r={vizCircle.r}</text>
+                      <text x={cx + 6} y={cy - 6} fill="#ff9900" fontSize={10} fontFamily="monospace">({vizCircle.cx},{vizCircle.cy})</text>
+                    </svg>
+                    <div style={{ display: 'flex', gap: '14px', marginTop: '6px', fontSize: '11px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
+                      <span style={{ color: '#b388ff' }}>Area = πr² = {area.toFixed(3)}</span>
+                      <span style={{ color: '#00cc88' }}>Circumference = 2πr = {circumference.toFixed(3)}</span>
+                      <span style={{ color: '#888' }}>Equation: (x−{vizCircle.cx})²+(y−{vizCircle.cy})²={vizCircle.r}²</span>
                     </div>
                   </div>
                 );
@@ -2957,8 +3325,11 @@ return (
 
 createRoot(document.getElementById('root')!).render(<App />);
 
-// Inject pulse keyframe for recording animation
+// Inject pulse + greenPulse keyframes for animations
 const styleEl = document.createElement('style');
-styleEl.textContent = `@keyframes pulse { 0%,100%{box-shadow:0 0 0 0 rgba(255,68,68,0.5)} 50%{box-shadow:0 0 0 6px rgba(255,68,68,0.0)} }`;
+styleEl.textContent = `
+@keyframes pulse { 0%,100%{box-shadow:0 0 0 0 rgba(255,68,68,0.5)} 50%{box-shadow:0 0 0 6px rgba(255,68,68,0.0)} }
+@keyframes greenPulse { 0%{box-shadow:0 0 0 0 rgba(0,204,136,0.6)} 50%{box-shadow:0 0 0 8px rgba(0,204,136,0)} 100%{box-shadow:0 0 0 0 rgba(0,204,136,0)} }
+`;
 document.head.appendChild(styleEl);
 

@@ -59,7 +59,7 @@ def _setup_log_streaming():
     handler = _SSELogHandler()
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(logging.Formatter("%(name)s | %(message)s"))
-    for name in ("code_agent", "multi_agent", "tool_hooks", "ocr", "voice_io", "chat_session_store", "tutor"):
+    for name in ("code_agent", "multi_agent", "tool_hooks", "ocr", "voice_io", "chat_session_store", "tutor", "fast_search", "rag_brain", "query_pipeline", "code_context"):
         lg = logging.getLogger(name)
         lg.addHandler(handler)
         lg.setLevel(logging.DEBUG)
