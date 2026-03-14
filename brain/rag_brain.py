@@ -11,10 +11,11 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from .metrics import evaluate_retrieval
 from .prompts import STRICT_RAG_PROMPT
+from . import config as _cfg
 from .config import (
-    DATA_DIR, INDEX_META_PATH, EMBEDDING_MODEL, LLM_MODEL, LLM_TEMPERATURE, RERANK_BATCH_SIZE,
+    DATA_DIR, INDEX_META_PATH, EMBEDDING_MODEL, LLM_TEMPERATURE, RERANK_BATCH_SIZE,
     RETRIEVAL_K, CHUNK_SIZE, CHUNK_OVERLAP, FUSION_MODE, FUSION_ALPHA, FUSION_K_PARAM,
-    ENABLE_QUERY_SPELL_CORRECTION, ENABLE_QUERY_REWRITE, ENABLE_QUERY_EXPANSION,
+    ENABLE_QUERY_SPELL_CORRECTION, ENABLE_QUERY_REWRITE, ENABLE_QUERY_EXPANSION, make_llm,
     RETRIEVAL_CANDIDATE_MULTIPLIER, RERANK_METHOD, CROSS_ENCODER_MODEL, CHROMA_DIR, USE_SMART_K
 )
 from .pdf_utils import load_pdfs
@@ -235,7 +236,7 @@ async def hybrid_retrieval(
     
     effective_question = enhance_query_for_retrieval(
         query=question,
-        llm_model=LLM_MODEL,
+        llm_model=_cfg.LLM_MODEL,
         enable_spell_correction=ENABLE_QUERY_SPELL_CORRECTION,
         enable_rewrite=ENABLE_QUERY_REWRITE,
         enable_expansion=ENABLE_QUERY_EXPANSION,
@@ -253,7 +254,7 @@ async def hybrid_retrieval(
     candidate_multiplier = max(1, RETRIEVAL_CANDIDATE_MULTIPLIER)     
 
     if USE_SMART_K:
-        llm = OllamaLLM(model=LLM_MODEL)  
+        llm = make_llm()
         base_k = await get_smart_k(question, llm)
     else:
         base_k = get_dynamic_k(question)

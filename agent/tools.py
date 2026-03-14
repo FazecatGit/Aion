@@ -1,6 +1,9 @@
 import difflib
 import subprocess
+import sys
 from pathlib import Path
+
+_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -19,6 +22,7 @@ def run_git_command(args: list[str]) -> str:
         capture_output=True,
         text=True,
         check=False,
+        creationflags=_SUBPROCESS_FLAGS,
     )
     return result.stdout
 
@@ -31,6 +35,7 @@ def run_python_file(path: str) -> str:
         capture_output=True,
         text=True,
         check=False,
+        creationflags=_SUBPROCESS_FLAGS,
     )
     return result.stdout
 

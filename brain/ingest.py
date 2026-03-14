@@ -77,16 +77,46 @@ def _classify_document_topic(source_path: str) -> str:
 
 
 def _enrich_metadata(doc) -> dict:
-    """Build clean metadata: keep source filename + add topic classification."""
+    """Build clean metadata: keep source filename + add topic classification
+    and algorithm sub-category for improved retrieval."""
     meta = dict(doc.metadata or {})
     raw_source = meta.get("source") or meta.get("file_path") or ""
     # Keep just the filename (no full path for privacy)
     source_name = Path(raw_source).name if raw_source else "unknown"
     topic = _classify_document_topic(raw_source)
-    return {
+
+    # Detect algorithm sub-category from chunk content for finer-grained retrieval
+    algo_category = ""
+    if topic == "algorithms":
+        content_lower = (doc.page_content or "").lower()
+        _ALGO_CATEGORIES = [
+            (["binary search", "bisect", "lower_bound", "upper_bound"], "binary-search"),
+            (["dynamic programming", "memoization", "tabulation", "subproblem", "knapsack"], "dp"),
+            (["two pointer", "two-pointer", "left pointer", "right pointer"], "two-pointer"),
+            (["sliding window", "window size", "shrink window"], "sliding-window"),
+            (["breadth first", "bfs", "queue"], "bfs"),
+            (["depth first", "dfs", "backtrack"], "dfs-backtracking"),
+            (["greedy", "locally optimal"], "greedy"),
+            (["divide and conquer", "merge sort", "quick sort"], "divide-conquer"),
+            (["union find", "disjoint set", "union-find"], "union-find"),
+            (["topological sort", "topological order", "dag"], "topological-sort"),
+            (["trie", "prefix tree"], "trie"),
+            (["monotonic stack", "monotone stack", "next greater"], "monotonic-stack"),
+            (["segment tree", "fenwick", "binary indexed"], "segment-tree"),
+            (["graph", "adjacency", "shortest path", "dijkstra", "bellman"], "graph"),
+        ]
+        for keywords, cat in _ALGO_CATEGORIES:
+            if any(kw in content_lower for kw in keywords):
+                algo_category = cat
+                break
+
+    result = {
         k: v for k, v in meta.items()
         if k not in ("file_path",)  # drop file_path, keep everything else
     } | {"source": source_name, "topic": topic}
+    if algo_category:
+        result["algo_category"] = algo_category
+    return result
 
 
 TOPIC_MAP_PATH = "cache/topic_map.json"
@@ -265,7 +295,10 @@ def _add_to_chroma_batched(docs, embeddings, persist_directory, resume: bool = F
         i = batch_idx * CHROMA_BATCH_SIZE
         batch = docs[i:i + CHROMA_BATCH_SIZE]
         try:
-            Chroma.from_documents(batch, embedding=embeddings, persist_directory=persist_directory)
+            Chroma.from_documents(
+                batch, embedding=embeddings, persist_directory=persist_directory,
+                collection_metadata={"hnsw:space": "cosine"},
+            )
             _save_chroma_progress(batch_idx + 1, total_batches)
             _log(f"Chroma batch {batch_idx + 1}/{total_batches}: embedded {len(batch)} chunks")
         except Exception as e:
@@ -535,14 +568,20 @@ def ingest_file(file_path: str):
 
     if os.path.exists(CHROMA_DIR):
         if cleaned_new:
-            Chroma.from_documents(cleaned_new, embedding=embeddings, persist_directory=CHROMA_DIR)
+            Chroma.from_documents(
+                cleaned_new, embedding=embeddings, persist_directory=CHROMA_DIR,
+                collection_metadata={"hnsw:space": "cosine"},
+            )
     else:
         cleaned_all = []
         for doc in combined_splits:
             clean_doc = doc.copy()
             clean_doc.metadata = _enrich_metadata(doc)
             cleaned_all.append(clean_doc)
-        Chroma.from_documents(cleaned_all, embedding=embeddings, persist_directory=CHROMA_DIR)
+        Chroma.from_documents(
+            cleaned_all, embedding=embeddings, persist_directory=CHROMA_DIR,
+            collection_metadata={"hnsw:space": "cosine"},
+        )
 
     # cache updated splits
     with Path("cache/splits.pkl").open('wb') as f:

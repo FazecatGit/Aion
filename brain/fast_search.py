@@ -2,8 +2,9 @@ from pathlib import Path
 import pickle
 import logging
 from typing import Any, List, Dict
+from print_logger import get_logger
 
-logger = logging.getLogger("fast_search")
+logger = get_logger("fast_search")
 
 BM25_IDX = None
 BM25_CHUNKS = None

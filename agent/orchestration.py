@@ -11,9 +11,10 @@ from typing import List, Dict, Optional
 
 from langchain_ollama import OllamaLLM
 
-from brain.config import LLM_MODEL, LANG_FENCE
+from brain.config import LLM_MODEL, LANG_FENCE, make_llm
+from print_logger import get_logger
 
-logger = logging.getLogger("code_agent")
+logger = get_logger("code_agent")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -44,7 +45,7 @@ def plan_task(
         }
     """
     if llm is None:
-        llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+        llm = make_llm(temperature=0.0)
 
     lang = LANG_FENCE.get(ext, ext.lstrip('.'))
 
@@ -164,7 +165,7 @@ def critique_code(
         }
     """
     if llm is None:
-        llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+        llm = make_llm(temperature=0.0)
 
     lang = LANG_FENCE.get(ext, ext.lstrip('.'))
 

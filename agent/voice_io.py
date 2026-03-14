@@ -15,8 +15,9 @@ import wave
 from typing import Optional, Tuple
 
 import numpy as np
+from print_logger import get_logger
 
-logger = logging.getLogger("voice_io")
+logger = get_logger("voice_io")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LAZY IMPORTS

@@ -21,8 +21,9 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_core.documents import Document
 
 from brain.config import EMBEDDING_MODEL
+from print_logger import get_logger
 
-logger = logging.getLogger("code_agent")
+logger = get_logger("code_agent")
 
 # Separate directory so it doesn't collide with the RAG knowledge store
 _MEMORY_PERSIST_DIR = "cache/session_memory_db"

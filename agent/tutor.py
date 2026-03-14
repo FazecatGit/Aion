@@ -15,9 +15,11 @@ from datetime import datetime
 from typing import Optional
 
 from langchain_ollama import OllamaLLM
-from brain.config import LLM_MODEL, LLM_TEMPERATURE
+import brain.config as _cfg
+from brain.config import LLM_TEMPERATURE, MATH_LLM_MODEL, make_llm
+from print_logger import get_logger
 
-logger = logging.getLogger("tutor")
+logger = get_logger("tutor")
 
 # In-memory store of active tutor sessions  {session_id: TutorState}
 _tutor_sessions: dict[str, dict] = {}
@@ -25,6 +27,420 @@ _tutor_sessions: dict[str, dict] = {}
 # Track recently generated questions per topic to avoid repetition
 # Key: (topic, difficulty, style), Value: list of question summaries
 _question_history: dict[tuple, list] = {}
+
+# Track completed chapters per subject  {subject_id: set of chapter_ids}
+_curriculum_progress: dict[str, set] = {}
+
+# ── Curriculum data structure ────────────────────────────────────────────────
+# Subjects → Chapters → Topics, ordered from foundational to advanced
+MATH_CURRICULUM = {
+    "algebra": {
+        "name": "Algebra",
+        "icon": "📐",
+        "chapters": [
+            {"id": "alg-basics", "name": "Algebraic Foundations", "topics": [
+                "Order of operations (PEMDAS)", "Variables and expressions", "Simplifying expressions",
+                "Evaluating expressions", "Properties of real numbers",
+            ]},
+            {"id": "alg-linear", "name": "Linear Equations & Inequalities", "topics": [
+                "Solving linear equations", "Graphing linear equations", "Slope and y-intercept",
+                "Systems of linear equations", "Linear inequalities",
+            ]},
+            {"id": "alg-quadratic", "name": "Quadratics & Polynomials", "topics": [
+                "Factoring polynomials", "Quadratic formula", "Completing the square",
+                "Graphing parabolas", "Polynomial long division",
+            ]},
+            {"id": "alg-rational", "name": "Rational & Radical Expressions", "topics": [
+                "Simplifying rational expressions", "Rational equations",
+                "Radical expressions and equations", "Exponent rules", "Rationalizing denominators",
+            ]},
+            {"id": "alg-functions", "name": "Functions & Transformations", "topics": [
+                "Function notation and evaluation", "Domain and range",
+                "Function transformations (shifts, stretches)", "Inverse functions",
+                "Composition of functions", "Piecewise functions",
+            ]},
+        ],
+    },
+    "trigonometry": {
+        "name": "Trigonometry",
+        "icon": "📏",
+        "chapters": [
+            {"id": "trig-basics", "name": "Angles & the Unit Circle", "topics": [
+                "Degree and radian measure", "Converting between degrees and radians",
+                "The unit circle", "Reference angles", "Coterminal angles",
+            ]},
+            {"id": "trig-functions", "name": "Trigonometric Functions", "topics": [
+                "Sine, cosine, tangent definitions", "Reciprocal functions (csc, sec, cot)",
+                "Evaluating trig functions at special angles", "Graphs of sin, cos, tan",
+                "Amplitude, period, and phase shift",
+            ]},
+            {"id": "trig-identities", "name": "Trig Identities & Equations", "topics": [
+                "Pythagorean identities", "Sum and difference formulas",
+                "Double angle formulas", "Half angle formulas", "Solving trigonometric equations",
+            ]},
+            {"id": "trig-applications", "name": "Applications of Trigonometry", "topics": [
+                "Law of sines", "Law of cosines", "Area of triangles using trig",
+                "Vectors and direction angles", "Polar coordinates",
+            ]},
+        ],
+    },
+    "calculus": {
+        "name": "Calculus",
+        "icon": "∫",
+        "chapters": [
+            {"id": "calc-limits", "name": "Limits & Continuity", "topics": [
+                "Intuitive understanding of limits", "Limit laws and computation",
+                "One-sided limits", "Limits at infinity", "Continuity and the IVT",
+            ]},
+            {"id": "calc-derivatives", "name": "Derivatives", "topics": [
+                "Definition of the derivative", "Power rule", "Product and quotient rule",
+                "Chain rule", "Derivatives of trig functions",
+                "Derivatives of exponential and log functions", "Implicit differentiation",
+            ]},
+            {"id": "calc-applications", "name": "Applications of Derivatives", "topics": [
+                "Related rates", "Optimization problems", "Mean value theorem",
+                "Curve sketching with derivatives", "L'Hôpital's rule",
+            ]},
+            {"id": "calc-integrals", "name": "Integrals", "topics": [
+                "Antiderivatives and indefinite integrals", "Definite integrals and area",
+                "Fundamental theorem of calculus", "U-substitution",
+                "Integration by parts",
+            ]},
+            {"id": "calc-advanced", "name": "Advanced Integration", "topics": [
+                "Trigonometric integrals", "Partial fractions", "Improper integrals",
+                "Volumes of revolution (disk/washer)", "Arc length and surface area",
+            ]},
+            {"id": "calc-series", "name": "Sequences & Series", "topics": [
+                "Sequences and convergence", "Geometric and arithmetic series",
+                "Convergence tests (ratio, root, comparison)", "Power series",
+                "Taylor and Maclaurin series",
+            ]},
+        ],
+    },
+    "linear_algebra": {
+        "name": "Linear Algebra",
+        "icon": "🔢",
+        "chapters": [
+            {"id": "la-vectors", "name": "Vectors & Spaces", "topics": [
+                "Vectors in R² and R³", "Vector addition and scalar multiplication",
+                "Dot product and cross product", "Linear combinations and span",
+                "Linear independence",
+            ]},
+            {"id": "la-matrices", "name": "Matrices & Operations", "topics": [
+                "Matrix addition and multiplication", "Matrix transpose",
+                "Determinants (2x2 and 3x3)", "Inverse matrices",
+                "Row reduction and echelon forms",
+            ]},
+            {"id": "la-systems", "name": "Systems of Equations", "topics": [
+                "Gaussian elimination", "Row-reduced echelon form",
+                "Homogeneous systems", "Solution sets and free variables",
+            ]},
+            {"id": "la-transforms", "name": "Linear Transformations", "topics": [
+                "Matrix as a linear transformation", "Rotation and reflection matrices",
+                "Kernel and image", "Rank-nullity theorem",
+            ]},
+            {"id": "la-eigen", "name": "Eigenvalues & Eigenvectors", "topics": [
+                "Eigenvalue equation", "Finding eigenvalues (characteristic polynomial)",
+                "Finding eigenvectors", "Diagonalization", "Applications of eigenvalues",
+            ]},
+        ],
+    },
+    "probability": {
+        "name": "Probability & Statistics",
+        "icon": "🎲",
+        "chapters": [
+            {"id": "prob-basics", "name": "Counting & Probability", "topics": [
+                "Permutations and combinations", "Basic probability rules",
+                "Conditional probability", "Bayes' theorem", "Independent events",
+            ]},
+            {"id": "prob-distributions", "name": "Probability Distributions", "topics": [
+                "Random variables (discrete and continuous)", "Expected value and variance",
+                "Binomial distribution", "Normal distribution",
+                "Poisson distribution",
+            ]},
+            {"id": "stat-descriptive", "name": "Descriptive Statistics", "topics": [
+                "Mean, median, mode", "Standard deviation and variance",
+                "Percentiles and quartiles", "Box plots and histograms",
+                "Correlation and scatter plots",
+            ]},
+            {"id": "stat-inference", "name": "Statistical Inference", "topics": [
+                "Sampling distributions", "Confidence intervals",
+                "Hypothesis testing", "Chi-square tests", "Linear regression",
+            ]},
+        ],
+    },
+    "discrete_math": {
+        "name": "Discrete Mathematics",
+        "icon": "🔗",
+        "chapters": [
+            {"id": "dm-logic", "name": "Logic & Proofs", "topics": [
+                "Propositional logic", "Truth tables", "Logical equivalences",
+                "Methods of proof (direct, contradiction, induction)",
+            ]},
+            {"id": "dm-sets", "name": "Sets & Relations", "topics": [
+                "Set operations (union, intersection, complement)", "Venn diagrams",
+                "Relations and their properties", "Equivalence relations",
+                "Partial orders",
+            ]},
+            {"id": "dm-graphs", "name": "Graph Theory", "topics": [
+                "Graph terminology (vertices, edges, degree)", "Graph representations",
+                "BFS and DFS traversal", "Shortest path algorithms",
+                "Trees and spanning trees", "Euler and Hamilton paths",
+            ]},
+            {"id": "dm-combinatorics", "name": "Combinatorics", "topics": [
+                "Pigeonhole principle", "Inclusion-exclusion",
+                "Generating functions", "Recurrence relations",
+            ]},
+        ],
+    },
+}
+
+
+# ── CS Curriculum — junior → mid → senior level developer knowledge ───────────
+CS_CURRICULUM = {
+    "cs_fundamentals": {
+        "name": "CS Fundamentals",
+        "icon": "🖥️",
+        "level": "junior",
+        "chapters": [
+            {"id": "cs-datatypes", "name": "Data Types & Variables", "topics": [
+                "Primitive types (int, float, string, bool)", "Type casting and conversion",
+                "Constants and immutability", "Null/nil/None handling",
+                "Value types vs reference types",
+            ]},
+            {"id": "cs-control", "name": "Control Flow", "topics": [
+                "If/else and switch statements", "For loops and while loops",
+                "Break, continue, and early returns", "Error handling (try/catch/exceptions)",
+                "Pattern matching basics",
+            ]},
+            {"id": "cs-functions", "name": "Functions & Scope", "topics": [
+                "Function declaration and parameters", "Return values and multiple returns",
+                "Closures and anonymous functions", "Recursion and base cases",
+                "Variable scope and lifetime",
+            ]},
+            {"id": "cs-collections", "name": "Built-in Data Structures", "topics": [
+                "Arrays and slices", "Hash maps / dictionaries",
+                "Sets and their operations", "Stacks and queues (using arrays)",
+                "Strings and string manipulation",
+            ]},
+        ],
+    },
+    "dsa": {
+        "name": "Data Structures & Algorithms",
+        "icon": "🏗️",
+        "level": "junior",
+        "chapters": [
+            {"id": "dsa-complexity", "name": "Big-O & Complexity", "topics": [
+                "Time complexity (O(1), O(n), O(n^2), O(log n))", "Space complexity analysis",
+                "Best/average/worst case", "Amortized analysis basics",
+                "Recognizing complexity from code",
+            ]},
+            {"id": "dsa-sorting", "name": "Sorting & Searching", "topics": [
+                "Binary search and its variants", "Merge sort and quicksort",
+                "Counting sort and radix sort", "Two-pointer technique",
+                "Sliding window technique",
+            ]},
+            {"id": "dsa-linkedlists", "name": "Linked Lists & Trees", "topics": [
+                "Singly and doubly linked lists", "Binary trees and BSTs",
+                "Tree traversals (inorder, preorder, postorder, BFS)",
+                "Balanced trees (AVL/Red-Black concepts)", "Heap / priority queue",
+            ]},
+            {"id": "dsa-graphs", "name": "Graphs", "topics": [
+                "Graph representations (adjacency list/matrix)", "BFS and DFS traversal",
+                "Shortest path (Dijkstra, BFS unweighted)", "Topological sort",
+                "Union-Find / Disjoint Set", "Minimum spanning tree (Kruskal/Prim)",
+            ]},
+            {"id": "dsa-dp", "name": "Dynamic Programming", "topics": [
+                "Memoization vs tabulation", "1D DP (fibonacci, climbing stairs)",
+                "2D DP (grid paths, LCS)", "Knapsack problems",
+                "State machine DP patterns",
+            ]},
+        ],
+    },
+    "oop_design": {
+        "name": "OOP & Design Patterns",
+        "icon": "🧩",
+        "level": "mid",
+        "chapters": [
+            {"id": "oop-basics", "name": "Object-Oriented Principles", "topics": [
+                "Classes, objects, and constructors", "Encapsulation and access modifiers",
+                "Inheritance and composition", "Polymorphism and interfaces",
+                "Abstract classes vs interfaces",
+            ]},
+            {"id": "oop-patterns", "name": "Design Patterns", "topics": [
+                "Singleton and Factory patterns", "Observer and Pub/Sub patterns",
+                "Strategy and Command patterns", "Adapter and Decorator patterns",
+                "Builder pattern and fluent APIs",
+            ]},
+            {"id": "oop-solid", "name": "SOLID Principles", "topics": [
+                "Single Responsibility Principle", "Open/Closed Principle",
+                "Liskov Substitution Principle", "Interface Segregation Principle",
+                "Dependency Inversion Principle",
+            ]},
+        ],
+    },
+    "systems": {
+        "name": "Systems & Architecture",
+        "icon": "⚙️",
+        "level": "mid",
+        "chapters": [
+            {"id": "sys-os", "name": "Operating Systems Concepts", "topics": [
+                "Processes and threads", "Memory management (stack vs heap)",
+                "Concurrency and parallelism", "Mutexes, semaphores, and deadlocks",
+                "File systems and I/O basics",
+            ]},
+            {"id": "sys-networking", "name": "Networking Fundamentals", "topics": [
+                "TCP/IP and HTTP protocol", "REST APIs and status codes",
+                "DNS resolution and routing", "WebSockets and real-time communication",
+                "HTTPS, TLS, and certificates",
+            ]},
+            {"id": "sys-databases", "name": "Databases", "topics": [
+                "SQL fundamentals (SELECT, JOIN, GROUP BY)", "Indexing and query optimization",
+                "ACID properties and transactions", "NoSQL concepts (document, key-value, graph)",
+                "Database normalization (1NF, 2NF, 3NF)",
+            ]},
+            {"id": "sys-devops", "name": "DevOps & Tooling", "topics": [
+                "Git branching strategies (gitflow, trunk-based)", "CI/CD pipeline concepts",
+                "Docker containers and images", "Environment variables and config management",
+                "Logging, monitoring, and observability",
+            ]},
+        ],
+    },
+    "senior_engineering": {
+        "name": "Senior Engineering",
+        "icon": "🏛️",
+        "level": "senior",
+        "chapters": [
+            {"id": "sr-system-design", "name": "System Design", "topics": [
+                "Load balancers and reverse proxies", "Caching strategies (Redis, CDN, memoization)",
+                "Message queues and event-driven architecture", "Microservices vs monolith trade-offs",
+                "Database sharding and replication",
+                "CAP theorem and consistency models",
+            ]},
+            {"id": "sr-scalability", "name": "Scalability & Performance", "topics": [
+                "Horizontal vs vertical scaling", "Rate limiting and throttling",
+                "Connection pooling and resource management", "Profiling and bottleneck identification",
+                "Asynchronous processing patterns",
+            ]},
+            {"id": "sr-security", "name": "Security Engineering", "topics": [
+                "Authentication (OAuth2, JWT, session tokens)", "Authorization (RBAC, ABAC)",
+                "OWASP Top 10 vulnerabilities", "SQL injection and XSS prevention",
+                "Secrets management and encryption at rest/transit",
+            ]},
+            {"id": "sr-architecture", "name": "Software Architecture", "topics": [
+                "Clean Architecture and hexagonal architecture", "Domain-Driven Design (DDD) basics",
+                "Event sourcing and CQRS", "API design (versioning, pagination, error contracts)",
+                "Technical debt management and refactoring strategies",
+            ]},
+            {"id": "sr-leadership", "name": "Technical Leadership", "topics": [
+                "Code review best practices", "Writing technical RFCs and ADRs",
+                "Mentoring junior developers", "Incident response and postmortems",
+                "Estimating and planning complex projects",
+            ]},
+        ],
+    },
+}
+
+# Track completed chapters for CS curriculum
+_cs_curriculum_progress: dict[str, set] = {}
+
+
+def get_curriculum() -> dict:
+    """Return the full curriculum tree with progress info."""
+    result = {}
+    for subj_id, subj in MATH_CURRICULUM.items():
+        completed = _curriculum_progress.get(subj_id, set())
+        chapters = []
+        for ch in subj["chapters"]:
+            chapters.append({
+                "id": ch["id"],
+                "name": ch["name"],
+                "topics": ch["topics"],
+                "completed": ch["id"] in completed,
+            })
+        total = len(chapters)
+        done = sum(1 for c in chapters if c["completed"])
+        result[subj_id] = {
+            "name": subj["name"],
+            "icon": subj["icon"],
+            "progress": f"{done}/{total}",
+            "chapters": chapters,
+        }
+    return result
+
+
+def get_cs_curriculum() -> dict:
+    """Return the CS curriculum tree with progress info."""
+    result = {}
+    for subj_id, subj in CS_CURRICULUM.items():
+        completed = _cs_curriculum_progress.get(subj_id, set())
+        chapters = []
+        for ch in subj["chapters"]:
+            chapters.append({
+                "id": ch["id"],
+                "name": ch["name"],
+                "topics": ch["topics"],
+                "completed": ch["id"] in completed,
+            })
+        total = len(chapters)
+        done = sum(1 for c in chapters if c["completed"])
+        result[subj_id] = {
+            "name": subj["name"],
+            "icon": subj["icon"],
+            "level": subj.get("level", ""),
+            "progress": f"{done}/{total}",
+            "chapters": chapters,
+        }
+    return result
+
+
+def get_cs_chapter_topics(subject_id: str, chapter_id: str) -> dict:
+    """Get topics for a CS curriculum chapter."""
+    subj = CS_CURRICULUM.get(subject_id)
+    if not subj:
+        return {"error": f"CS subject '{subject_id}' not found"}
+    for ch in subj["chapters"]:
+        if ch["id"] == chapter_id:
+            return {
+                "subject": subj["name"],
+                "chapter": ch["name"],
+                "topics": ch["topics"],
+                "chapter_id": chapter_id,
+                "level": subj.get("level", ""),
+            }
+    return {"error": f"Chapter '{chapter_id}' not found in {subject_id}"}
+
+
+def mark_cs_chapter_complete(subject_id: str, chapter_id: str) -> dict:
+    """Mark a CS chapter as completed."""
+    if subject_id not in CS_CURRICULUM:
+        return {"error": f"CS subject '{subject_id}' not found"}
+    _cs_curriculum_progress.setdefault(subject_id, set()).add(chapter_id)
+    return {"status": "ok", "subject": subject_id, "chapter": chapter_id}
+
+
+def get_chapter_topics(subject_id: str, chapter_id: str) -> dict:
+    """Get topics for a specific chapter, suitable for starting a lesson."""
+    subj = MATH_CURRICULUM.get(subject_id)
+    if not subj:
+        return {"error": f"Subject '{subject_id}' not found"}
+    for ch in subj["chapters"]:
+        if ch["id"] == chapter_id:
+            return {
+                "subject": subj["name"],
+                "chapter": ch["name"],
+                "topics": ch["topics"],
+                "chapter_id": chapter_id,
+            }
+    return {"error": f"Chapter '{chapter_id}' not found in {subject_id}"}
+
+
+def mark_chapter_complete(subject_id: str, chapter_id: str) -> dict:
+    """Mark a chapter as completed."""
+    if subject_id not in MATH_CURRICULUM:
+        return {"error": f"Subject '{subject_id}' not found"}
+    _curriculum_progress.setdefault(subject_id, set()).add(chapter_id)
+    return {"status": "ok", "subject": subject_id, "chapter": chapter_id}
 
 
 def _fetch_rag_context(topic: str, max_chunks: int = 3) -> str:
@@ -55,8 +471,10 @@ def _fetch_rag_context(topic: str, max_chunks: int = 3) -> str:
     return ""
 
 
-def _llm(temperature: float = 0.3) -> OllamaLLM:
-    return OllamaLLM(model=LLM_MODEL, temperature=temperature)
+def _llm(temperature: float = 0.3, is_math: bool = False) -> OllamaLLM:
+    model = MATH_LLM_MODEL if (is_math and MATH_LLM_MODEL) else _cfg.LLM_MODEL
+    logger.info("[LLM] Using model: %s (math=%s)", model, is_math)
+    return make_llm(model=model, temperature=temperature)
 
 
 def _parse_json_from_llm(text: str) -> dict:
@@ -286,12 +704,62 @@ def _try_unwrap_json_string(value: str) -> str:
     return value
 
 
+def _strip_latex(text: str) -> str:
+    """Convert LaTeX math notation to readable plain text.
+
+    The frontend has no LaTeX renderer, so \\begin{cases}, $$...$$, etc.
+    display as garbage.  This converts common patterns to readable ASCII.
+    """
+    if not text or '\\' not in text and '$$' not in text and '\\begin' not in text:
+        return text
+    s = text
+    # Remove $$ and $ delimiters
+    s = s.replace('$$', '')
+    s = re.sub(r'(?<!\\)\$', '', s)
+    # \begin{cases}...\end{cases} → line-by-line
+    s = re.sub(r'\\begin\{cases\}', '', s)
+    s = re.sub(r'\\end\{cases\}', '', s)
+    # \\  (LaTeX line break) → newline
+    s = s.replace('\\\\', '\n')
+    # \frac{a}{b} → (a)/(b)
+    s = re.sub(r'\\frac\{([^}]*)\}\{([^}]*)\}', r'(\1)/(\2)', s)
+    # \sqrt{x} → sqrt(x)
+    s = re.sub(r'\\sqrt\{([^}]*)\}', r'sqrt(\1)', s)
+    # \left and \right → nothing
+    s = re.sub(r'\\(?:left|right)[(.)|\[\]{}]?', '', s)
+    # \text{...} → ...
+    s = re.sub(r'\\text\{([^}]*)\}', r'\1', s)
+    # \mathbf{...}, \mathrm{...} etc → ...
+    s = re.sub(r'\\math[a-z]*\{([^}]*)\}', r'\1', s)
+    # \times → ×, \div → ÷, \cdot → ·, \pm → ±
+    s = s.replace('\\times', '×').replace('\\div', '÷')
+    s = s.replace('\\cdot', '·').replace('\\pm', '±')
+    # \geq → >=, \leq → <=, \neq → !=
+    s = s.replace('\\geq', '>=').replace('\\leq', '<=')
+    s = s.replace('\\neq', '!=').replace('\\approx', '≈')
+    # \pi → π, \theta → θ, \alpha → α, \beta → β, \infty → ∞
+    for sym, repl in [('pi', 'π'), ('theta', 'θ'), ('alpha', 'α'), ('beta', 'β'),
+                       ('gamma', 'γ'), ('delta', 'δ'), ('infty', '∞'), ('sum', 'Σ'),
+                       ('int', '∫'), ('partial', '∂')]:
+        s = s.replace(f'\\{sym}', repl)
+    # x^{n} → x^n
+    s = re.sub(r'\^\{([^}]*)\}', r'^\1', s)
+    # x_{n} → x_n
+    s = re.sub(r'_\{([^}]*)\}', r'_\1', s)
+    # Remove any remaining \commandname
+    s = re.sub(r'\\[a-zA-Z]+', '', s)
+    # Collapse excess whitespace
+    s = re.sub(r'[ \t]+', ' ', s)
+    s = re.sub(r'\n{3,}', '\n\n', s)
+    return s.strip()
+
+
 def _sanitize_problem(problem: dict, style: str) -> dict:
-    """Clean up a parsed problem dict so no field contains raw JSON slop."""
+    """Clean up a parsed problem dict so no field contains raw JSON slop or LaTeX."""
     # Clean question
     q = problem.get("question", "")
     if isinstance(q, str):
-        problem["question"] = _try_unwrap_json_string(q)
+        problem["question"] = _strip_latex(_try_unwrap_json_string(q))
 
     # Clean code_snippet
     cs = problem.get("code_snippet", "")
@@ -301,7 +769,12 @@ def _sanitize_problem(problem: dict, style: str) -> dict:
     # Clean explanation
     exp = problem.get("explanation", "")
     if isinstance(exp, str):
-        problem["explanation"] = _try_unwrap_json_string(exp)
+        problem["explanation"] = _strip_latex(_try_unwrap_json_string(exp))
+
+    # Clean steps
+    steps = problem.get("steps", [])
+    if isinstance(steps, list):
+        problem["steps"] = [_strip_latex(str(s)) for s in steps if s]
 
     # Clean options — each must be a plain string like "A) ..."
     if style == "mcq":
@@ -811,7 +1284,7 @@ def generate_math_problem(
     random_angle = random.choice(angles)
 
     logger.info("[MATH] Step 2/3: Invoking LLM to generate %s problem...", style)
-    llm = _llm(temperature=0.6)
+    llm = _llm(temperature=0.6, is_math=True)
 
     if style == "mcq":
         prompt = f"""Generate a multiple-choice math question about {topic} at {difficulty} difficulty.
@@ -821,9 +1294,17 @@ Angle: {random_angle}
 {rag_context}
 IMPORTANT: After generating options, VERIFY your answer by solving the problem step by step.
 Double-check arithmetic carefully. The correct_answer letter MUST match the option that equals your computed result.
+
+FORMATTING RULES — FOLLOW EXACTLY:
+- Use PLAIN TEXT math only: x^2, sqrt(x), dy/dx, integral(f(x)dx)
+- Do NOT use LaTeX: no \\begin, \\frac, \\sqrt, $$, no dollar signs.
+- For systems of equations, write each equation on its own line separated by commas or "and".
+- Example good: "2x + 3y = 10 and x - y = 1"
+- Example bad: "$$\\begin{{cases}} 2x + 3y = 10 \\end{{cases}}$$"
+
 Return ONLY a JSON object:
 {{
-  "question": "The math question with any necessary equations (use plain text math notation)",
+  "question": "The math question (PLAIN TEXT math notation only — no LaTeX)",
   "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
   "correct_answer": "A",
   "steps": [
@@ -868,9 +1349,15 @@ CRITICAL INSTRUCTIONS:
 4. The correct_answer MUST match what you computed in the final step.
 5. If the problem involves evaluating at a point, substitute and compute carefully.
 
+FORMATTING RULES — FOLLOW EXACTLY:
+- Use PLAIN TEXT math only: x^2, sqrt(x), dy/dx, integral(f(x)dx)
+- Do NOT use LaTeX: no \\begin, \\frac, \\sqrt, $$, no dollar signs.
+- For systems of equations, write each equation on its own line.
+- Example: "Solve: 2x + 3y = 10 and x - y = 1"
+
 Return ONLY a JSON object:
 {{
-  "question": "The problem statement with specific values (use plain text math notation like x^2 for x squared, sqrt(x) for square root)",
+  "question": "The problem statement with specific values (PLAIN TEXT — no LaTeX)",
   "correct_answer": "The final numerical or symbolic answer",
   "steps": [
     "Step 1: Identify what we need to find and write the equation",
@@ -947,26 +1434,33 @@ Return ONLY a JSON object:
 def _generate_math_lesson(topic: str, difficulty: str = "medium", rag_context: str = "") -> dict:
     """Generate a math lesson (not code-based)."""
     logger.info("[MATH] Generating lesson for '%s' (%s)...", topic, difficulty)
-    llm = _llm(temperature=0.4)
-    prompt = f"""You are an expert math tutor. Generate a concise lesson about "{topic}" at {difficulty} difficulty.
+    llm = _llm(temperature=0.4, is_math=True)
+    prompt = f"""You are an expert math tutor creating a lesson for a student learning "{topic}" at {difficulty} difficulty.
 {rag_context}
 IMPORTANT: Verify all mathematical computations in your example. Double-check arithmetic.
+Do NOT use LaTeX notation (no \\begin, \\frac, $$). Use plain text math only.
+
+Your lesson should:
+1. START with a motivating "why this matters" hook — a real-world scenario or interesting question that makes the student curious.
+2. Explain the core concept clearly, building from what the student already knows.
+3. Include concrete rules/formulas they can reference.
+4. Walk through a worked example with every arithmetic step shown.
 
 Return ONLY a JSON object:
 {{
   "title": "Topic Title (e.g. Derivatives - Chain Rule)",
-  "explanation": "Clear 2-4 paragraph explanation of the concept, its meaning, and when to use it. Use plain text math notation.",
+  "explanation": "Start with WHY this matters (1 paragraph with a real-world hook). Then explain the concept in 2-3 clear paragraphs, building intuition before formalism. Use analogies where helpful. Plain text math only.",
   "rules": [
-    "Rule 1: key formula or theorem with the formula itself",
-    "Rule 2: when and how to apply it",
-    "Rule 3: common pitfall or edge case"
+    "Rule 1: The key formula or theorem, written out with the formula itself (e.g. d/dx[x^n] = n*x^(n-1))",
+    "Rule 2: When and how to apply it — describe the situation where you'd reach for this rule",
+    "Rule 3: Common pitfall or edge case that trips students up, and how to avoid it"
   ],
-  "example_code": "A worked example problem with step-by-step solution (not code, but a solved problem)",
-  "example_explanation": "Detailed walkthrough of each step in the example",
+  "example_code": "A fully worked problem with every computation step shown: State the problem, show each step, arrive at the answer",
+  "example_explanation": "Detailed walkthrough explaining the reasoning behind each step — why we did it, not just what we did",
   "key_terms": ["term1", "term2", "term3"]
 }}
 
-Use plain text math notation: x^2 for powers, sqrt(x) for roots, dy/dx for derivatives, integral(f(x)dx) for integrals."""
+FORMATTING: Use plain text math — x^2, sqrt(x), dy/dx, integral(f(x)dx). No LaTeX."""
 
     raw = llm.invoke(prompt)
     logger.info("[MATH] Lesson LLM response received")
@@ -1020,7 +1514,38 @@ Return ONLY a JSON object:
         raw = llm.invoke(prompt)
         result = _parse_json_from_llm(raw)
         verified_letter = result.get("correct_letter", "").strip().upper()
+        computed_answer = str(result.get("computed_answer", "")).strip()
         original_letter = problem.get("correct_answer", "").strip().upper()
+
+        # Check if the computed answer actually matches any of the option values
+        if computed_answer and options:
+            answer_found_in_options = False
+            for opt in options:
+                # Extract the value part after "A) ", "B) ", etc.
+                opt_value = opt.split(")", 1)[-1].strip() if ")" in opt else opt.strip()
+                if computed_answer == opt_value or computed_answer in opt:
+                    answer_found_in_options = True
+                    break
+            if not answer_found_in_options:
+                logger.warning(
+                    "[MATH] Computed answer '%s' not found in any option %s — regenerating options",
+                    computed_answer, [o[:20] for o in options],
+                )
+                # Replace the option that was marked correct with the computed answer,
+                # and set the correct_answer to that letter
+                target_idx = "ABCD".index(verified_letter) if verified_letter and verified_letter in "ABCD" else 0
+                letter = "ABCD"[target_idx]
+                options[target_idx] = f"{letter}) {computed_answer}"
+                problem["options"] = options
+                problem["correct_answer"] = letter
+                if result.get("explanation"):
+                    problem["explanation"] = result["explanation"]
+                if result.get("work"):
+                    work_steps = [s.strip() for s in result["work"].split("\n") if s.strip()]
+                    problem["steps"] = work_steps + problem.get("steps", [])
+                logger.info("[MATH] Fixed option %s to '%s' ✓", letter, computed_answer)
+                return problem
+
         if verified_letter and verified_letter[0] in "ABCD":
             verified_letter = verified_letter[0]
             if original_letter and original_letter[0] != verified_letter:
@@ -1139,7 +1664,7 @@ def check_math_answer(session_id: str, user_answer: str) -> dict:
     logger.info("[MATH] Using LLM to evaluate answer equivalence...")
     correct = problem.get("correct_answer", "")
     steps = problem.get("steps", [])
-    llm = _llm(temperature=0.1)
+    llm = _llm(temperature=0.1, is_math=True)
     prompt = f"""You are grading a student's math answer.
 
 Question: {problem.get('question', '')}
@@ -1196,7 +1721,7 @@ def get_math_step_by_step(session_id: str) -> dict:
         logger.info("[MATH] No steps stored — generating via LLM...")
         question = problem.get("question", "")
         if question:
-            llm = _llm(temperature=0.3)
+            llm = _llm(temperature=0.3, is_math=True)
             prompt = f"""Solve the following math problem step by step.
 
 Problem: {question}
@@ -1368,7 +1893,7 @@ def _symbolic_derivative(expression: str, variable: str = "x") -> str:
 
     # For complex expressions, use LLM
     try:
-        llm = _llm(temperature=0.0)
+        llm = _llm(temperature=0.0, is_math=True)
         prompt = (
             f"Compute the derivative of f({variable}) = {expression} with respect to {variable}.\n"
             f"Return ONLY the derivative expression using plain text math notation "

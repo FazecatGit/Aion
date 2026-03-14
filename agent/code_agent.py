@@ -7,10 +7,9 @@ from datetime import datetime
 from types import SimpleNamespace
 import os
 
-from langchain_ollama import OllamaLLM
 from typing import List, Dict, Optional
 
-from brain.config import LLM_MODEL, LANG_NAMES, LANG_FENCE, IMPLEMENT_KEYWORDS
+from brain.config import LLM_MODEL, LANG_NAMES, LANG_FENCE, IMPLEMENT_KEYWORDS, make_llm
 from brain.fast_search import fast_topic_search
 from db.db_reader import get_code_documents
 from .tools import read_file, write_file, run_git_command, show_diff, run_python_file, run_shell_command, list_files
@@ -28,8 +27,9 @@ from .code_editing_helpers import (
 from .code_context_builders import build_all_contexts, run_lint_checks
 from .session_memory import SessionMemory
 from .orchestration import plan_task, format_plan_for_prompt, critique_code, build_critic_feedback_note
+from print_logger import get_logger
 
-logger = logging.getLogger("code_agent")
+logger = get_logger("code_agent")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
@@ -107,6 +107,40 @@ class CodeAgent:
         return any(kw in instruction_lower for kw in IMPLEMENT_KEYWORDS)
 
     @staticmethod
+    def _classify_problem_pattern(instruction: str, source: str, ext: str, llm) -> str:
+        """Pre-pass: classify the algorithmic pattern before code generation.
+
+        Returns a short classification block (pattern name, key invariants,
+        edge cases) that gets injected into the analysis/edit prompts so the
+        LLM reasons from a correct framework instead of guessing.
+        """
+        lang_name = LANG_NAMES.get(ext, ext.lstrip('.').upper() if ext else 'code')
+        prompt = (
+            "You are an algorithm classification expert. Given the problem below "
+            "and the current code, identify the CORE algorithmic pattern needed.\n\n"
+            f"PROBLEM: {instruction[:1500]}\n\n"
+            f"CURRENT CODE ({lang_name}):\n```\n{source[:2000]}\n```\n\n"
+            "Respond with EXACTLY this format (no other text):\n"
+            "PATTERN: <pattern name, e.g. two-pointer, binary search, BFS, DP, "
+            "sliding window, greedy, backtracking, divide-and-conquer, union-find, "
+            "trie, monotonic stack, topological sort, etc.>\n"
+            "INVARIANT: <the key invariant that must hold at every step>\n"
+            "EDGE CASES: <comma-separated list of edge cases to handle>\n"
+            "COMPLEXITY: <expected time and space complexity>\n"
+        )
+        try:
+            classification = llm.invoke(prompt).strip()
+            # Validate it has the expected structure
+            if "PATTERN:" in classification:
+                logger.info("[CLASSIFY] %s", classification.replace('\n', ' | '))
+                return classification
+            logger.debug("[CLASSIFY] LLM returned unstructured output, discarding")
+            return ""
+        except Exception as e:
+            logger.debug("[CLASSIFY] Classification failed: %s", e)
+            return ""
+
+    @staticmethod
     def _resolve_rerank_method(instruction: str, rerank_method: str) -> str:
         """Auto-select rerank method based on instruction complexity.
         
@@ -176,7 +210,7 @@ class CodeAgent:
             return instruction
 
         try:
-            llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+            llm = make_llm(temperature=0.0)
             lang_name = LANG_FENCE.get(ext, ext.lstrip('.'))
             prompt = (
                 f"A user gave this instruction about their {lang_name} code:\n"
@@ -316,6 +350,15 @@ class CodeAgent:
         # extracted repeated `combined_context + extra_syntax` into one variable
         context_block = combined_context + extra_syntax
 
+        # --- Cap context to avoid bloated prompts that stall the LLM ---
+        _MAX_CONTEXT_CHARS = 6000  # ~1500 tokens of reference context
+        if len(context_block) > _MAX_CONTEXT_CHARS:
+            logger.warning(
+                "[AGENT] Context block too large (%d chars), truncating to %d",
+                len(context_block), _MAX_CONTEXT_CHARS,
+            )
+            context_block = context_block[:_MAX_CONTEXT_CHARS] + "\n... (context truncated)\n"
+
         # --- Choose snippet for prompt ---
         func_start, func_end = 0, len(file_lines)
 
@@ -352,7 +395,24 @@ class CodeAgent:
             "```"
         )
 
-        llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+        # --- Cap original_snippet to prevent enormous prompts ---
+        _MAX_SNIPPET_CHARS = 12000  # ~3000 tokens of code
+        if len(original_snippet) > _MAX_SNIPPET_CHARS:
+            logger.warning(
+                "[AGENT] File snippet too large (%d chars), truncating to %d",
+                len(original_snippet), _MAX_SNIPPET_CHARS,
+            )
+            original_snippet = original_snippet[:_MAX_SNIPPET_CHARS] + "\n// ... (file truncated — remaining code omitted)\n"
+
+        # Log total prompt budget for debugging
+        _total_prompt_est = len(original_snippet) + len(context_block) + len(instruction) + 500
+        logger.info(
+            "[AGENT] Prompt budget: snippet=%d ctx=%d instruction=%d total=~%d chars (~%d tok)",
+            len(original_snippet), len(context_block), len(instruction),
+            _total_prompt_est, _total_prompt_est // 4,
+        )
+
+        llm = make_llm(temperature=0.0)
 
         if task_mode == "solve":
             is_implement = True
@@ -403,7 +463,21 @@ class CodeAgent:
             )
             logger.info("[AGENT] Crash-type bug detected — injecting bounds-checking analysis hints")
 
-        # --- Two-stage: analysis then edit ---
+        # --- Pattern classification pre-pass ---
+        pattern_classification = ""
+        if is_implement or is_crash_bug or "fix" in instruction.lower():
+            pattern_classification = self._classify_problem_pattern(
+                instruction, file_source, ext, llm
+            )
+        pattern_block = ""
+        if pattern_classification:
+            pattern_block = (
+                f"\nALGORITHM CLASSIFICATION (use this to guide your solution):\n"
+                f"{pattern_classification}\n\n"
+            )
+
+        # --- Two-stage: analysis (reasoning, temp=0.1) then edit (coding, temp=0.0) ---
+        reasoning_llm = make_llm(temperature=0.1)
         logger.info("Waiting for LLM to analyze the issue...")
         try:
             if is_implement:
@@ -413,6 +487,7 @@ class CodeAgent:
                     f"{lang_directive}"
                     f"TASK: {instruction}\n\n"
                     f"{plan_section}"
+                    f"{pattern_block}"
                     f"{original_header}```{lang_fence}\n{original_snippet}\n```\n\n"
                     "Describe step-by-step what algorithm or logic you will implement to satisfy the requirement. "
                     "Be specific about data structures, loop structure, and edge cases.\n\n"
@@ -422,11 +497,12 @@ class CodeAgent:
                 analysis_prompt = (
                     f"Look at this code and describe what needs to change to fix: {instruction}\n\n"
                     f"{lang_directive}"
+                    f"{pattern_block}"
                     f"{original_header}```{lang_fence}\n{original_snippet}\n```\n\n"
                     f"{crash_analysis_hint}"
                     f"{context_block}"
                 )
-            analysis = llm.invoke(analysis_prompt).strip()
+            analysis = reasoning_llm.invoke(analysis_prompt).strip()
 
             logger.info("Analysis received; requesting SEARCH/REPLACE from LLM...")
             
@@ -1023,6 +1099,44 @@ class CodeAgent:
         logger.info("Wrote file %s", path)
         return new_source
 
+    def _classify_problem_pattern(
+        self, instruction: str, code: str, ext: str, llm
+    ) -> str:
+        """Classify the algorithm pattern to guide solution generation.
+        
+        Returns a structured analysis including:
+        - Pattern type (binary search, DP, two-pointer, etc.)
+        - Key invariants to maintain
+        - Edge cases to handle
+        - Time/space complexity expectations
+        """
+        prompt = (
+            f"Analyze this {LANG_NAMES.get(ext, 'code')} problem and identify the algorithm pattern:\n\n"
+            f"PROBLEM:\n{instruction}\n\n"
+            f"CURRENT CODE (if any):\n```{LANG_FENCE.get(ext, 'text')}\n{code[:1500]}\n```\n\n"
+            "Classify the algorithm pattern and provide:\n"
+            "1. PATTERN: Name the algorithm type (e.g. 'binary search', 'dynamic programming', "
+            "'two-pointer', 'sliding window', 'DFS backtracking', 'BFS', 'greedy', 'topological sort', etc.)\n"
+            "2. CORE INVARIANTS: What conditions must ALWAYS remain true for the solution to work?\n"
+            "3. EDGE CASES: List 3-5 specific edge cases this pattern commonly fails on.\n"
+            "4. COMPLEXITY: Expected time and space complexity.\n"
+            "5. SOLUTION TEMPLATE: 2-3 lines describing the high-level algorithm structure.\n\n"
+            "Format:\n"
+            "PATTERN: [type]\n"
+            "INVARIANTS: [list]\n"
+            "EDGE CASES: [list]\n"
+            "COMPLEXITY: [O(?) time, O(?) space]\n"
+            "TEMPLATE: [description]\n"
+        )
+
+        try:
+            analysis = llm.invoke(prompt).strip()
+            logger.info("[CLASSIFY_PATTERN] Identified: %s", analysis.split('\n')[0][:100])
+            return analysis
+        except Exception as e:
+            logger.debug("[CLASSIFY_PATTERN] Failed: %s", e)
+            return ""
+
     def _strategy_pivot(
         self,
         llm,
@@ -1075,8 +1189,13 @@ class CodeAgent:
         )
 
         try:
-            # Use slightly higher temperature to encourage creative divergence
-            pivot_llm = OllamaLLM(model=LLM_MODEL, temperature=0.3)
+            # Use higher temperature + expanded context for creative divergence
+            from brain.config import LLM_NUM_CTX_HARD, LLM_NUM_PREDICT_HARD
+            pivot_llm = make_llm(
+                temperature=0.3,
+                num_ctx=LLM_NUM_CTX_HARD,
+                num_predict=LLM_NUM_PREDICT_HARD,
+            )
             rewritten = pivot_llm.invoke(prompt).strip()
             rewritten = strip_markdown(rewritten) if "```" in rewritten else rewritten
 
@@ -1123,7 +1242,7 @@ class CodeAgent:
         """
         from .test_runner import run_tests, build_test_failure_note, run_debug_trace, run_step_verification, format_step_verification_for_prompt
 
-        llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+        llm = make_llm(temperature=0.0)
         original_source = read_file(path)
         source = original_source
         ext = os.path.splitext(path)[1].lower()
@@ -1196,15 +1315,90 @@ class CodeAgent:
                     # Don't pivot yet — let debug trace inform the next fix attempt
                     # The debug trace will be picked up below in the failure_note builder
 
-                # --- Stagnant count 2: Strategy Pivot ---
+                # --- Stagnant count 2: Clean-slate rewrite with pattern classification ---
                 elif stagnant_count >= 2:
                     logger.info(
-                        "[FIX_WITH_TESTS] Identical errors persisting after debug fix — triggering strategy pivot (attempt %d)",
+                        "[FIX_WITH_TESTS] Identical errors persisting after debug fix — "
+                        "forcing clean-slate rewrite with pattern classification (attempt %d)",
                         attempt
                     )
                     explanation_parts.append(
-                        f"Attempt {attempt}: Debug-informed fix didn't resolve — pivoting to a different algorithm."
+                        f"Attempt {attempt}: Debug-informed fix didn't resolve — "
+                        "clean-slate rewrite with pattern classification."
                     )
+
+                    # Step 1: Classify the problem pattern
+                    pattern_class = self._classify_problem_pattern(
+                        instruction, source, ext, llm
+                    )
+
+                    # Step 2: Gather trace data from failures for concrete context
+                    trace_context = ""
+                    if failures:
+                        first_fail = failures[0]
+                        for tc in failures[:3]:
+                            trace_context += (
+                                f"  input={tc['input']}  →  expected={tc['expected']}"
+                                f",  got={tc.get('actual', tc.get('error', 'CRASH'))}\n"
+                            )
+
+                    # Step 3: Force a from-scratch rewrite ignoring the broken code
+                    lang_fence = LANG_FENCE.get(ext, ext.lstrip('.') if ext else 'text')
+                    lang_name = LANG_NAMES.get(ext, ext.lstrip('.').upper() if ext else 'code')
+
+                    failed_block = ""
+                    if failed_approaches:
+                        failed_block = "APPROACHES ALREADY TRIED AND FAILED (do NOT reuse):\n"
+                        for fa in failed_approaches:
+                            failed_block += f"  - {fa}\n"
+                        failed_block += "\n"
+
+                    pattern_section = ""
+                    if pattern_class:
+                        pattern_section = (
+                            f"\nALGORITHM CLASSIFICATION:\n{pattern_class}\n\n"
+                            "Use this classification to guide your implementation.\n"
+                        )
+
+                    rewrite_prompt = (
+                        f"LANGUAGE: You MUST write {lang_name} code. The file is {ext}.\n\n"
+                        f"The previous code was fundamentally broken. Do NOT patch it — "
+                        f"write a COMPLETE new solution from scratch.\n\n"
+                        f"PROBLEM: {instruction}\n\n"
+                        f"{pattern_section}"
+                        f"CONCRETE TEST DATA:\n{trace_context}\n"
+                        f"{failed_block}"
+                        f"Requirements:\n"
+                        f"1. Write the COMPLETE function from scratch using the classified pattern.\n"
+                        f"2. Trace through each failing test case mentally to verify correctness.\n"
+                        f"3. Handle ALL edge cases identified in the classification.\n"
+                        f"4. Output ONLY the function code — no explanation, no markdown fences.\n"
+                        f"REMINDER: Valid {lang_name} ({ext}) only.\n"
+                    )
+
+                    try:
+                        from brain.config import LLM_NUM_CTX_HARD, LLM_NUM_PREDICT_HARD
+                        rewrite_llm = make_llm(
+                            temperature=0.2,
+                            num_ctx=LLM_NUM_CTX_HARD,
+                            num_predict=LLM_NUM_PREDICT_HARD,
+                        )
+                        rewritten = rewrite_llm.invoke(rewrite_prompt).strip()
+                        rewritten = strip_markdown(rewritten) if "```" in rewritten else rewritten
+
+                        if rewritten.strip() and source_matches_ext(rewritten, ext):
+                            _, func_start, func_end = extract_function(source, instruction)
+                            new_source = whole_function_replace(source, rewritten, func_start, func_end)
+                            if new_source and new_source != source:
+                                previous_source = source
+                                source = new_source
+                                write_file(path, source)
+                                logger.info("[FIX_WITH_TESTS] Clean-slate rewrite applied — re-running tests")
+                                continue
+                    except Exception as e:
+                        logger.error("[FIX_WITH_TESTS] Clean-slate rewrite failed: %s", e)
+
+                    # Fallback: try old strategy pivot if clean-slate failed
                     pivot_source = self._strategy_pivot(
                         llm, instruction, source, ext, test_cases, results, failed_approaches
                     )
@@ -1260,17 +1454,25 @@ class CodeAgent:
                 )
                 break
 
-            # --- Temperature escalation ---
+            # --- Temperature + token escalation ---
             # If pass count is stagnant (same as last iteration), bump temperature
+            # AND give the LLM more context/generation room for harder reasoning
             if attempt > 0 and pass_count == best_pass_count and current_temperature < 0.4:
                 current_temperature = min(current_temperature + 0.15, 0.4)
-                llm = OllamaLLM(model=LLM_MODEL, temperature=current_temperature)
+                from brain.config import LLM_NUM_CTX_HARD, LLM_NUM_PREDICT_HARD
+                llm = make_llm(
+                    temperature=current_temperature,
+                    num_ctx=LLM_NUM_CTX_HARD,
+                    num_predict=LLM_NUM_PREDICT_HARD,
+                )
                 logger.info(
-                    "[FIX_WITH_TESTS] Pass count stagnant — escalating temperature to %.2f",
-                    current_temperature
+                    "[FIX_WITH_TESTS] Pass count stagnant — escalating temperature to %.2f, "
+                    "num_ctx=%d, num_predict=%d",
+                    current_temperature, LLM_NUM_CTX_HARD, LLM_NUM_PREDICT_HARD
                 )
                 explanation_parts.append(
-                    f"Escalated temperature to {current_temperature:.2f} for creative problem-solving."
+                    f"Escalated temperature to {current_temperature:.2f} with expanded context "
+                    f"(ctx={LLM_NUM_CTX_HARD}, predict={LLM_NUM_PREDICT_HARD}) for harder reasoning."
                 )
 
             # --- Self-reasoning with debug trace: actual runtime values ---

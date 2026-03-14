@@ -1,6 +1,8 @@
 import os
+import logging
 from pathlib import Path
 
+from brain.timed_llm import TimedLLM
 
 def _env_bool(name: str, default: str = "0") -> bool:
 	return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -16,8 +18,43 @@ INDEX_META_PATH = os.getenv("RAG_INDEX_META_PATH", str(Path(CHROMA_DIR) / "index
 EMBEDDING_MODEL = os.getenv("RAG_EMBEDDING_MODEL", "nomic-embed-text")
 
 # LLM settings
-LLM_MODEL = os.getenv("RAG_LLM_MODEL", "qwen2.5-coder:7b")
+LLM_MODEL = os.getenv("RAG_LLM_MODEL", "qwen3")  # qwen3 for general/code reasoning; qwen3.5 was slow on RAG retrieval tasks
+MATH_LLM_MODEL = os.getenv("RAG_MATH_LLM_MODEL", "qwen3")  # Dedicated math model for tutor; empty = fall back to LLM_MODEL
 LLM_TEMPERATURE = float(os.getenv("RAG_LLM_TEMPERATURE", "0"))
+
+# LLM context / generation limits (adjust based on model VRAM)
+LLM_NUM_CTX = int(os.getenv("RAG_LLM_NUM_CTX", "8192"))          # context window tokens
+LLM_NUM_PREDICT = int(os.getenv("RAG_LLM_NUM_PREDICT", "4096"))   # max output tokens
+LLM_TIMEOUT_SECONDS = int(os.getenv("RAG_LLM_TIMEOUT", "180"))    # per-call timeout (seconds)
+
+
+LLM_NUM_CTX_HARD = int(os.getenv("RAG_LLM_NUM_CTX_HARD", "16384"))
+LLM_NUM_PREDICT_HARD = int(os.getenv("RAG_LLM_NUM_PREDICT_HARD", "8192"))
+
+
+def make_llm(model: str = None, temperature: float = None, *,
+             num_ctx: int = None, num_predict: int = None):
+    """Shared LLM factory. Returns a TimedLLM wrapper with logging/diagnostics.
+    
+    Sets num_ctx and num_predict to prevent unbounded context/generation.
+    Pass explicit num_ctx/num_predict to override the defaults (e.g. for hard problems).
+    Automatically disables thinking mode on qwen3.x models.
+    """
+    from langchain_ollama import OllamaLLM
+    m = model if model is not None else LLM_MODEL
+    t = temperature if temperature is not None else LLM_TEMPERATURE
+    ctx = num_ctx if num_ctx is not None else LLM_NUM_CTX
+    pred = num_predict if num_predict is not None else LLM_NUM_PREDICT
+    # qwen3 models have 'thinking' on by default — disable via reasoning=False
+    reasoning = False if "qwen3" in m.lower() else None
+    raw_llm = OllamaLLM(
+        model=m,
+        temperature=t,
+        reasoning=reasoning,
+        num_ctx=ctx,
+        num_predict=pred,
+    )
+    return TimedLLM(raw_llm)
 
 # Retrieval settings
 RETRIEVAL_K = int(os.getenv("RAG_RETRIEVAL_K", "5"))

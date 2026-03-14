@@ -108,11 +108,12 @@ function App() {
   const [mathSteps, setMathSteps] = useState<string[] | null>(null);
   const [showMathGraph, setShowMathGraph] = useState(false);
   const tutorAbortRef = useRef<AbortController | null>(null);  // for stop button
+  const globalAbortRef = useRef<AbortController | null>(null);  // cancels any in-flight fetch
   const [pulsingBtn, setPulsingBtn] = useState<string | null>(null);  // tracks which button is pulsing
 
   // ── Math Visualization Tools ───────────────────────────────────────────────
   const [showMathViz, setShowMathViz] = useState(false);
-  type MathVizType = 'vector' | 'circle' | 'triangle' | 'unitcircle' | null;
+  type MathVizType = 'vector' | 'circle' | 'triangle' | 'unitcircle' | 'matrix' | 'normal' | 'bezier' | null;
   const [mathVizType, setMathVizType] = useState<MathVizType>(null);
   // Vector: {x, y} endpoints
   const [vizVectors, setVizVectors] = useState<{x: number; y: number; label: string; color: string}[]>([
@@ -127,7 +128,31 @@ function App() {
   // Unit circle angle in degrees
   const [vizAngle, setVizAngle] = useState(45);
 
-  // ── Tools panel state ──────────────────────────────────────────────────────
+  // ── Curriculum browser state ───────────────────────────────────────────────
+  type CurriculumChapter = { id: string; name: string; topics: string[]; completed: boolean };
+  type CurriculumSubject = { name: string; icon: string; progress: string; chapters: CurriculumChapter[] };
+  const [showCurriculum, setShowCurriculum] = useState(false);
+  const [curriculum, setCurriculum] = useState<Record<string, CurriculumSubject> | null>(null);
+  const [csCurriculum, setCsCurriculum] = useState<Record<string, CurriculumSubject> | null>(null);
+  const [currTab, setCurrTab] = useState<'math' | 'cs'>('math');
+  const [currExpandedSubject, setCurrExpandedSubject] = useState<string | null>(null);
+  const [currExpandedChapter, setCurrExpandedChapter] = useState<string | null>(null);
+
+  // ── Matrix viz state ───────────────────────────────────────────────────────
+  const [vizMatrix, setVizMatrix] = useState<number[][]>([[1, 0], [0, 1]]);
+  const [vizMatrixPoints, setVizMatrixPoints] = useState<{x: number; y: number}[]>([
+    { x: 1, y: 0 }, { x: 0, y: 1 }, { x: 1, y: 1 }
+  ]);
+
+  // ── Normal distribution viz state ──────────────────────────────────────────
+  const [vizNormMean, setVizNormMean] = useState(0);
+  const [vizNormStd, setVizNormStd] = useState(1);
+
+  // ── Bezier curve viz state ─────────────────────────────────────────────────
+  const [vizBezierPts, setVizBezierPts] = useState<{x: number; y: number}[]>([
+    { x: 50, y: 250 }, { x: 150, y: 50 }, { x: 250, y: 50 }, { x: 350, y: 250 }
+  ]);
+  const [vizBezierT, setVizBezierT] = useState(0.5);
   const [showToolsPanel, setShowToolsPanel] = useState(false);
   const [toolsOutput, setToolsOutput] = useState<string | null>(null);
   const [toolsLoading, setToolsLoading] = useState(false);
@@ -159,16 +184,48 @@ function App() {
     return () => { es.close(); };
   }, []);
 
-  // Auto-scroll process log
+  // Auto-scroll process log (only when panel is expanded to avoid constant re-renders during active logging)
   useEffect(() => {
-    if (showProcessPanel && processEndRef.current) {
-      processEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    if (showProcessPanel && showProcessPanel === true && processEndRef.current) {
+      // Use requestAnimationFrame to batch scroll updates and avoid janky re-renders
+      requestAnimationFrame(() => {
+        processEndRef.current?.scrollIntoView({ behavior: 'auto' });  // auto instead of smooth to reduce CPU
+      });
     }
   }, [processLogs, showProcessPanel]);
 
   // ── LLM connection status ──────────────────────────────────────────────────
   const [llmConnected, setLlmConnected] = useState<boolean | null>(null);  // null = unknown
   const [llmModel, setLlmModel] = useState<string>('');
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [showModelPicker, setShowModelPicker] = useState(false);
+  const [modelSwitching, setModelSwitching] = useState(false);
+
+  const fetchModels = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/models');
+      if (res.ok) {
+        const data = await res.json();
+        setAvailableModels((data.available ?? []).map((m: any) => m.name as string));
+        setLlmModel(data.current_model ?? '');
+      }
+    } catch { /* server not ready */ }
+  };
+
+  const handleSwitchModel = async (model: string) => {
+    if (model === llmModel || modelSwitching) return;
+    setModelSwitching(true);
+    setShowModelPicker(false);
+    try {
+      await fetch('http://localhost:8000/models/switch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model }),
+      });
+      setLlmModel(model);
+    } catch { /* ignore */ }
+    setModelSwitching(false);
+  };
 
   useEffect(() => {
     const checkHealth = async () => {
@@ -186,6 +243,7 @@ function App() {
       }
     };
     checkHealth();
+    fetchModels();
     const interval = setInterval(checkHealth, 15000);  // poll every 15s
     return () => clearInterval(interval);
   }, []);
@@ -304,6 +362,17 @@ function App() {
     setVisibleCount(prev => Math.max(prev, Math.min(messages.length, MESSAGES_PER_PAGE)));
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // Close model picker on outside click
+  useEffect(() => {
+    if (!showModelPicker) return;
+    const handler = (e: MouseEvent) => {
+      const target = e.target as Element;
+      if (!target.closest('[data-model-picker]')) setShowModelPicker(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [showModelPicker]);
 
   // ── WAV encoder (no ffmpeg needed — pure PCM → WAV) ──────────────────────
   const encodeWAV = (samples: Float32Array, sampleRate: number): Blob => {
@@ -502,38 +571,55 @@ function App() {
         // Guard: if question looks like raw JSON (LLM parse failure), show error
         const q = problem.question.trim();
         if (q.startsWith('{') && q.endsWith('}')) {
-          setMessages(prev => [...prev, { role: 'ai', text: '[TUTOR] Problem generation returned malformed data. Retrying...' }]);
-          // Auto-retry once
-          const retry = await fetch(endpoint, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          });
-          const retryData = await retry.json();
-          if (retryData.status === 'ok' && retryData.question && !retryData.question.trim().startsWith('{')) {
-            const retryProblem = {
-              session_id: retryData.session_id || '',
-              style: retryData.style || tutorStyle,
-              question: retryData.question || '',
-              language: retryData.language || tutorLanguage,
-              options: retryData.options,
-              test_cases: retryData.test_cases,
-              function_name: retryData.function_name,
-              code_snippet: retryData.code_snippet,
-              lesson: retryData.lesson,
-            };
-            // Safeguard: if lesson.explanation is raw JSON, try to parse it
-            if (retryProblem.lesson && typeof retryProblem.lesson.explanation === 'string') {
-              const exp = retryProblem.lesson.explanation.trim();
-              if (exp.startsWith('{') && exp.endsWith('}')) {
-                try {
-                  const parsed = JSON.parse(exp);
-                  if (parsed.explanation) retryProblem.lesson = parsed;
-                } catch { /* keep original */ }
+          setMessages(prev => [...prev, { role: 'ai', text: '[TUTOR] Problem generation returned malformed data. Retrying in 1 second...' }]);
+          // Yield to event loop so UI can update and display logs
+          await new Promise(r => setTimeout(r, 1000));
+          
+          // Auto-retry once with proper timeout and abort control
+          const retryController = new AbortController();
+          const retryTimeout = setTimeout(() => retryController.abort(), 60_000);
+          try {
+            const retry = await fetch(endpoint, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+              signal: retryController.signal,
+            });
+            clearTimeout(retryTimeout);
+            const retryData = await retry.json();
+            if (retryData.status === 'ok' && retryData.question && !retryData.question.trim().startsWith('{')) {
+              const retryProblem = {
+                session_id: retryData.session_id || '',
+                style: retryData.style || tutorStyle,
+                question: retryData.question || '',
+                language: retryData.language || tutorLanguage,
+                options: retryData.options,
+                test_cases: retryData.test_cases,
+                function_name: retryData.function_name,
+                code_snippet: retryData.code_snippet,
+                lesson: retryData.lesson,
+              };
+              // Safeguard: if lesson.explanation is raw JSON, try to parse it
+              if (retryProblem.lesson && typeof retryProblem.lesson.explanation === 'string') {
+                const exp = retryProblem.lesson.explanation.trim();
+                if (exp.startsWith('{') && exp.endsWith('}')) {
+                  try {
+                    const parsed = JSON.parse(exp);
+                    if (parsed.explanation) retryProblem.lesson = parsed;
+                  } catch { /* keep original */ }
+                }
               }
+              setTutorProblem(retryProblem);
+              setMessages(prev => [...prev, { role: 'ai', text: '[TUTOR] ✓ Retry succeeded!' }]);
+            } else {
+              setMessages(prev => [...prev, { role: 'ai', text: '[TUTOR] Retry also returned malformed data. Please try again.' }]);
             }
-            setTutorProblem(retryProblem);
-          } else {
-            setMessages(prev => [...prev, { role: 'ai', text: '[TUTOR] Could not generate a valid problem. Please try again.' }]);
+          } catch (retryErr: any) {
+            clearTimeout(retryTimeout);
+            if (retryErr?.name === 'AbortError') {
+              setMessages(prev => [...prev, { role: 'ai', text: '[TUTOR] Retry timeout — request cancelled.' }]);
+            } else {
+              setMessages(prev => [...prev, { role: 'ai', text: `[TUTOR] Retry failed: ${retryErr?.message || 'unknown'}` }]);
+            }
           }
         } else {
           setTutorProblem(problem);
@@ -552,13 +638,26 @@ function App() {
     setTutorLoading(false);
   };
 
-  // Stop all tutor processes
+  // Stop ALL running processes — tutor, agent, query, everything
   const handleStopAll = () => {
+    // Abort tutor-specific controller
     if (tutorAbortRef.current) {
       tutorAbortRef.current.abort();
       tutorAbortRef.current = null;
     }
+    // Abort any global in-flight fetch (agent, query, etc.)
+    if (globalAbortRef.current) {
+      globalAbortRef.current.abort();
+      globalAbortRef.current = null;
+    }
+    // Tell the backend to cancel any running LLM tasks
+    fetch('http://localhost:8000/agent/cancel', { method: 'POST' }).catch(() => {});
+    // Reset all loading/processing states
     setTutorLoading(false);
+    setMode('idle');
+    setOcrLoading(false);
+    setToolsLoading(false);
+    setMessages(prev => [...prev, { role: 'ai', text: '⏹ All processes stopped.' }]);
   };
 
   // Pulse animation helper for buttons
@@ -674,9 +773,25 @@ function App() {
     setToolsLoading(false);
   };
 
+/** Safely parse a fetch response as JSON, handling non-JSON error responses. */
+const safeJson = async (res: Response): Promise<any> => {
+  if (!res.ok) {
+    // Try to parse JSON error body, fall back to status text
+    const text = await res.text();
+    try { return JSON.parse(text); } catch { /* not JSON */ }
+    throw new Error(`Server error ${res.status}: ${text.slice(0, 200) || res.statusText}`);
+  }
+  return res.json();
+};
+
 const handleSubmit = async (e: React.FormEvent) => {
   e.preventDefault();
   if (!input.trim()) return;
+
+  // Create a fresh AbortController for this request
+  const controller = new AbortController();
+  globalAbortRef.current = controller;
+  const signal = controller.signal;
 
   const userMsg = input.trim();
   setInput('');
@@ -696,8 +811,8 @@ const handleSubmit = async (e: React.FormEvent) => {
       const form = new FormData();
       form.append('image', imageBlob, 'screenshot.png');
       form.append('question', userMsg);
-      const res = await fetch('http://localhost:8000/ocr/analyze', { method: 'POST', body: form });
-      const data = await res.json();
+      const res = await fetch('http://localhost:8000/ocr/analyze', { method: 'POST', body: form, signal });
+      const data = await safeJson(res);
       if (data.status === 'ok') {
         // Update persistent OCR context so follow-up queries also have it
         setOcrContext({ text: data.image_context || data.ocr_text || data.analysis, imageDataUrl: imageDataUrl || '' });
@@ -742,6 +857,7 @@ const handleSubmit = async (e: React.FormEvent) => {
       const res = await fetch(`http://localhost:8000${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal,
         body: JSON.stringify({
           instruction: userMsg,
           file_path: selectedFilePath,
@@ -753,7 +869,7 @@ const handleSubmit = async (e: React.FormEvent) => {
           } : {}),
         }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
 
       if (useMultiAgent && (data.status === 'ok' || data.status === 'pending_review')) {
         // Multi-agent returns {diff, explanation, citations, plan, verdict, attempts, related_files, new_source, critic_feedback, discussion_log}
@@ -822,14 +938,17 @@ const handleSubmit = async (e: React.FormEvent) => {
       const res = await fetch('http://localhost:8000/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal,
         body: JSON.stringify({ question: queryQuestion, mode: queryMode, session_id: sid }),
       });
-      const data = await res.json();
+      const data = await safeJson(res);
 
       // store last user query for potential dislike feedback
       setLastUserQuery(userMsg);
 
-      if (data.fast && data.deep) {
+      if (data.status === 'error') {
+        setMessages(prev => [...prev, { role: 'ai', text: `Error: ${data.error || data.answer || 'Unknown error'}` }]);
+      } else if (data.fast && data.deep) {
         // both mode – show concise answers + summaries, stash full details
         setMessages(prev => [
           ...prev,
@@ -848,34 +967,44 @@ const handleSubmit = async (e: React.FormEvent) => {
         }
       }
     }
-  } catch (err) {
-    setMessages(prev => [...prev, { role: 'ai', text: 'Error connecting to Aion.' }]);
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      // User cancelled — already handled by handleStopAll
+    } else {
+      const errMsg = err?.message || String(err);
+      setMessages(prev => [...prev, { role: 'ai', text: `Error: ${errMsg}` }]);
+    }
   }
 
+  globalAbortRef.current = null;
   setMode('idle');
 };
 
 const handleRunTests = async () => {
   if (!selectedFilePath || testCases.length === 0) return;
+  const controller = new AbortController();
+  globalAbortRef.current = controller;
   setMode('agent-processing');
   try {
     const res = await fetch('http://localhost:8000/agent/run_tests', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
       body: JSON.stringify({
         file_path: selectedFilePath,
         test_cases: testCases.map(tc => ({ input: tc.input, expected: tc.expected })),
       }),
     });
-    const data = await res.json();
+    const data = await safeJson(res);
     if (data.status === 'ok') {
       setTestResults(data.results);
     } else {
       setMessages(prev => [...prev, { role: 'ai', text: `[TEST ERROR] ${data.error}` }]);
     }
-  } catch {
-    setMessages(prev => [...prev, { role: 'ai', text: 'Test run failed — is the server running?' }]);
+  } catch (err: any) {
+    if (err?.name !== 'AbortError') setMessages(prev => [...prev, { role: 'ai', text: 'Test run failed — is the server running?' }]);
   }
+  globalAbortRef.current = null;
   setMode('idle');
 };
 
@@ -886,12 +1015,15 @@ const handleFixWithTests = async () => {
     setMessages(prev => [...prev, { role: 'ai', text: '[TEST] Send the task description first so the agent knows what to implement.' }]);
     return;
   }
+  const controller = new AbortController();
+  globalAbortRef.current = controller;
   setMode('agent-processing');
   setMessages(prev => [...prev, { role: 'ai', text: `[AUTO-FIX] Running tests and iterating... (up to 3 attempts)` }]);
   try {
     const res = await fetch('http://localhost:8000/agent/fix_with_tests', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
       body: JSON.stringify({
         file_path: selectedFilePath,
         instruction,
@@ -901,7 +1033,7 @@ const handleFixWithTests = async () => {
         session_id: sessionId,
       }),
     });
-    const data = await res.json();
+    const data = await safeJson(res);
     if (data.status === 'ok') {
       setTestResults(data.test_results);
       const passed = data.test_results.filter((r: TestResult) => r.passed).length;
@@ -921,15 +1053,18 @@ const handleFixWithTests = async () => {
     } else {
       setMessages(prev => [...prev, { role: 'ai', text: `[AUTO-FIX ERROR] ${data.error}` }]);
     }
-  } catch {
-    setMessages(prev => [...prev, { role: 'ai', text: 'Auto-fix failed — is the server running?' }]);
+  } catch (err: any) {
+    if (err?.name !== 'AbortError') setMessages(prev => [...prev, { role: 'ai', text: 'Auto-fix failed — is the server running?' }]);
   }
+  globalAbortRef.current = null;
   setMode('idle');
 };
 
 const handleRagChunkRetry = async (chunks: number) => {
   if (!ragChunkPrompt) return;
   
+  const controller = new AbortController();
+  globalAbortRef.current = controller;
   setMode('agent-processing');
   setMessages(prev => [...prev, { role: 'ai', text: `[CODE AGENT] Retrying with ${chunks} RAG chunks (${ragSearchMethod})...` }]);
   
@@ -937,6 +1072,7 @@ const handleRagChunkRetry = async (chunks: number) => {
     const res = await fetch('http://localhost:8000/agent/edit_with_chunks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
       body: JSON.stringify({ 
         instruction: ragChunkPrompt.instruction, 
         file_path: ragChunkPrompt.filePath,
@@ -945,7 +1081,7 @@ const handleRagChunkRetry = async (chunks: number) => {
         search_method: ragSearchMethod
       }),
     });
-    const data = await res.json();
+    const data = await safeJson(res);
     
     if (data.status === 'pending_review') {
       const resolvedPath = data.file_path || ragChunkPrompt.filePath;
@@ -962,12 +1098,13 @@ const handleRagChunkRetry = async (chunks: number) => {
     } else if (data.status === 'error') {
       setMessages(prev => [...prev, { role: 'ai', text: `[AGENT ERROR] ${data.message || data.error}` }]);
     }
-  } catch (err) {
-    setMessages(prev => [...prev, { role: 'ai', text: 'Error retrying with custom chunks.' }]);
+  } catch (err: any) {
+    if (err?.name !== 'AbortError') setMessages(prev => [...prev, { role: 'ai', text: 'Error retrying with custom chunks.' }]);
   }
   
   setRagChunkPrompt(null);
   setCustomChunkInput('');
+  globalAbortRef.current = null;
   setMode('idle');
 };
 
@@ -1656,45 +1793,68 @@ return (
       {activeMode === 'tutor' && (
         <div style={{
           position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
-          zIndex: 35, width: '85%', maxWidth: '1000px', maxHeight: '80vh', overflowY: 'auto',
-          padding: '24px', borderRadius: '20px',
-          backgroundColor: 'rgba(0, 20, 15, 0.92)', backdropFilter: 'blur(25px)',
+          zIndex: 35, width: '94%', maxWidth: '1400px', maxHeight: '92vh', overflowY: 'auto',
+          padding: '28px', borderRadius: '20px',
+          backgroundColor: 'rgba(0, 20, 15, 0.94)', backdropFilter: 'blur(25px)',
           border: '1px solid rgba(0,204,136,0.3)', boxShadow: '0 12px 40px rgba(0,0,0,0.6)',
         }}>
           {/* Setup bar */}
           <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '16px', alignItems: 'center' }}>
-            <input value={tutorTopic} onChange={e => setTutorTopic(e.target.value)} placeholder="Topic (e.g. arrays, recursion)"
-              style={{ padding: '8px 12px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px', flex: '1', minWidth: '120px' }} />
-            <select value={tutorDifficulty} onChange={e => setTutorDifficulty(e.target.value as any)}
-              style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px' }}>
+            <input value={tutorTopic} onChange={e => setTutorTopic(e.target.value)} disabled={tutorLoading} placeholder="Topic (e.g. arrays, recursion)"
+              style={{ padding: '8px 12px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px', flex: '1', minWidth: '120px', opacity: tutorLoading ? 0.5 : 1, cursor: tutorLoading ? 'not-allowed' : 'text' }} />
+            <button onClick={async () => {
+              const tab = isMathMode ? 'math' : 'cs';
+              setCurrTab(tab);
+              try {
+                if (tab === 'math' && !curriculum) {
+                  const r = await fetch('http://localhost:8000/math/curriculum');
+                  const d = await r.json();
+                  if (d.curriculum) setCurriculum(d.curriculum);
+                }
+                if (tab === 'cs' && !csCurriculum) {
+                  const r = await fetch('http://localhost:8000/cs/curriculum');
+                  const d = await r.json();
+                  if (d.curriculum) setCsCurriculum(d.curriculum);
+                }
+              } catch {}
+              setShowCurriculum(v => !v);
+            }}
+              disabled={tutorLoading}
+              style={{ padding: '8px 14px', borderRadius: '8px', border: '1px solid #00cc8866', backgroundColor: showCurriculum ? 'rgba(0,204,136,0.15)' : 'transparent', color: '#00cc88', fontWeight: 'bold', cursor: tutorLoading ? 'not-allowed' : 'pointer', fontSize: '12px', opacity: tutorLoading ? 0.5 : 1 }}>
+              Browse Topics
+            </button>
+            <select value={tutorDifficulty} onChange={e => setTutorDifficulty(e.target.value as any)} disabled={tutorLoading}
+              style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1, cursor: tutorLoading ? 'not-allowed' : 'pointer' }}>
               <option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option>
             </select>
             {/* Math / CS mode toggle */}
             <button
               type="button"
               onClick={() => setIsMathMode(p => !p)}
+              disabled={tutorLoading}
               style={{
                 padding: '6px 14px', borderRadius: '8px', fontSize: '12px', fontWeight: 'bold',
                 border: '1px solid',
                 borderColor: isMathMode ? '#00cc88' : '#5533ff',
                 backgroundColor: isMathMode ? 'rgba(0,204,136,0.15)' : 'rgba(85,51,255,0.12)',
                 color: isMathMode ? '#00cc88' : '#b388ff',
-                cursor: 'pointer', transition: 'all 0.2s',
+                cursor: tutorLoading ? 'not-allowed' : 'pointer', transition: 'all 0.2s',
+                opacity: tutorLoading ? 0.5 : 1,
               }}
             >
-              {isMathMode ? '📐 Math' : '💻 CS'}
+              {isMathMode ? 'Math' : 'CS'}
             </button>
             {/* Language selector - hidden in math mode */}
             {!isMathMode && (
-              <select value={tutorLanguage} onChange={e => setTutorLanguage(e.target.value)}
-                style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px' }}>
+              <select value={tutorLanguage} onChange={e => setTutorLanguage(e.target.value)} disabled={tutorLoading}
+                style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1, cursor: tutorLoading ? 'not-allowed' : 'pointer' }}>
                 {['python', 'go', 'cpp', 'c', 'javascript', 'typescript', 'java', 'rust'].map(l =>
                   <option key={l} value={l}>{l}</option>
                 )}
               </select>
             )}
-            <select value={tutorStyle} onChange={e => setTutorStyle(e.target.value as any)}
-              style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px' }}>
+            <select value={tutorStyle} onChange={e => setTutorStyle(e.target.value as any)} disabled={tutorLoading}
+              style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1, cursor: tutorLoading ? 'not-allowed' : 'pointer' }}>
               <option value="mcq">Multiple Choice</option><option value="free_text">Short Answer</option>
               {!isMathMode && <option value="code">Coding</option>}
               {isMathMode && <option value="solve">Solve</option>}
@@ -1710,14 +1870,82 @@ return (
             {tutorLoading && (
               <button onClick={handleStopAll}
                 style={{ padding: '8px 16px', borderRadius: '8px', border: '2px solid #ff4444', backgroundColor: 'rgba(255,68,68,0.15)', color: '#ff4444', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px' }}>
-                ⏹ Stop
+                Stop
               </button>
             )}
-            <button onClick={() => handleFetchLearnings()}
-              style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#b388ff', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px' }}>
-              📚 Learnings
+            <button onClick={() => handleFetchLearnings()} disabled={tutorLoading}
+              style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#b388ff', fontWeight: 'bold', cursor: tutorLoading ? 'not-allowed' : 'pointer', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1 }}>
+              Learnings
             </button>
           </div>
+
+          {/* ── Curriculum Browser ──────────────────────────────────────────── */}
+          {showCurriculum && (
+            <div style={{ marginBottom: '16px', padding: '16px', borderRadius: '12px', backgroundColor: 'rgba(0,204,136,0.04)', border: '1px solid rgba(0,204,136,0.2)', maxHeight: '50vh', overflowY: 'auto' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                  <span style={{ fontSize: '14px', fontWeight: 'bold', color: '#ccc', marginRight: '4px' }}>Topics</span>
+                  <button onClick={async () => {
+                    if (!curriculum) {
+                      try { const r = await fetch('http://localhost:8000/math/curriculum'); const d = await r.json(); if (d.curriculum) setCurriculum(d.curriculum); } catch {}
+                    }
+                    setCurrTab('math'); setCurrExpandedSubject(null); setCurrExpandedChapter(null);
+                  }} style={{ padding: '4px 12px', borderRadius: '6px', border: 'none', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold', backgroundColor: currTab === 'math' ? 'rgba(0,204,136,0.25)' : 'rgba(255,255,255,0.05)', color: currTab === 'math' ? '#00cc88' : '#888' }}>Math</button>
+                  <button onClick={async () => {
+                    if (!csCurriculum) {
+                      try { const r = await fetch('http://localhost:8000/cs/curriculum'); const d = await r.json(); if (d.curriculum) setCsCurriculum(d.curriculum); } catch {}
+                    }
+                    setCurrTab('cs'); setCurrExpandedSubject(null); setCurrExpandedChapter(null);
+                  }} style={{ padding: '4px 12px', borderRadius: '6px', border: 'none', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold', backgroundColor: currTab === 'cs' ? 'rgba(85,51,255,0.25)' : 'rgba(255,255,255,0.05)', color: currTab === 'cs' ? '#b388ff' : '#888' }}>CS</button>
+                </div>
+                <button onClick={() => setShowCurriculum(false)} style={{ background: 'none', border: '1px solid #00cc8844', borderRadius: '6px', color: '#888', cursor: 'pointer', padding: '4px 10px', fontSize: '11px' }}>Close</button>
+              </div>
+              {(() => {
+                const activeCurr = currTab === 'cs' ? csCurriculum : curriculum;
+                const accentColor = currTab === 'cs' ? '#b388ff' : '#00cc88';
+                const accentRgb = currTab === 'cs' ? '85,51,255' : '0,204,136';
+                if (!activeCurr) return <div style={{ color: '#888', fontSize: '13px' }}>Loading...</div>;
+                return (
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '12px' }}>
+                    {Object.entries(activeCurr).map(([subjId, subj]) => (
+                      <div key={subjId} style={{ borderRadius: '10px', border: `1px solid rgba(${accentRgb},0.15)`, backgroundColor: 'rgba(0,0,0,0.25)', overflow: 'hidden' }}>
+                        <button onClick={() => setCurrExpandedSubject(currExpandedSubject === subjId ? null : subjId)}
+                          style={{ width: '100%', display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 14px', background: 'none', border: 'none', color: accentColor, cursor: 'pointer', fontSize: '14px', fontWeight: 'bold', textAlign: 'left' }}>
+                          <span>{subj.icon} {subj.name}</span>
+                          <span style={{ fontSize: '11px', color: '#888', fontWeight: 'normal' }}>{subj.progress} chapters</span>
+                        </button>
+                        {currExpandedSubject === subjId && (
+                          <div style={{ padding: '0 10px 10px' }}>
+                            {subj.chapters.map(ch => (
+                              <div key={ch.id} style={{ marginBottom: '4px' }}>
+                                <button onClick={() => setCurrExpandedChapter(currExpandedChapter === ch.id ? null : ch.id)}
+                                  style={{ width: '100%', display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 8px', background: 'none', border: 'none', borderRadius: '6px', color: ch.completed ? '#888' : '#ddd', cursor: 'pointer', fontSize: '12px', textAlign: 'left', backgroundColor: currExpandedChapter === ch.id ? `rgba(${accentRgb},0.08)` : 'transparent' }}>
+                                  <span>{ch.completed ? '+ ' : '> '}{ch.name}</span>
+                                  <span style={{ fontSize: '10px', color: '#666' }}>{ch.topics.length} topics</span>
+                                </button>
+                                {currExpandedChapter === ch.id && (
+                                  <div style={{ padding: '4px 0 4px 18px', display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                                    {ch.topics.map(t => (
+                                      <button key={t} onClick={() => { setTutorTopic(t); setIsMathMode(currTab === 'math'); setShowCurriculum(false); }}
+                                        style={{ padding: '4px 10px', borderRadius: '14px', border: `1px solid rgba(${accentRgb},0.3)`, background: `rgba(${accentRgb},0.06)`, color: currTab === 'cs' ? '#c5b0ff' : '#a0e8d0', cursor: 'pointer', fontSize: '11px', transition: 'all 0.15s' }}
+                                        onMouseEnter={e => { (e.target as HTMLElement).style.backgroundColor = `rgba(${accentRgb},0.2)`; }}
+                                        onMouseLeave={e => { (e.target as HTMLElement).style.backgroundColor = `rgba(${accentRgb},0.06)`; }}>
+                                        {t}
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()}
+            </div>
+          )}
 
           {/* Agent learnings display */}
           {showLearnings && (
@@ -2000,7 +2228,7 @@ return (
                     padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#5533ff', cursor: 'pointer', fontSize: '12px',
                     animation: pulsingBtn === 'hint' ? 'greenPulse 0.6s ease-out' : undefined,
                   }}>
-                  💡 Hint
+                  Hint
                 </button>
                 {isMathMode && (
                   <button onClick={() => { triggerPulse('steps'); handleMathSteps(); }}
@@ -2008,7 +2236,7 @@ return (
                       padding: '8px 16px', borderRadius: '8px', border: '1px solid #00cc8866', backgroundColor: 'transparent', color: '#00cc88', cursor: 'pointer', fontSize: '12px',
                       animation: pulsingBtn === 'steps' ? 'greenPulse 0.6s ease-out' : undefined,
                     }}>
-                    📝 Step-by-Step
+                    Step-by-Step
                   </button>
                 )}
                 {isMathMode && (
@@ -2017,7 +2245,7 @@ return (
                       padding: '8px 16px', borderRadius: '8px', border: '1px solid #ff990066', backgroundColor: showMathGraph ? 'rgba(255,153,0,0.15)' : 'transparent', color: '#ff9900', cursor: 'pointer', fontSize: '12px',
                       animation: pulsingBtn === 'graph' ? 'greenPulse 0.6s ease-out' : undefined,
                     }}>
-                    📈 Graph
+                    Graph
                   </button>
                 )}
                 {isMathMode && (
@@ -2026,7 +2254,7 @@ return (
                       padding: '8px 16px', borderRadius: '8px', border: '1px solid #b388ff66', backgroundColor: showMathViz ? 'rgba(179,136,255,0.15)' : 'transparent', color: '#b388ff', cursor: 'pointer', fontSize: '12px',
                       animation: pulsingBtn === 'mathviz' ? 'greenPulse 0.6s ease-out' : undefined,
                     }}>
-                    🔧 Math Tools
+                    Math Tools
                   </button>
                 )}
                 {tutorFeedback?.solved && (
@@ -2195,10 +2423,10 @@ return (
             <div style={{ marginTop: '16px', padding: '16px', borderRadius: '12px', backgroundColor: 'rgba(179,136,255,0.04)', border: '1px solid rgba(179,136,255,0.2)' }}>
               <div style={{ fontSize: '14px', fontWeight: 'bold', color: '#b388ff', marginBottom: '10px' }}>🔧 Math Visualization Tools</div>
               <div style={{ display: 'flex', gap: '6px', marginBottom: '12px', flexWrap: 'wrap' }}>
-                {(['unitcircle', 'vector', 'triangle', 'circle'] as MathVizType[]).map(t => (
+                {(['unitcircle', 'vector', 'triangle', 'circle', 'matrix', 'normal', 'bezier'] as MathVizType[]).map(t => (
                   <button key={t} onClick={() => setMathVizType(mathVizType === t ? null : t)}
                     style={{ padding: '6px 14px', borderRadius: '6px', border: mathVizType === t ? '1px solid #b388ff' : '1px solid #444', backgroundColor: mathVizType === t ? 'rgba(179,136,255,0.2)' : 'transparent', color: mathVizType === t ? '#b388ff' : '#aaa', cursor: 'pointer', fontSize: '12px' }}>
-                    {t === 'unitcircle' ? '🔵 Unit Circle' : t === 'vector' ? '➡️ Vectors' : t === 'triangle' ? '📐 Triangle' : '⭕ Circle'}
+                    {t === 'unitcircle' ? '🔵 Unit Circle' : t === 'vector' ? '➡️ Vectors' : t === 'triangle' ? '📐 Triangle' : t === 'circle' ? '⭕ Circle' : t === 'matrix' ? '🔢 Matrix Transform' : t === 'normal' ? '📊 Normal Dist' : '〰️ Bezier Curve'}
                   </button>
                 ))}
               </div>
@@ -2402,6 +2630,235 @@ return (
                       <span style={{ color: '#b388ff' }}>Area = πr² = {area.toFixed(3)}</span>
                       <span style={{ color: '#00cc88' }}>Circumference = 2πr = {circumference.toFixed(3)}</span>
                       <span style={{ color: '#888' }}>Equation: (x−{vizCircle.cx})²+(y−{vizCircle.cy})²={vizCircle.r}²</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Matrix transform visualization */}
+              {mathVizType === 'matrix' && (() => {
+                const W = 400, H = 400, CX = W / 2, CY = H / 2, SCALE = 40;
+                const m = vizMatrix;
+                // Transform the three standard points
+                const transform = (p: {x: number; y: number}) => ({
+                  x: m[0][0] * p.x + m[0][1] * p.y,
+                  y: m[1][0] * p.x + m[1][1] * p.y,
+                });
+                const origPts = vizMatrixPoints;
+                const transPts = origPts.map(transform);
+                const det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+                // Eigenvalues for 2x2: λ² - trace·λ + det = 0
+                const trace = m[0][0] + m[1][1];
+                const disc = trace * trace - 4 * det;
+                const eig1 = disc >= 0 ? (trace + Math.sqrt(disc)) / 2 : null;
+                const eig2 = disc >= 0 ? (trace - Math.sqrt(disc)) / 2 : null;
+                return (
+                  <div>
+                    <div style={{ display: 'flex', gap: '12px', marginBottom: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                      <span style={{ color: '#b388ff', fontSize: '12px' }}>Matrix:</span>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px' }}>
+                        {[0, 1].map(r => [0, 1].map(c => (
+                          <input key={`${r}${c}`} type="number" step={0.1} value={m[r][c]}
+                            onChange={e => { const n = m.map(row => [...row]); n[r][c] = +e.target.value; setVizMatrix(n); }}
+                            style={{ width: '52px', padding: '3px 6px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '12px', fontFamily: 'monospace', textAlign: 'center' }} />
+                        )))}
+                      </div>
+                      <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                        {[{ label: 'I', m: [[1,0],[0,1]] }, { label: 'Rot 45°', m: [[0.707,-0.707],[0.707,0.707]] }, { label: 'Shear', m: [[1,1],[0,1]] }, { label: 'Scale 2x', m: [[2,0],[0,2]] }, { label: 'Reflect Y', m: [[-1,0],[0,1]] }].map(p => (
+                          <button key={p.label} onClick={() => setVizMatrix(p.m)}
+                            style={{ padding: '3px 8px', borderRadius: '4px', border: '1px solid #444', background: 'transparent', color: '#aaa', cursor: 'pointer', fontSize: '10px' }}>
+                            {p.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      {/* Axes */}
+                      <line x1={0} y1={CY} x2={W} y2={CY} stroke="#333" strokeWidth={1} />
+                      <line x1={CX} y1={0} x2={CX} y2={H} stroke="#333" strokeWidth={1} />
+                      {/* Grid */}
+                      {[-4,-3,-2,-1,1,2,3,4].map(n => (
+                        <g key={n}>
+                          <line x1={CX + n * SCALE} y1={0} x2={CX + n * SCALE} y2={H} stroke="#1a1a1a" strokeWidth={1} />
+                          <line x1={0} y1={CY + n * SCALE} x2={W} y2={CY + n * SCALE} stroke="#1a1a1a" strokeWidth={1} />
+                        </g>
+                      ))}
+                      {/* Original shape (filled) */}
+                      <polygon points={origPts.map(p => `${CX + p.x * SCALE},${CY - p.y * SCALE}`).join(' ')} fill="rgba(0,204,136,0.1)" stroke="#00cc88" strokeWidth={1.5} strokeDasharray="4,3" />
+                      {/* Transformed shape */}
+                      <polygon points={transPts.map(p => `${CX + p.x * SCALE},${CY - p.y * SCALE}`).join(' ')} fill="rgba(255,136,0,0.12)" stroke="#ff8800" strokeWidth={2} />
+                      {/* Transformed basis vectors */}
+                      <defs>
+                        <marker id="arrowR" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ff4444" /></marker>
+                        <marker id="arrowY" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ffcc00" /></marker>
+                      </defs>
+                      <line x1={CX} y1={CY} x2={CX + m[0][0] * SCALE} y2={CY - m[1][0] * SCALE} stroke="#ff4444" strokeWidth={2} markerEnd="url(#arrowR)" />
+                      <line x1={CX} y1={CY} x2={CX + m[0][1] * SCALE} y2={CY - m[1][1] * SCALE} stroke="#ffcc00" strokeWidth={2} markerEnd="url(#arrowY)" />
+                      {/* Labels */}
+                      <text x={CX + m[0][0] * SCALE + 4} y={CY - m[1][0] * SCALE - 6} fill="#ff4444" fontSize={11} fontWeight="bold">ê₁</text>
+                      <text x={CX + m[0][1] * SCALE + 4} y={CY - m[1][1] * SCALE - 6} fill="#ffcc00" fontSize={11} fontWeight="bold">ê₂</text>
+                      {origPts.map((p, i) => <circle key={`o${i}`} cx={CX + p.x * SCALE} cy={CY - p.y * SCALE} r={3} fill="#00cc88" />)}
+                      {transPts.map((p, i) => <circle key={`t${i}`} cx={CX + p.x * SCALE} cy={CY - p.y * SCALE} r={3} fill="#ff8800" />)}
+                    </svg>
+                    <div style={{ display: 'flex', gap: '14px', marginTop: '6px', fontSize: '11px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
+                      <span style={{ color: '#b388ff' }}>det = {det.toFixed(3)}</span>
+                      <span style={{ color: '#ff9900' }}>trace = {trace.toFixed(3)}</span>
+                      {eig1 !== null && <span style={{ color: '#ff4444' }}>λ₁ = {eig1.toFixed(3)}</span>}
+                      {eig2 !== null && <span style={{ color: '#ffcc00' }}>λ₂ = {eig2.toFixed(3)}</span>}
+                      {disc < 0 && <span style={{ color: '#888' }}>λ = {(trace/2).toFixed(2)} ± {(Math.sqrt(-disc)/2).toFixed(2)}i (complex)</span>}
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Normal distribution visualization */}
+              {mathVizType === 'normal' && (() => {
+                const W = 440, H = 260;
+                const mu = vizNormMean, sigma = vizNormStd;
+                const xMin = mu - 4 * Math.max(sigma, 0.5), xMax = mu + 4 * Math.max(sigma, 0.5);
+                const pdf = (x: number) => {
+                  const s = Math.max(sigma, 0.01);
+                  return (1 / (s * Math.sqrt(2 * Math.PI))) * Math.exp(-0.5 * ((x - mu) / s) ** 2);
+                };
+                const steps = 120;
+                const pts: string[] = [];
+                let yMax = 0;
+                const allPts: {x: number; y: number}[] = [];
+                for (let i = 0; i <= steps; i++) {
+                  const x = xMin + (xMax - xMin) * i / steps;
+                  const y = pdf(x);
+                  allPts.push({ x, y });
+                  if (y > yMax) yMax = y;
+                }
+                yMax *= 1.1;
+                const PAD = 35;
+                const toSvgX = (x: number) => PAD + (x - xMin) / (xMax - xMin) * (W - 2 * PAD);
+                const toSvgY = (y: number) => (H - PAD) - (y / yMax) * (H - 2 * PAD);
+                allPts.forEach(p => pts.push(`${toSvgX(p.x)},${toSvgY(p.y)}`));
+                // Area fill path
+                const fillPath = `M${toSvgX(xMin)},${toSvgY(0)} ` + allPts.map(p => `L${toSvgX(p.x)},${toSvgY(p.y)}`).join(' ') + ` L${toSvgX(xMax)},${toSvgY(0)} Z`;
+                // σ markers
+                const sigmaLines = [-3, -2, -1, 0, 1, 2, 3].map(n => mu + n * sigma);
+                return (
+                  <div>
+                    <div style={{ display: 'flex', gap: '12px', marginBottom: '8px', fontSize: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#00cc88' }}>
+                        μ: <input type="range" min={-5} max={5} step={0.1} value={mu} onChange={e => setVizNormMean(+e.target.value)} />
+                        <span style={{ fontFamily: 'monospace', minWidth: '36px' }}>{mu.toFixed(1)}</span>
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#ff9900' }}>
+                        σ: <input type="range" min={0.2} max={3} step={0.1} value={sigma} onChange={e => setVizNormStd(+e.target.value)} />
+                        <span style={{ fontFamily: 'monospace', minWidth: '36px' }}>{sigma.toFixed(1)}</span>
+                      </label>
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      {/* x-axis */}
+                      <line x1={PAD} y1={H - PAD} x2={W - PAD} y2={H - PAD} stroke="#555" strokeWidth={1} />
+                      {/* σ lines */}
+                      {sigmaLines.map((x, i) => (
+                        <g key={i}>
+                          <line x1={toSvgX(x)} y1={PAD} x2={toSvgX(x)} y2={H - PAD} stroke={i === 3 ? '#555' : '#222'} strokeWidth={1} strokeDasharray={i === 3 ? undefined : '3,3'} />
+                          <text x={toSvgX(x)} y={H - PAD + 14} fill="#888" fontSize={9} textAnchor="middle">
+                            {i - 3 === 0 ? 'μ' : `${i - 3 > 0 ? '+' : ''}${i - 3}σ`}
+                          </text>
+                        </g>
+                      ))}
+                      {/* Fill */}
+                      <path d={fillPath} fill="rgba(0,204,136,0.12)" />
+                      {/* 1σ shaded region */}
+                      {(() => {
+                        const lo = mu - sigma, hi = mu + sigma;
+                        const sigPts = allPts.filter(p => p.x >= lo && p.x <= hi);
+                        if (sigPts.length < 2) return null;
+                        const d = `M${toSvgX(lo)},${toSvgY(0)} ` + sigPts.map(p => `L${toSvgX(p.x)},${toSvgY(p.y)}`).join(' ') + ` L${toSvgX(hi)},${toSvgY(0)} Z`;
+                        return <path d={d} fill="rgba(0,204,136,0.2)" />;
+                      })()}
+                      {/* Curve */}
+                      <polyline points={pts.join(' ')} fill="none" stroke="#00cc88" strokeWidth={2} />
+                      {/* Peak marker */}
+                      <circle cx={toSvgX(mu)} cy={toSvgY(pdf(mu))} r={3} fill="#00cc88" />
+                    </svg>
+                    <div style={{ display: 'flex', gap: '14px', marginTop: '6px', fontSize: '11px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
+                      <span style={{ color: '#00cc88' }}>μ = {mu.toFixed(2)}</span>
+                      <span style={{ color: '#ff9900' }}>σ = {sigma.toFixed(2)}</span>
+                      <span style={{ color: '#b388ff' }}>σ² = {(sigma * sigma).toFixed(3)}</span>
+                      <span style={{ color: '#888' }}>P(μ±1σ) ≈ 68.27%</span>
+                      <span style={{ color: '#888' }}>P(μ±2σ) ≈ 95.45%</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Bezier curve visualization */}
+              {mathVizType === 'bezier' && (() => {
+                const W = 420, H = 300;
+                const pts = vizBezierPts;
+                const t = vizBezierT;
+                // Cubic bezier evaluation
+                const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+                const bezierPt = (t: number) => {
+                  const p01x = lerp(pts[0].x, pts[1].x, t), p01y = lerp(pts[0].y, pts[1].y, t);
+                  const p12x = lerp(pts[1].x, pts[2].x, t), p12y = lerp(pts[1].y, pts[2].y, t);
+                  const p23x = lerp(pts[2].x, pts[3].x, t), p23y = lerp(pts[2].y, pts[3].y, t);
+                  const p012x = lerp(p01x, p12x, t), p012y = lerp(p01y, p12y, t);
+                  const p123x = lerp(p12x, p23x, t), p123y = lerp(p12y, p23y, t);
+                  return { x: lerp(p012x, p123x, t), y: lerp(p012y, p123y, t), p01: {x: p01x, y: p01y}, p12: {x: p12x, y: p12y}, p23: {x: p23x, y: p23y}, p012: {x: p012x, y: p012y}, p123: {x: p123x, y: p123y} };
+                };
+                // Build the curve path
+                const curvePts: string[] = [];
+                for (let i = 0; i <= 100; i++) {
+                  const p = bezierPt(i / 100);
+                  curvePts.push(`${p.x},${p.y}`);
+                }
+                const currentPt = bezierPt(t);
+                return (
+                  <div>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '8px' }}>
+                      <span style={{ color: '#b388ff', fontSize: '12px' }}>t =</span>
+                      <input type="range" min={0} max={1} step={0.01} value={t} onChange={e => setVizBezierT(+e.target.value)} style={{ flex: 1 }} />
+                      <span style={{ color: '#fff', fontFamily: 'monospace', fontSize: '13px', minWidth: '38px' }}>{t.toFixed(2)}</span>
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      {/* Control polygon */}
+                      <polyline points={pts.map(p => `${p.x},${p.y}`).join(' ')} fill="none" stroke="#333" strokeWidth={1} strokeDasharray="4,3" />
+                      {/* De Casteljau construction lines */}
+                      <line x1={currentPt.p01.x} y1={currentPt.p01.y} x2={currentPt.p12.x} y2={currentPt.p12.y} stroke="#444" strokeWidth={1} strokeDasharray="3,3" />
+                      <line x1={currentPt.p12.x} y1={currentPt.p12.y} x2={currentPt.p23.x} y2={currentPt.p23.y} stroke="#444" strokeWidth={1} strokeDasharray="3,3" />
+                      <line x1={currentPt.p012.x} y1={currentPt.p012.y} x2={currentPt.p123.x} y2={currentPt.p123.y} stroke="#555" strokeWidth={1} strokeDasharray="2,2" />
+                      {/* Curve */}
+                      <polyline points={curvePts.join(' ')} fill="none" stroke="#00cc88" strokeWidth={2.5} />
+                      {/* Control points (draggable look) */}
+                      {pts.map((p, i) => (
+                        <g key={i}>
+                          <circle cx={p.x} cy={p.y} r={6} fill="transparent" stroke="#b388ff" strokeWidth={1.5} />
+                          <text x={p.x + 8} y={p.y - 6} fill="#b388ff" fontSize={10}>P{i}</text>
+                        </g>
+                      ))}
+                      {/* Intermediate points */}
+                      <circle cx={currentPt.p01.x} cy={currentPt.p01.y} r={3} fill="#ff9900" />
+                      <circle cx={currentPt.p12.x} cy={currentPt.p12.y} r={3} fill="#ff9900" />
+                      <circle cx={currentPt.p23.x} cy={currentPt.p23.y} r={3} fill="#ff9900" />
+                      <circle cx={currentPt.p012.x} cy={currentPt.p012.y} r={3} fill="#22aaff" />
+                      <circle cx={currentPt.p123.x} cy={currentPt.p123.y} r={3} fill="#22aaff" />
+                      {/* Point on curve */}
+                      <circle cx={currentPt.x} cy={currentPt.y} r={5} fill="#ff4444" />
+                    </svg>
+                    <div style={{ display: 'flex', gap: '6px', marginTop: '6px', flexWrap: 'wrap' }}>
+                      {pts.map((p, i) => (
+                        <span key={i} style={{ display: 'flex', alignItems: 'center', gap: '3px', fontSize: '10px' }}>
+                          <span style={{ color: '#b388ff' }}>P{i}(</span>
+                          <input type="number" value={p.x} onChange={e => { const n = [...pts]; n[i] = { ...n[i], x: +e.target.value }; setVizBezierPts(n); }}
+                            style={{ width: '40px', padding: '2px 4px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '10px', fontFamily: 'monospace' }} />
+                          <span style={{ color: '#888' }}>,</span>
+                          <input type="number" value={p.y} onChange={e => { const n = [...pts]; n[i] = { ...n[i], y: +e.target.value }; setVizBezierPts(n); }}
+                            style={{ width: '40px', padding: '2px 4px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '10px', fontFamily: 'monospace' }} />
+                          <span style={{ color: '#b388ff' }}>)</span>
+                        </span>
+                      ))}
+                    </div>
+                    <div style={{ display: 'flex', gap: '14px', marginTop: '4px', fontSize: '11px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
+                      <span style={{ color: '#ff4444' }}>B(t) = ({currentPt.x.toFixed(1)}, {currentPt.y.toFixed(1)})</span>
+                      <span style={{ color: '#888' }}>Cubic Bézier: B(t) = (1-t)³P₀ + 3(1-t)²tP₁ + 3(1-t)t²P₂ + t³P₃</span>
                     </div>
                   </div>
                 );
@@ -2947,16 +3404,70 @@ return (
 
       {/* Mode toggle — always visible */}
       <div style={{ position: 'fixed', bottom: '28px', right: '40px', zIndex: 50, display: 'flex', alignItems: 'center', gap: '10px' }}>
-        {/* LLM connection status indicator */}
-        <div
-          title={llmConnected === null ? 'Checking LLM...' : llmConnected ? `LLM connected: ${llmModel}` : 'LLM offline — queries will fail'}
-          style={{
-            width: '10px', height: '10px', borderRadius: '50%',
-            backgroundColor: llmConnected === null ? '#888' : llmConnected ? '#00cc88' : '#ff3333',
-            boxShadow: llmConnected ? '0 0 6px #00cc88' : llmConnected === false ? '0 0 6px #ff3333' : 'none',
-            transition: 'all 0.3s',
-          }}
-        />
+        {/* LLM connection status indicator + model switcher */}
+        <div style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: '6px' }} data-model-picker>
+          <div
+            title={llmConnected === null ? 'Checking LLM...' : llmConnected ? `LLM connected: ${llmModel}` : 'LLM offline — queries will fail'}
+            style={{
+              width: '10px', height: '10px', borderRadius: '50%',
+              backgroundColor: llmConnected === null ? '#888' : llmConnected ? '#00cc88' : '#ff3333',
+              boxShadow: llmConnected ? '0 0 6px #00cc88' : llmConnected === false ? '0 0 6px #ff3333' : 'none',
+              transition: 'all 0.3s', flexShrink: 0,
+            }}
+          />
+          {llmModel && (
+            <button
+              onClick={() => { if (!modelSwitching) { fetchModels(); setShowModelPicker(p => !p); } }}
+              title="Switch model"
+              style={{
+                background: showModelPicker ? 'rgba(85,51,255,0.25)' : 'rgba(255,255,255,0.07)',
+                border: '1px solid rgba(255,255,255,0.2)',
+                borderRadius: '8px', padding: '3px 8px',
+                color: modelSwitching ? '#888' : '#ccc',
+                fontSize: '11px', cursor: modelSwitching ? 'wait' : 'pointer',
+                fontFamily: 'monospace', transition: 'all 0.2s',
+                display: 'flex', alignItems: 'center', gap: '4px',
+              }}
+            >
+              {modelSwitching ? '⏳' : '⬡'} {llmModel.replace(':latest', '')}
+            </button>
+          )}
+          {showModelPicker && (
+            <div
+              style={{
+                position: 'absolute', bottom: 'calc(100% + 8px)', right: 0,
+                background: 'rgba(15,12,30,0.97)', border: '1px solid rgba(255,255,255,0.15)',
+                borderRadius: '12px', padding: '6px', minWidth: '200px',
+                backdropFilter: 'blur(16px)', boxShadow: '0 8px 32px rgba(0,0,0,0.5)', zIndex: 100,
+              }}
+            >
+              <div style={{ color: '#888', fontSize: '10px', padding: '4px 8px 6px', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Switch Model</div>
+              {availableModels.length === 0
+                ? <div style={{ color: '#666', fontSize: '11px', padding: '6px 8px' }}>No models found</div>
+                : availableModels.map(m => (
+                  <button
+                    key={m}
+                    onClick={() => handleSwitchModel(m)}
+                    style={{
+                      display: 'block', width: '100%', textAlign: 'left',
+                      background: (m === llmModel || m.replace(':latest','') === llmModel || llmModel === m.replace(':latest',''))
+                        ? 'rgba(85,51,255,0.3)' : 'transparent',
+                      border: 'none', borderRadius: '8px',
+                      color: '#ddd', fontSize: '12px', padding: '7px 10px',
+                      cursor: 'pointer', fontFamily: 'monospace',
+                      transition: 'background 0.15s',
+                    }}
+                    onMouseEnter={e => { if (m !== llmModel) (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.08)'; }}
+                    onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = (m === llmModel) ? 'rgba(85,51,255,0.3)' : 'transparent'; }}
+                  >
+                    {(m === llmModel || m.replace(':latest', '') === llmModel) && <span style={{ color: '#00cc88', marginRight: '6px' }}>✓</span>}
+                    {m.replace(':latest', '')}
+                  </button>
+                ))
+              }
+            </div>
+          )}
+        </div>
         <button
           onClick={() => {
             const modes: ActiveMode[] = ['query', 'agent', 'tutor'];
@@ -3247,6 +3758,27 @@ return (
         >
           {mode !== 'idle' ? '...' : 'Send'}
         </button>
+        {mode !== 'idle' && (
+          <button
+            type="button"
+            onClick={handleStopAll}
+            style={{
+              padding: '12px 18px',
+              borderRadius: '999px',
+              border: '2px solid #ff4444',
+              backgroundColor: 'rgba(255,68,68,0.15)',
+              color: '#ff4444',
+              cursor: 'pointer',
+              fontSize: '14px',
+              fontWeight: 'bold',
+              transition: 'all 0.2s',
+              animation: 'pulse 1.5s infinite',
+            }}
+            title="Stop all running processes"
+          >
+            ⏹ Stop
+          </button>
+        )}
         </div>
       </form>
       )}

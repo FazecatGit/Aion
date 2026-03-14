@@ -22,8 +22,9 @@ import os
 import re
 import tempfile
 from typing import List, Optional, Tuple
+from print_logger import get_logger
 
-logger = logging.getLogger("ocr")
+logger = get_logger("ocr")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -390,8 +391,7 @@ def analyze_image_with_context(
             "confidence": float,
         }
     """
-    from langchain_ollama import OllamaLLM
-    from brain.config import LLM_MODEL
+    from brain.config import LLM_MODEL, make_llm
 
     # Step 1: Extract OCR text for supplementary context
     ocr_result = extract_text_from_image(image_bytes, mode=mode)
@@ -470,7 +470,7 @@ def analyze_image_with_context(
         )
 
     try:
-        llm = OllamaLLM(model=LLM_MODEL, temperature=0.2)
+        llm = make_llm(temperature=0.2)
         analysis = llm.invoke(prompt).strip()
     except Exception as e:
         logger.error("[OCR] LLM analysis failed: %s", e)

@@ -13,13 +13,14 @@ Provides the low-level machinery that CodeAgent relies on:
 import re
 import logging
 import traceback
+from print_logger import get_logger
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional
 
 from brain.config import BRACE_LANGUAGES
 
-logger = logging.getLogger("code_agent")
+logger = get_logger("code_agent")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -459,9 +460,8 @@ def extract_function(source: str, instruction: str, hint_blocks=None) -> tuple[s
     # -- LLM-based function targeting: ask the LLM which function the instruction refers to --
     if target_idx is None and _file_func_names:
         try:
-            from langchain_ollama import OllamaLLM
-            from brain.config import LLM_MODEL
-            _target_llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+            from brain.config import LLM_MODEL, make_llm
+            _target_llm = make_llm(temperature=0.0)
             _sig_list = "\n".join(f"  {i+1}. {fn} (line {fi+1})" for i, (fn, fi) in enumerate(_file_func_names))
             _target_prompt = (
                 f"A user wants to edit code. Their instruction:\n\"{instruction}\"\n\n"

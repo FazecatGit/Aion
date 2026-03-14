@@ -1,7 +1,12 @@
 import asyncio
 import logging
 import json
+import os
+import signal
+import subprocess
+import sys
 import time
+import traceback
 import warnings
 from collections import deque
 from fastapi import FastAPI, UploadFile, File, Form, Query
@@ -23,10 +28,20 @@ from brain.config import DATA_DIR
 
 warnings.filterwarnings("ignore")
 
-_api_log = logging.getLogger("tutor")  # reuse the tutor logger so messages flow to SSE
+from print_logger import get_logger
+_api_log = get_logger("tutor")  # reuse the tutor logger so messages flow to SSE
 
 raw_docs = []
 chat_store = ChatSessionStore()
+
+# ── Cancellation flag for long-running agent tasks ────────────────────────────
+import threading
+_cancel_event = threading.Event()  # set() to cancel, clear() to reset
+
+
+def check_cancelled():
+    """Check if a cancellation has been requested. Agent code can call this."""
+    return _cancel_event.is_set()
 
 # ── Process log streaming (SSE) ───────────────────────────────────────────────
 # Captures logs from agent/brain modules and streams them to the frontend
@@ -59,22 +74,82 @@ def _setup_log_streaming():
     handler = _SSELogHandler()
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(logging.Formatter("%(name)s | %(message)s"))
-    for name in ("code_agent", "multi_agent", "tool_hooks", "ocr", "voice_io", "chat_session_store", "tutor", "fast_search", "rag_brain", "query_pipeline", "code_context"):
+    for name in ("code_agent", "multi_agent", "tool_hooks", "ocr", "voice_io", "chat_session_store", "tutor", "fast_search", "rag_brain", "query_pipeline", "code_context", "llm_calls"):
         lg = logging.getLogger(name)
         lg.addHandler(handler)
         lg.setLevel(logging.DEBUG)
 
 
+_API_PORT = int(os.getenv("AION_API_PORT", "8000"))
+
+
+def _kill_stale_port(port: int = _API_PORT):
+    """Kill any leftover process holding our API port (Windows-only).
+    
+    This prevents 'address already in use' errors from dead uvicorn workers
+    that survived after the Electron app or user closed without clean shutdown.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        # netstat -ano finds PIDs bound to the port
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True, text=True, timeout=5,
+        )
+        my_pid = os.getpid()
+        killed = set()
+        for line in result.stdout.splitlines():
+            # Match lines like:  TCP  0.0.0.0:8000  ...  LISTENING  12345
+            if f":{port} " not in line and f":{port}\t" not in line:
+                continue
+            if "LISTENING" not in line:
+                continue
+            parts = line.split()
+            pid_str = parts[-1]
+            if not pid_str.isdigit():
+                continue
+            pid = int(pid_str)
+            if pid == my_pid or pid in killed or pid == 0:
+                continue
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True, timeout=5,
+                )
+                killed.add(pid)
+                print(f"[API] Killed stale process PID {pid} on port {port}")
+            except Exception:
+                pass
+        if killed:
+            time.sleep(0.5)  # brief pause for OS to release the port
+    except Exception as e:
+        print(f"[API] Port cleanup warning: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global raw_docs
+    _kill_stale_port()
     _setup_log_streaming()
     raw_docs = load_pdfs(DATA_DIR)
     initialize_bm25(raw_docs)
     yield
+    # Shutdown: nothing to clean up — uvicorn handles socket close
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    tb = traceback.format_exc()
+    print(f"[UNHANDLED ERROR] {request.url.path}: {exc}\n{tb}", flush=True)
+    _api_log.error("[UNHANDLED ERROR] %s: %s\n%s", request.url.path, exc, tb)
+    return JSONResponse(status_code=500, content={"status": "error", "error": str(exc)})
 
 
 @app.get("/health")
@@ -95,6 +170,75 @@ async def health_check():
     except Exception:
         pass
     return {"status": "ok", "llm_connected": llm_ok, "llm_model": llm_model}
+
+
+# ── Model management endpoints ────────────────────────────────────────────────
+
+@app.get("/models")
+async def list_models():
+    """List all available Ollama models and the currently active one."""
+    import brain.config as cfg
+    import httpx
+    available = []
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get("http://localhost:11434/api/tags")
+            if resp.status_code == 200:
+                data = resp.json()
+                for m in data.get("models", []):
+                    available.append({
+                        "name": m.get("name", ""),
+                        "size": m.get("size", 0),
+                        "modified_at": m.get("modified_at", ""),
+                    })
+    except Exception as e:
+        return {"status": "error", "error": f"Cannot reach Ollama: {e}"}
+    return {
+        "status": "ok",
+        "current_model": cfg.LLM_MODEL,
+        "available": available,
+    }
+
+
+class SwitchModelRequest(BaseModel):
+    model: str
+
+
+@app.post("/models/switch")
+async def switch_model(req: SwitchModelRequest):
+    """Switch the active LLM model at runtime. Validates the model exists in Ollama first."""
+    import brain.config as cfg
+    import httpx
+
+    new_model = req.model.strip()
+    if not new_model:
+        return {"status": "error", "error": "Model name cannot be empty"}
+
+    # Verify model exists in Ollama
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get("http://localhost:11434/api/tags")
+            if resp.status_code == 200:
+                data = resp.json()
+                available = [m.get("name", "") for m in data.get("models", [])]
+                # Match with or without tag suffix (e.g. "qwen3.5" matches "qwen3.5:latest")
+                found = any(new_model in name or name.split(":")[0] == new_model for name in available)
+                if not found:
+                    return {
+                        "status": "error",
+                        "error": f"Model '{new_model}' not found in Ollama",
+                        "available": available,
+                    }
+    except Exception as e:
+        return {"status": "error", "error": f"Cannot reach Ollama: {e}"}
+
+    old_model = cfg.LLM_MODEL
+    cfg.LLM_MODEL = new_model
+    return {
+        "status": "ok",
+        "previous_model": old_model,
+        "current_model": new_model,
+    }
 
 
 # ── Process log SSE stream ────────────────────────────────────────────────────
@@ -131,6 +275,15 @@ async def process_logs_history():
     return {"logs": list(_LOG_HISTORY)}
 
 
+# ── Cancel all running agent processes ─────────────────────────────────────────
+@app.post("/agent/cancel")
+async def agent_cancel():
+    """Signal all running agent/LLM tasks to stop ASAP."""
+    _cancel_event.set()
+    _api_log.info("[API] Cancellation requested — all running agent tasks will stop")
+    return {"status": "ok", "message": "Cancellation signal sent"}
+
+
 class QueryRequest(BaseModel):
     question: str
     verbose: bool = False
@@ -145,36 +298,40 @@ class FeedbackRequest(BaseModel):
 
 @app.post("/query")
 async def query(req: QueryRequest):
-    # Build context from persistent session if session_id provided
-    if req.session_id:
-        history = chat_store.get_context_window(req.session_id, req.question)
-    else:
-        history = session_chat_history
+    try:
+        # Build context from persistent session if session_id provided
+        if req.session_id:
+            history = chat_store.get_context_window(req.session_id, req.question)
+        else:
+            history = session_chat_history
 
-    results = await query_brain_comprehensive(
-        req.question,
-        verbose=req.verbose,
-        raw_docs=raw_docs,
-        session_chat_history=history,
-        mode_override=req.mode
-    )
+        results = await query_brain_comprehensive(
+            req.question,
+            verbose=req.verbose,
+            raw_docs=raw_docs,
+            session_chat_history=history,
+            mode_override=req.mode
+        )
 
-    # Persist turns to Chroma session store
-    if req.session_id:
-        chat_store.add_turn(req.session_id, "User", req.question)
-        answer_text = ""
-        if isinstance(results, dict):
-            if "deep" in results:
-                answer_text = results["deep"].get("answer", "")
-            else:
-                answer_text = results.get("answer", "")
-        if answer_text:
-            chat_store.add_turn(req.session_id, "Assistant", answer_text)
-        # Trigger smart summarization when chat gets long
-        if chat_store.should_summarize(req.session_id):
-            chat_store.trigger_summarization(req.session_id)
+        # Persist turns to Chroma session store
+        if req.session_id:
+            chat_store.add_turn(req.session_id, "User", req.question)
+            answer_text = ""
+            if isinstance(results, dict):
+                if "deep" in results:
+                    answer_text = results["deep"].get("answer", "")
+                else:
+                    answer_text = results.get("answer", "")
+            if answer_text:
+                chat_store.add_turn(req.session_id, "Assistant", answer_text)
+            # Trigger smart summarization when chat gets long
+            if chat_store.should_summarize(req.session_id):
+                chat_store.trigger_summarization(req.session_id)
 
-    return results
+        return results
+    except Exception as e:
+        _api_log.error("query failed: %s\n%s", e, traceback.format_exc())
+        return {"answer": f"Error: {e}", "error": str(e), "status": "error"}
 
 @app.post("/ingest")
 async def ingest():
@@ -304,36 +461,40 @@ async def ingest_file_endpoint(filename: str):
 
 @app.post("/feedback")
 async def feedback(req: FeedbackRequest):
-    # Tiered escalation: fast → deep → deep_semantic
-    escalation = {
-        'fast': 'deep',
-        'auto': 'deep',
-        'deep': 'deep_semantic',
-        'deep_semantic': 'deep_semantic',  # already highest, retry same
-        'both': 'deep_semantic',
-    }
-    next_mode = escalation.get(req.prev_mode or 'auto', 'deep')
+    try:
+        # Tiered escalation: fast → deep → deep_semantic
+        escalation = {
+            'fast': 'deep',
+            'auto': 'deep',
+            'deep': 'deep_semantic',
+            'deep_semantic': 'deep_semantic',  # already highest, retry same
+            'both': 'deep_semantic',
+        }
+        next_mode = escalation.get(req.prev_mode or 'auto', 'deep')
 
-    if req.session_id:
-        history = chat_store.get_context_window(req.session_id, req.question)
-    else:
-        history = session_chat_history
+        if req.session_id:
+            history = chat_store.get_context_window(req.session_id, req.question)
+        else:
+            history = session_chat_history
 
-    results = await query_brain_comprehensive(
-        req.question,
-        verbose=False,
-        raw_docs=raw_docs,
-        session_chat_history=history,
-        mode_override=next_mode
-    )
+        results = await query_brain_comprehensive(
+            req.question,
+            verbose=False,
+            raw_docs=raw_docs,
+            session_chat_history=history,
+            mode_override=next_mode
+        )
 
-    # Persist the retry answer
-    if req.session_id:
-        answer_text = results.get("answer", "") if isinstance(results, dict) else ""
-        if answer_text:
-            chat_store.add_turn(req.session_id, "Assistant", f"[DEEP RETRY] {answer_text}")
+        # Persist the retry answer
+        if req.session_id:
+            answer_text = results.get("answer", "") if isinstance(results, dict) else ""
+            if answer_text:
+                chat_store.add_turn(req.session_id, "Assistant", f"[DEEP RETRY] {answer_text}")
 
-    return results
+        return results
+    except Exception as e:
+        _api_log.error("feedback failed: %s\n%s", e, traceback.format_exc())
+        return {"answer": f"Error: {e}", "error": str(e), "status": "error"}
 
 
 class AgentEditRequest(BaseModel):
@@ -360,7 +521,11 @@ async def agent_edit(req: AgentEditRequest):
         candidate = Path(resolved_path)
         if not candidate.is_absolute():
             # already tried relative, now search recursively
-            matches = list(Path(".").rglob(candidate.name))
+            try:
+                matches = list(Path(".").rglob(candidate.name))
+            except OSError as e:
+                _api_log.warning("rglob scan failed (%s) — cannot locate %s", e, candidate.name)
+                matches = []
             if matches:
                 resolved_path = str(matches[0].resolve())
             else:
@@ -370,7 +535,8 @@ async def agent_edit(req: AgentEditRequest):
             return {"error": f"File not found: {req.file_path}", "status": "error",
                     "message": f"File not found: {req.file_path}"}
 
-    try:
+    def _run_edit():
+        _cancel_event.clear()
         # Build cross-file context from additional context files
         augmented_instruction = req.instruction
         if req.context_files:
@@ -395,6 +561,15 @@ async def agent_edit(req: AgentEditRequest):
             task_mode=req.task_mode,
             session_id=req.session_id,
         )
+        return result
+
+    try:
+        result = await asyncio.to_thread(_run_edit)
+
+        if _cancel_event.is_set():
+            _cancel_event.clear()
+            return {"status": "error", "error": "Cancelled by user"}
+
         # edit_code returns a dict when dry_run=True: {new_source, diff, changed}
         if isinstance(result, dict):
             diff = result.get("diff", "")
@@ -445,6 +620,7 @@ async def agent_edit(req: AgentEditRequest):
             "new_source": new_source,
         }
     except Exception as e:
+        _api_log.error("agent_edit failed: %s\n%s", e, traceback.format_exc())
         return {"error": str(e), "status": "error", "message": f"Agent error: {str(e)}"}
 
 
@@ -521,15 +697,17 @@ async def agent_apply(req: AgentApplyRequest):
             }
 
         agent = CodeAgent(repo_path=".")
-        result = agent.edit_code(
-            path=resolved_path,
-            instruction=req.instruction,
-            dry_run=False,
-            use_rag=True,
-            rerank_method="cross_encoder",  # always use best quality when actually writing
-            task_mode=req.task_mode,
-            session_id=req.session_id,
-        )
+        def _apply_edit():
+            return agent.edit_code(
+                path=resolved_path,
+                instruction=req.instruction,
+                dry_run=False,
+                use_rag=True,
+                rerank_method="cross_encoder",  # always use best quality when actually writing
+                task_mode=req.task_mode,
+                session_id=req.session_id,
+            )
+        result = await asyncio.to_thread(_apply_edit)
         return {
             "status": "success",
             "message": f"Changes applied to {resolved_path}",
@@ -573,17 +751,24 @@ async def agent_edit_with_chunks(req: AgentEditWithChunksRequest):
         # Clamp max_chunks to reasonable range
         max_chunks = max(1, min(req.max_chunks, 50))
 
-        agent = CodeAgent(repo_path=".")
-        result = agent.edit_code(
-            path=resolved_path,
-            instruction=req.instruction,
-            dry_run=True,
-            use_rag=True,
-            rerank_method="auto",
-            max_chunks=max_chunks,
-            task_mode=req.task_mode,
-            search_method=req.search_method
-        )
+        def _run_chunks():
+            _cancel_event.clear()
+            agent = CodeAgent(repo_path=".")
+            return agent.edit_code(
+                path=resolved_path,
+                instruction=req.instruction,
+                dry_run=True,
+                use_rag=True,
+                rerank_method="auto",
+                max_chunks=max_chunks,
+                task_mode=req.task_mode,
+                search_method=req.search_method
+            )
+        result = await asyncio.to_thread(_run_chunks)
+
+        if _cancel_event.is_set():
+            _cancel_event.clear()
+            return {"status": "error", "error": "Cancelled by user"}
 
         if isinstance(result, dict):
             diff = result.get("diff", "")
@@ -642,16 +827,23 @@ async def agent_orchestrate(req: OrchestrateRequest):
             return {"error": f"File not found: {req.file_path}", "status": "error"}
 
     try:
-        result = run_multi_agent(
-            instruction=req.instruction,
-            file_path=resolved_path,
-            task_mode=req.task_mode,
-            session_id=req.session_id,
-            max_attempts=max(1, min(req.max_attempts, 5)),
-            include_related=req.include_related,
-            extra_context_files=req.context_files,
-            test_cases=req.test_cases if req.test_cases else None,
-        )
+        def _run_orchestrate():
+            _cancel_event.clear()
+            return run_multi_agent(
+                instruction=req.instruction,
+                file_path=resolved_path,
+                task_mode=req.task_mode,
+                session_id=req.session_id,
+                max_attempts=max(1, min(req.max_attempts, 5)),
+                include_related=req.include_related,
+                extra_context_files=req.context_files,
+                test_cases=req.test_cases if req.test_cases else None,
+            )
+        result = await asyncio.to_thread(_run_orchestrate)
+
+        if _cancel_event.is_set():
+            _cancel_event.clear()
+            return {"status": "error", "error": "Cancelled by user"}
 
         # Build the full assistant response matching what the frontend displays
         response_parts = []
@@ -728,8 +920,10 @@ async def run_tests_endpoint(req: RunTestsRequest):
             return {"error": f"File not found: {req.file_path}", "status": "error"}
 
     try:
-        source = agent_read_file(resolved_path)
-        results = run_tests(source, resolved_path, req.test_cases)
+        def _run():
+            source = agent_read_file(resolved_path)
+            return run_tests(source, resolved_path, req.test_cases)
+        results = await asyncio.to_thread(_run)
         return {
             "status": "ok",
             "results": results,
@@ -775,15 +969,18 @@ async def fix_with_tests_endpoint(req: FixWithTestsRequest):
         original_content = None
 
     try:
-        agent = CodeAgent(repo_path=".")
-        result = agent.fix_with_tests(
-            path=resolved_path,
-            instruction=req.instruction,
-            test_cases=req.test_cases,
-            max_retries=max(1, min(req.max_retries, 5)),
-            task_mode=req.task_mode,
-            session_id=req.session_id,
-        )
+        def _run_fix():
+            _cancel_event.clear()
+            agent = CodeAgent(repo_path=".")
+            return agent.fix_with_tests(
+                path=resolved_path,
+                instruction=req.instruction,
+                test_cases=req.test_cases,
+                max_retries=max(1, min(req.max_retries, 5)),
+                task_mode=req.task_mode,
+                session_id=req.session_id,
+            )
+        result = await asyncio.to_thread(_run_fix)
 
         # Restore original file on disk — user must approve via frontend
         if original_content is not None:
@@ -1125,21 +1322,12 @@ async def tutor_start(req: TutorStartRequest):
     from agent.tutor import generate_problem, generate_math_problem, is_math_topic
     _is_math = is_math_topic(req.topic)
     _api_log.info("[API] /tutor/start — topic=%s, math=%s, style=%s", req.topic, _is_math, req.style)
-    if _is_math:
-        # Route to math-specific problem generation
-        math_style = "mcq" if req.style == "mcq" else "solve"
-        result = generate_math_problem(
-            topic=req.topic,
-            difficulty=req.difficulty,
-            style=math_style,
-        )
-    else:
-        result = generate_problem(
-            topic=req.topic,
-            difficulty=req.difficulty,
-            language=req.language,
-            style=req.style,
-        )
+    def _gen():
+        if _is_math:
+            math_style = "mcq" if req.style == "mcq" else "solve"
+            return generate_math_problem(topic=req.topic, difficulty=req.difficulty, style=math_style)
+        return generate_problem(topic=req.topic, difficulty=req.difficulty, language=req.language, style=req.style)
+    result = await asyncio.to_thread(_gen)
     _api_log.info("[API] /tutor/start — done ✓")
     return {"status": "ok", **result}
 
@@ -1150,10 +1338,11 @@ async def tutor_check(req: TutorAnswerRequest):
     _api_log.info("[API] /tutor/check — session=%s", req.session_id)
     from agent.tutor import check_answer, check_math_answer, _tutor_sessions
     state = _tutor_sessions.get(req.session_id)
-    if state and state.get("is_math"):
-        result = check_math_answer(req.session_id, req.answer)
-    else:
-        result = check_answer(req.session_id, req.answer)
+    def _check():
+        if state and state.get("is_math"):
+            return check_math_answer(req.session_id, req.answer)
+        return check_answer(req.session_id, req.answer)
+    result = await asyncio.to_thread(_check)
     return {"status": "ok", **result}
 
 
@@ -1169,7 +1358,7 @@ async def tutor_run(req: TutorCodeRequest):
 async def tutor_hint(req: TutorHintRequest):
     """Get the next progressive hint."""
     from agent.tutor import get_hint
-    result = get_hint(req.session_id)
+    result = await asyncio.to_thread(get_hint, req.session_id)
     return {"status": "ok", **result}
 
 
@@ -1207,7 +1396,7 @@ async def math_start(req: MathStartRequest):
     """Generate a new math practice problem with lesson and step-by-step solution."""
     _api_log.info("[API] /math/start — topic=%s, difficulty=%s, style=%s", req.topic, req.difficulty, req.style)
     from agent.tutor import generate_math_problem
-    result = generate_math_problem(topic=req.topic, difficulty=req.difficulty, style=req.style)
+    result = await asyncio.to_thread(generate_math_problem, topic=req.topic, difficulty=req.difficulty, style=req.style)
     _api_log.info("[API] /math/start — done ✓")
     return {"status": "ok", **result}
 
@@ -1217,7 +1406,7 @@ async def math_check(req: MathAnswerRequest):
     """Check a math answer (supports equivalent forms via LLM evaluation)."""
     _api_log.info("[API] /math/check — session=%s", req.session_id)
     from agent.tutor import check_math_answer
-    result = check_math_answer(req.session_id, req.answer)
+    result = await asyncio.to_thread(check_math_answer, req.session_id, req.answer)
     _api_log.info("[API] /math/check — done ✓")
     return {"status": "ok", **result}
 
@@ -1227,7 +1416,7 @@ async def math_hint(req: TutorHintRequest):
     """Get the next progressive hint for a math problem."""
     _api_log.info("[API] /math/hint — session=%s", req.session_id)
     from agent.tutor import get_hint
-    result = get_hint(req.session_id)
+    result = await asyncio.to_thread(get_hint, req.session_id)
     _api_log.info("[API] /math/hint — done ✓")
     return {"status": "ok", **result}
 
@@ -1262,3 +1451,61 @@ async def math_matrix(req: MatrixRequest):
     from agent.tutor import solve_matrix_problem
     result = solve_matrix_problem(operation=req.operation, matrices=req.matrices)
     return {"status": "ok", **result}
+
+
+# ── Curriculum endpoints ──────────────────────────────────────────────────
+
+@app.get("/math/curriculum")
+async def math_curriculum():
+    """Get the full curriculum tree with progress."""
+    from agent.tutor import get_curriculum
+    return {"status": "ok", "curriculum": get_curriculum()}
+
+
+@app.get("/math/curriculum/{subject_id}/{chapter_id}")
+async def math_chapter(subject_id: str, chapter_id: str):
+    """Get topics for a specific chapter."""
+    from agent.tutor import get_chapter_topics
+    result = get_chapter_topics(subject_id, chapter_id)
+    return {"status": "ok", **result}
+
+
+class ChapterProgressRequest(BaseModel):
+    subject_id: str
+    chapter_id: str
+
+@app.post("/math/curriculum/progress")
+async def math_progress(req: ChapterProgressRequest):
+    """Mark a chapter as completed."""
+    from agent.tutor import mark_chapter_complete
+    result = mark_chapter_complete(req.subject_id, req.chapter_id)
+    return result
+
+
+# ── CS Curriculum endpoints ───────────────────────────────────────────────
+
+@app.get("/cs/curriculum")
+async def cs_curriculum():
+    """Get the full CS curriculum tree with progress."""
+    from agent.tutor import get_cs_curriculum
+    return {"status": "ok", "curriculum": get_cs_curriculum()}
+
+
+@app.get("/cs/curriculum/{subject_id}/{chapter_id}")
+async def cs_chapter(subject_id: str, chapter_id: str):
+    """Get topics for a specific CS chapter."""
+    from agent.tutor import get_cs_chapter_topics
+    result = get_cs_chapter_topics(subject_id, chapter_id)
+    return {"status": "ok", **result}
+
+
+class CSChapterProgressRequest(BaseModel):
+    subject_id: str
+    chapter_id: str
+
+@app.post("/cs/curriculum/progress")
+async def cs_progress(req: CSChapterProgressRequest):
+    """Mark a CS chapter as completed."""
+    from agent.tutor import mark_cs_chapter_complete
+    result = mark_cs_chapter_complete(req.subject_id, req.chapter_id)
+    return result

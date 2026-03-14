@@ -6,6 +6,7 @@ import numpy as np
 
 from langchain_core.documents import Document
 from langchain_ollama import OllamaLLM
+from .config import make_llm
 
 from .keyword_search import tokenize_text
 from .prompts import (
@@ -31,7 +32,7 @@ def _safe_llm_invoke(llm: OllamaLLM, prompt: str, verbose: bool = False) -> Opti
 
 
 def _build_query_llm(llm_model: str) -> OllamaLLM:
-    return OllamaLLM(model=llm_model, temperature=0)
+    return make_llm(model=llm_model, temperature=0)
 
 
 def _spell_correct_query(query: str, llm: OllamaLLM) -> str:
@@ -166,7 +167,7 @@ def evaluate_documents_with_llm(
     if not docs:
         return []
 
-    llm = OllamaLLM(model=llm_model, temperature=0)
+    llm = make_llm(model=llm_model, temperature=0)
 
     formatted_docs = []
     for i, doc in enumerate(docs, 1):

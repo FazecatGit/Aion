@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from langchain_ollama import OllamaLLM
 from brain.fast_search import fast_topic_search
-from .config import LLM_MODEL, DATA_DIR
+from .config import DATA_DIR, make_llm
 
 _KEYWORD_CACHE = None
 
@@ -20,7 +20,7 @@ def build_keyword_map(topic_map: dict) -> dict:
             print(f"[DEBUG] Keyword map loaded from cache.")
             return _KEYWORD_CACHE
 
-    llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+    llm = make_llm(temperature=0.0)
     filenames = list(topic_map.values())
 
     prompt = f"""You are a keyword mapping assistant.
@@ -85,7 +85,7 @@ def extract_dynamic_filters(query: str, verbose: bool = False) -> dict:
         print(f"[DEBUG] Keyword pre-filter matched IDs: {matched_ids}")
     
     if not matched_ids:
-        llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+        llm = make_llm(temperature=0.0)
         prompt = f"""You are a strict data routing assistant. 
 Analyze the user query: "{query}"
 

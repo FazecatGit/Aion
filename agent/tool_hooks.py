@@ -13,8 +13,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional
+from print_logger import get_logger
 
-logger = logging.getLogger("tool_hooks")
+logger = get_logger("tool_hooks")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

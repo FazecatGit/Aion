@@ -8,10 +8,11 @@ import shutil
 from typing import List, Dict, Optional, Tuple
 
 from langchain_ollama import OllamaLLM
-from brain.config import LLM_MODEL, LANG_FENCE
+from brain.config import LLM_MODEL, LANG_FENCE, make_llm
 from .code_editing_helpers import strip_markdown
+from print_logger import get_logger
 
-logger = logging.getLogger("code_agent")
+logger = get_logger("code_agent")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -197,7 +198,7 @@ def run_tests(
         return _make_error_list(test_cases, err)
 
     if llm is None:
-        llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+        llm = make_llm(temperature=0.0)
 
     inputs = [tc["input"] for tc in test_cases]
     expected_outputs = [tc["expected"] for tc in test_cases]
@@ -367,7 +368,7 @@ def run_debug_trace(
     """
     ext = os.path.splitext(path)[1].lower()
     if llm is None:
-        llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+        llm = make_llm(temperature=0.0)
 
     try:
         harness = _generate_debug_harness(source, ext, failing_input, expected_output, llm)
@@ -690,7 +691,7 @@ def run_step_verification(
     """
     ext = os.path.splitext(path)[1].lower()
     if llm is None:
-        llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+        llm = make_llm(temperature=0.0)
 
     try:
         harness = _generate_assertion_harness(source, ext, failing_input, expected_output, instruction, llm)

@@ -8,6 +8,10 @@ import logging
 from typing import Optional, List, Dict
 from operator import itemgetter
 
+# On Windows, CREATE_NO_WINDOW prevents a console window flash and avoids
+# interaction with asyncio's ProactorEventLoop IOCP handles from threads.
+_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
 from brain.fast_search import fast_topic_search
 from brain.config import (
     LLM_MODEL, CHROMA_DIR, EMBEDDING_MODEL,
@@ -16,8 +20,9 @@ from brain.config import (
     UNIVERSAL_DOC_KEYWORDS, IMPLEMENT_KEYWORDS,
 )
 from .code_editing_helpers import parse_compiler_errors
+from print_logger import get_logger
 
-logger = logging.getLogger("code_agent")
+logger = get_logger("code_agent")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -42,6 +47,7 @@ def _go_compile_check(path: str, source: str, file_lines: list) -> str:
             result = subprocess.run(
                 ["go", "build", path],
                 capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
+                creationflags=_SUBPROCESS_FLAGS,
             )
             if result.returncode != 0 and result.stderr:
                 errors = parse_compiler_errors(result.stderr)
@@ -64,6 +70,7 @@ def _go_compile_check(path: str, source: str, file_lines: list) -> str:
                 ["go", "build", "."],
                 capture_output=True, text=True, timeout=10,
                 cwd=tmpdir, stdin=subprocess.DEVNULL,
+                creationflags=_SUBPROCESS_FLAGS,
             )
             if result.returncode != 0 and result.stderr:
                 errors = parse_compiler_errors(result.stderr)
@@ -110,7 +117,8 @@ def build_runtime_error_notes(
     try:
         run_result = subprocess.run(
             cmd, capture_output=True, text=True,
-            timeout=10, stdin=subprocess.DEVNULL
+            timeout=10, stdin=subprocess.DEVNULL,
+            creationflags=_SUBPROCESS_FLAGS,
         )
         if run_result.returncode != 0 and run_result.stderr:
             from .code_editing_helpers import build_runtime_error_note as build_formatted_note
@@ -169,12 +177,14 @@ def run_lint_checks(path: str, source: str, ext: str) -> str:
                         ["go", "vet", "."],
                         capture_output=True, text=True, timeout=10,
                         cwd=tmpdir, stdin=subprocess.DEVNULL,
+                        creationflags=_SUBPROCESS_FLAGS,
                     )
             else:
                 result = subprocess.run(
                     ["go", "vet", path],
                     capture_output=True, text=True, timeout=10,
                     stdin=subprocess.DEVNULL,
+                    creationflags=_SUBPROCESS_FLAGS,
                 )
         else:
             # Generic: run lint command on the file
@@ -182,6 +192,7 @@ def run_lint_checks(path: str, source: str, ext: str) -> str:
                 lint_cmd_template + [path],
                 capture_output=True, text=True, timeout=10,
                 stdin=subprocess.DEVNULL,
+                creationflags=_SUBPROCESS_FLAGS,
             )
 
         stderr_out = (result.stderr or "").strip()
@@ -568,8 +579,8 @@ def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cro
     if final_results:
         logger.info("[RAG] Grading %d fused chunks...", len(final_results))
         try:
-            from langchain_ollama import OllamaLLM as _OllamaLLM
-            grade_llm = _OllamaLLM(model=LLM_MODEL, temperature=0.0)
+            from brain.config import make_llm
+            grade_llm = make_llm(temperature=0.0)
             file_ext = ext if file_path else ""
             graded_results = _grade_chunks(final_results, instruction, grade_llm, file_ext=file_ext)
             final_results = graded_results[:max_chunks]

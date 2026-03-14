@@ -6,7 +6,8 @@ from brain.pdf_utils import load_pdfs
 from brain.route_execution import route_execution_mode
 from brain.router import extract_dynamic_filters
 
-from .config import LLM_MODEL, LLM_TEMPERATURE, DATA_DIR
+from . import config as _cfg
+from .config import LLM_TEMPERATURE, DATA_DIR, make_llm
 from .fast_search import fast_topic_search
 from .rag_brain import query_brain
 from .query_pipeline import evaluate_documents_with_llm
@@ -223,7 +224,7 @@ async def _answer_from_history(query: str, chat_history: list[dict], llm_model: 
             last_user_query = msg['content']
             break
 
-    llm = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
+    llm = make_llm(model=llm_model, temperature=LLM_TEMPERATURE)
 
     prompt = f"""You are an expert programming assistant.
 
@@ -286,7 +287,7 @@ Latest question: {query}
 Rewritten search query:"""
 
     try:
-        llm = OllamaLLM(model=llm_model, temperature=0)
+        llm = make_llm(model=llm_model, temperature=0)
         rewritten = llm.invoke(prompt)
         rewritten = rewritten.strip().strip('"').strip("'")
         if rewritten and len(rewritten) > 5:
@@ -322,7 +323,7 @@ def _format_search_results_for_prompt(results: list) -> str:
 
 
 async def answer_question(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
-    llm = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
+    llm = make_llm(model=llm_model, temperature=LLM_TEMPERATURE)
 
     history_entries = []
     if session_chat_history:
@@ -373,7 +374,7 @@ Answer:"""
 
 
 async def summarize_documents(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
-    llm  = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
+    llm  = make_llm(model=llm_model, temperature=LLM_TEMPERATURE)
 
     recent_history = "\n".join([
         f"{msg['role'].upper()}: {msg['content']}"
@@ -407,7 +408,7 @@ Summary:"""
     return await llm.ainvoke(prompt)
 
 async def cite_documents(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
-    llm  = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
+    llm  = make_llm(model=llm_model, temperature=LLM_TEMPERATURE)
 
     recent_history = "\n".join([
         f"{msg['role'].upper()}: {msg['content']}"
@@ -433,7 +434,7 @@ Citations:"""
 
 
 async def detailed_answer(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
-    llm  = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
+    llm  = make_llm(model=llm_model, temperature=LLM_TEMPERATURE)
     recent_history = session_chat_history[-5:] if session_chat_history else []
 
     history_str = []
@@ -653,7 +654,7 @@ async def query_brain_comprehensive(
     mode_override: str | None = None  # 'auto','fast','deep','deep_semantic','both'
 ) -> dict:
 
-    llm_model = llm_model or LLM_MODEL
+    llm_model = llm_model or _cfg.LLM_MODEL
 
     # ── Follow-up handling ─────────────────────────────────────────────
     effective_query = query

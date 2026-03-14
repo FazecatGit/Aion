@@ -19,9 +19,10 @@ from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
 from langchain_core.documents import Document
 
-from brain.config import EMBEDDING_MODEL, LLM_MODEL, LLM_TEMPERATURE
+from brain.config import EMBEDDING_MODEL, LLM_TEMPERATURE, make_llm
+from print_logger import get_logger
 
-logger = logging.getLogger("chat_session_store")
+logger = get_logger("chat_session_store")
 
 _PERSIST_DIR = "cache/chat_sessions_db"
 _COLLECTION  = "aion-chat-sessions"
@@ -274,7 +275,7 @@ class ChatSessionStore:
         )
 
         try:
-            llm = OllamaLLM(model=LLM_MODEL, temperature=0)
+            llm = make_llm(temperature=0)
             prompt = f"""Summarize this conversation history into a compact paragraph.
 Preserve:
 - Key technical topics discussed (languages, frameworks, algorithms)

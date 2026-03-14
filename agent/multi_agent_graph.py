@@ -25,10 +25,11 @@ from langgraph.graph import StateGraph, END
 
 from langchain_ollama import OllamaLLM
 
-from brain.config import LLM_MODEL, LANG_FENCE, LANG_NAMES
+from brain.config import LLM_MODEL, LANG_FENCE, LANG_NAMES, make_llm
 from agent.orchestration import plan_task, format_plan_for_prompt, critique_code, build_critic_feedback_note
+from print_logger import get_logger
 
-logger = logging.getLogger("multi_agent")
+logger = get_logger("multi_agent")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -78,7 +79,7 @@ def plan_node(state: AgentState) -> dict:
     source = state["original_source"]
 
     try:
-        llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+        llm = make_llm(temperature=0.0)
         plan = plan_task(
             instruction=state["instruction"],
             source=source,
@@ -119,7 +120,7 @@ def strategist_node(state: AgentState) -> dict:
     lang = LANG_FENCE.get(ext, ext.lstrip('.'))
     lang_name = LANG_NAMES.get(ext, ext.lstrip('.').upper() if ext else 'code')
 
-    llm = OllamaLLM(model=LLM_MODEL, temperature=0.1)
+    llm = make_llm(temperature=0.1)
 
     logger.info("[STRATEGIST] Analyzing problem for algorithmic approach...")
 
@@ -356,7 +357,7 @@ def critique_node(state: AgentState) -> dict:
     logger.info("[CRITIQUE] Reviewing code changes...")
 
     try:
-        llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+        llm = make_llm(temperature=0.0)
         critique = critique_code(
             instruction=state["instruction"],
             original_source=state["original_source"],
@@ -399,7 +400,7 @@ def discuss_node(state: AgentState) -> dict:
     """
     logger.info("[DISCUSS] Agents debating the problem (attempt %d)...", state["attempt"])
 
-    llm = OllamaLLM(model=LLM_MODEL, temperature=0.3)
+    llm = make_llm(temperature=0.3)
     lang = LANG_FENCE.get(state["ext"], state["ext"].lstrip('.'))
     discussion = list(state.get("discussion_log") or [])
 
@@ -494,7 +495,7 @@ def discuss_node(state: AgentState) -> dict:
     if state["attempt"] >= 2:
         logger.info("[DISCUSS] Escalating to strategist (attempt %d)", state["attempt"])
         try:
-            llm_strat = OllamaLLM(model=LLM_MODEL, temperature=0.2)
+            llm_strat = make_llm(temperature=0.2)
             lang_name = LANG_NAMES.get(state["ext"], state["ext"])
             lang = LANG_FENCE.get(state["ext"], state["ext"].lstrip('.'))
 
@@ -715,7 +716,7 @@ def _edit_context_files(
     if not _apply_to_all and len(context_file_paths) > 0:
         # Use a fast LLM probe to decide if the user intends changes in all files
         try:
-            _clf_llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+            _clf_llm = make_llm(temperature=0.0)
             _file_list = ", ".join(os.path.basename(p) for p in context_file_paths)
             _clf_prompt = (
                 f"A user gave this instruction to edit code:\n\"{instruction}\"\n\n"
