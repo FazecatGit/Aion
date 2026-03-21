@@ -334,6 +334,7 @@ def execute_node(state: AgentState) -> dict:
             use_rag=True,
             task_mode=state.get("task_mode", "auto"),
             session_id=state.get("session_id"),
+            skip_post_review=True,  # graph has its own critique_node; skip redundant critic+explain
         )
 
         if isinstance(result, dict):

@@ -309,6 +309,7 @@ class CodeAgent:
         task_mode: str = "auto",
         search_method: str = "both",
         session_id: Optional[str] = None,
+        skip_post_review: bool = False,
     ) -> str:
         """Edit code in a file based on instruction using LLM.
         
@@ -318,6 +319,7 @@ class CodeAgent:
             dry_run: If True, only show diff without writing
             use_rag: If True, include RAG context from code search
             session_chat_history: Optional conversation history for context
+            skip_post_review: If True, skip critic review + explanation (used in graph mode)
             rerank_method: Reranking method for RAG - "cross_encoder", "keyword", or "none"
             task_mode: "fix" forces fix mode, "solve" forces implement mode, "auto" detects from instruction
             search_method: "bm25", "semantic", or "both" (default) for RAG search method
@@ -959,7 +961,8 @@ class CodeAgent:
         return self._finalize_edit(
             file_source, new_source, path, ext, dry_run,
             instruction, is_implement, llm, rag_citations, session_chat_history,
-            session_id=session_id, rag_context=rag_context
+            session_id=session_id, rag_context=rag_context,
+            skip_post_review=skip_post_review,
         )
 
     # ─── Extracted helper methods for edit_code ─────────────────────────────
@@ -1069,8 +1072,13 @@ class CodeAgent:
 
     def _finalize_edit(self, file_source, new_source, path, ext, dry_run,
                        instruction, is_implement, llm, rag_citations,
-                       session_chat_history, session_id=None, rag_context=""):
-        """Generate diff, critic review, explanation, and optionally write the edited file."""
+                       session_chat_history, session_id=None, rag_context="",
+                       skip_post_review: bool = False):
+        """Generate diff, critic review, explanation, and optionally write the edited file.
+        
+        When skip_post_review=True (graph mode), skips the expensive critic + explanation
+        LLM calls since the multi-agent graph has its own critique_node.
+        """
         diff = show_diff(file_source, new_source)
         logger.info("--- DIFF PREVIEW ---")
         logger.info('\n%s', diff or "No changes detected.")
@@ -1078,17 +1086,18 @@ class CodeAgent:
 
         lang_fence = LANG_FENCE.get(ext, ext.lstrip('.') if ext else 'text')
 
-        # --- Critic review ---
+        # --- Critic review (skip in graph mode — graph has its own critique_node) ---
         critic_note = ""
-        if new_source != file_source:
+        if new_source != file_source and not skip_post_review:
             try:
+                critic_llm = make_llm(temperature=0.0, num_predict=1024)
                 critique = critique_code(
                     instruction=instruction,
                     original_source=file_source,
                     new_source=new_source,
                     ext=ext,
                     rag_context=rag_context,
-                    llm=llm,
+                    llm=critic_llm,
                 )
                 logger.info("[AGENT] Critic verdict: %s (confidence: %.1f)", critique["verdict"], critique["confidence"])
                 if critique["verdict"] != "PASS" and critique["issues"]:
@@ -1114,10 +1123,11 @@ class CodeAgent:
             except Exception as e:
                 logger.debug("[AGENT] Critic review failed: %s", e)
 
-        # --- Generate teaching-style explanation ---
+        # --- Generate teaching-style explanation (skip in graph mode) ---
         explanation = ""
-        if new_source != file_source:
+        if new_source != file_source and not skip_post_review:
             try:
+                explain_llm = make_llm(temperature=0.0, num_predict=2048)
                 explain_prompt = (
                     f"You just {'implemented' if is_implement else 'fixed'} code for this task:\n"
                     f"TASK: {instruction[:400]}\n\n"
@@ -1136,7 +1146,7 @@ class CodeAgent:
                     "List 2-3 edge cases the code handles (or should handle), with brief explanation.\n\n"
                     "Keep it clear and beginner-friendly. Use the actual code to illustrate each point."
                 )
-                explanation = llm.invoke(explain_prompt).strip()
+                explanation = explain_llm.invoke(explain_prompt).strip()
                 logger.info("[AGENT] Teaching explanation: %s", explanation[:200])
 
                 # Store explanation as a learning for tutor mode

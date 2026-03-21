@@ -277,7 +277,24 @@ function App() {
   const [imageGenHistory, setImageGenHistory] = useState<any[]>([]);
   const [imageGenFeedback, setImageGenFeedback] = useState('');
   const [imageGenAnimated, setImageGenAnimated] = useState(false);
-  const [imageGenFrames, setImageGenFrames] = useState(8);
+  const [imageGenFrames, setImageGenFrames] = useState(16);
+  // ── New ImageStudio state ──────────────────────────────────────────────────
+  const [imageGenArtStyle, setImageGenArtStyle] = useState('anime');
+  const [imageGenFrameStrength, setImageGenFrameStrength] = useState(0.35);
+  const [imageGenFps, setImageGenFps] = useState(8);
+  const [imageGenOutputFormat, setImageGenOutputFormat] = useState<'gif'|'mp4'|'both'>('gif');
+  const [artStyles, setArtStyles] = useState<{name:string; prefix:string}[]>([]);
+  const [imageGenSubTab, setImageGenSubTab] = useState<'generate'|'animate'|'storyboard'|'upscale'|'train'>('generate');
+  const [storyboardDescs, setStoryboardDescs] = useState('');
+  const [animJobs, setAnimJobs] = useState<any[]>([]);
+  const [trainingStatus, setTrainingStatus] = useState<any>(null);
+  const [trainingImageDir, setTrainingImageDir] = useState('');
+  const [trainingName, setTrainingName] = useState('');
+  const [trainingType, setTrainingType] = useState<'style'|'character'>('style');
+  const [trainingCritique, setTrainingCritique] = useState<any>(null);
+  const [upscaleImagePath, setUpscaleImagePath] = useState('');
+  const [upscaleScale, setUpscaleScale] = useState(2.0);
+  const [upscaleTileSize, setUpscaleTileSize] = useState(768);
   // ── Image lightbox with zoom+pan ───────────────────────────────────────────
   const [lightboxZoom, setLightboxZoom] = useState(1);
   const [lightboxPan, setLightboxPan] = useState({ x: 0, y: 0 });
@@ -493,7 +510,7 @@ function App() {
   // Fetch gamification profile when entering tutor mode
   useEffect(() => {
     if (activeMode === 'tutor') fetchGamifProfile();
-    if (activeMode === 'imagegen') { fetchImageModels(); fetchImageHistory(); }
+    if (activeMode === 'imagegen') { fetchImageModels(); fetchImageHistory(); fetchArtStyles(); fetchAnimJobs(); }
   }, [activeMode]);
 
   // Refresh gamification profile after solving a problem
@@ -1292,7 +1309,16 @@ const handleImageGenerate = async () => {
     if (selectedImageModel) body.model = selectedImageModel;
     if (selectedLoras.length > 0) body.loras = selectedLoras;
     if (imageGenNegative.trim()) body.negative_prompt = imageGenNegative.trim();
-    if (imageGenAnimated) body.num_frames = imageGenFrames;
+    if (imageGenAnimated) {
+      body.num_frames = imageGenFrames;
+      body.art_style = imageGenArtStyle;
+      body.frame_strength = imageGenFrameStrength;
+      body.fps = imageGenFps;
+      body.output_format = imageGenOutputFormat;
+      if (storyboardDescs.trim()) {
+        body.storyboard = storyboardDescs.split('\n').filter((s: string) => s.trim());
+      }
+    }
 
     const res = await fetch(`http://localhost:8000${endpoint}`, {
       method: 'POST',
@@ -1307,9 +1333,9 @@ const handleImageGenerate = async () => {
     }
 
     const contentType = res.headers.get('content-type') ?? '';
-    if (contentType.includes('image') || contentType.includes('gif')) {
+    if (contentType.includes('image') || contentType.includes('gif') || contentType.includes('video')) {
       // Parse metadata from custom header
-      const metaHeader = res.headers.get('X-Generation-Meta');
+      const metaHeader = res.headers.get('X-Generation-Meta') || res.headers.get('X-Animation-Meta');
       if (metaHeader) {
         try { setImageGenMeta(JSON.parse(metaHeader)); } catch {}
       }
@@ -1383,6 +1409,129 @@ const deleteImageModel = async (modelPath: string) => {
     });
     fetchImageModels();
   } catch {}
+};
+
+// Fetch available art styles
+const fetchArtStyles = async () => {
+  try {
+    const res = await fetch('http://localhost:8000/generate/styles');
+    const data = await res.json();
+    if (data.status === 'ok') setArtStyles(data.styles || []);
+  } catch {}
+};
+
+// Fetch animation jobs
+const fetchAnimJobs = async () => {
+  try {
+    const res = await fetch('http://localhost:8000/generate/animated/jobs');
+    const data = await res.json();
+    if (data.status === 'ok') setAnimJobs(data.jobs || []);
+  } catch {}
+};
+
+// Fetch training status
+const fetchTrainingStatus = async () => {
+  try {
+    const res = await fetch('http://localhost:8000/generate/train/status');
+    const data = await res.json();
+    setTrainingStatus(data);
+  } catch {}
+};
+
+// Critique training dataset
+const handleCritiqueDataset = async () => {
+  if (!trainingImageDir.trim()) return;
+  try {
+    const res = await fetch('http://localhost:8000/generate/train/critique', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image_dir: trainingImageDir, training_type: trainingType }),
+    });
+    const data = await res.json();
+    setTrainingCritique(data);
+  } catch {}
+};
+
+// Start LoRA training
+const handleStartTraining = async () => {
+  if (!trainingName.trim() || !trainingImageDir.trim()) return;
+  try {
+    const res = await fetch('http://localhost:8000/generate/train/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: trainingName, image_dir: trainingImageDir,
+        training_type: trainingType,
+        base_model: selectedImageModel || undefined,
+      }),
+    });
+    const data = await res.json();
+    setTrainingStatus(data);
+  } catch {}
+};
+
+// Upscale image
+const handleUpscale = async () => {
+  if (!upscaleImagePath.trim()) return;
+  setImageGenLoading(true);
+  try {
+    const res = await fetch('http://localhost:8000/generate/upscale', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        image_path: upscaleImagePath, scale: upscaleScale,
+        tile_size: upscaleTileSize,
+        model: selectedImageModel || undefined,
+      }),
+    });
+    const contentType = res.headers.get('content-type') ?? '';
+    if (contentType.includes('image')) {
+      const blob = await res.blob();
+      setImageGenResult(URL.createObjectURL(blob));
+    } else {
+      const data = await res.json();
+      if (data.status === 'error') setImageGenResult(`Error: ${data.error}`);
+    }
+  } catch (err: any) {
+    setImageGenResult(`Error: ${err.message}`);
+  } finally {
+    setImageGenLoading(false);
+  }
+};
+
+// Generate storyboard preview
+const handleStoryboardPreview = async () => {
+  if (!imageGenPrompt.trim()) return;
+  setImageGenLoading(true);
+  try {
+    const body: any = {
+      prompt: imageGenPrompt.trim(),
+      num_frames: imageGenFrames,
+      width: 256, height: 256,
+      seed: imageGenSeed,
+    };
+    if (selectedImageModel) body.model = selectedImageModel;
+    if (storyboardDescs.trim()) {
+      body.storyboard_descriptions = storyboardDescs.split('\n').filter((s: string) => s.trim());
+    }
+    const res = await fetch('http://localhost:8000/generate/storyboard', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const contentType = res.headers.get('content-type') ?? '';
+    if (contentType.includes('image')) {
+      const blob = await res.blob();
+      setImageGenResult(URL.createObjectURL(blob));
+    } else {
+      const data = await res.json();
+      if (data.status === 'error') setImageGenResult(`Error: ${data.error}`);
+    }
+  } catch (err: any) {
+    setImageGenResult(`Error: ${err.message}`);
+  } finally {
+    setImageGenLoading(false);
+  }
 };
 
 return (
@@ -4263,9 +4412,22 @@ return (
             border: '1px solid rgba(179,136,255,0.2)', backdropFilter: 'blur(16px)',
             overflowY: 'auto', padding: '16px', display: 'flex', flexDirection: 'column', gap: '14px',
           }}>
-            <h3 style={{ margin: 0, fontSize: '15px', color: '#b388ff', display: 'flex', alignItems: 'center', gap: '8px' }}>🎨 Image Generation</h3>
+            <h3 style={{ margin: 0, fontSize: '15px', color: '#b388ff', display: 'flex', alignItems: 'center', gap: '8px' }}>🎨 ImageStudio</h3>
 
-            {/* Model selector */}
+            {/* Sub-tab selector */}
+            <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+              {([['generate','🖼'], ['animate','🎬'], ['storyboard','📋'], ['upscale','🔍'], ['train','🧪']] as const).map(([tab, icon]) => (
+                <button key={tab} onClick={() => setImageGenSubTab(tab as any)} style={{
+                  flex: 1, minWidth: '50px', padding: '5px 4px', borderRadius: '6px', border: '1px solid',
+                  borderColor: imageGenSubTab === tab ? '#b388ff' : '#333',
+                  backgroundColor: imageGenSubTab === tab ? 'rgba(179,136,255,0.15)' : '#111',
+                  color: imageGenSubTab === tab ? '#b388ff' : '#666',
+                  cursor: 'pointer', fontSize: '10px', textTransform: 'capitalize',
+                }}>{icon} {tab}</button>
+              ))}
+            </div>
+
+            {/* Model selector (shared) */}
             <div>
               <label style={{ fontSize: '11px', color: '#888', marginBottom: '4px', display: 'block' }}>Checkpoint Model</label>
               <select
@@ -4280,119 +4442,292 @@ return (
               </select>
             </div>
 
-            {/* LoRA selector */}
+            {/* LoRA selector (shared) */}
             {imageModels.filter(m => m.type === 'lora').length > 0 && (
               <div>
                 <label style={{ fontSize: '11px', color: '#888', marginBottom: '4px', display: 'block' }}>LoRA Adapters</label>
                 {imageModels.filter(m => m.type === 'lora').map(m => (
                   <label key={m.name} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: '#ccc', cursor: 'pointer', padding: '3px 0' }}>
-                    <input
-                      type="checkbox"
-                      checked={selectedLoras.includes(m.name)}
-                      onChange={e => {
-                        if (e.target.checked) setSelectedLoras(prev => [...prev, m.name]);
-                        else setSelectedLoras(prev => prev.filter(l => l !== m.name));
-                      }}
-                      style={{ accentColor: '#b388ff' }}
-                    />
+                    <input type="checkbox" checked={selectedLoras.includes(m.name)}
+                      onChange={e => { if (e.target.checked) setSelectedLoras(prev => [...prev, m.name]); else setSelectedLoras(prev => prev.filter(l => l !== m.name)); }}
+                      style={{ accentColor: '#b388ff' }} />
                     {m.name} ({m.size_mb}MB)
                   </label>
                 ))}
               </div>
             )}
 
-            {/* Mode toggle */}
-            <div>
-              <label style={{ fontSize: '11px', color: '#888', marginBottom: '4px', display: 'block' }}>Mode</label>
-              <div style={{ display: 'flex', gap: '6px' }}>
-                {(['normal', 'explicit'] as const).map(m => (
-                  <button key={m} onClick={() => setImageGenMode(m)} style={{
-                    flex: 1, padding: '6px', borderRadius: '8px', border: '1px solid',
-                    borderColor: imageGenMode === m ? '#b388ff' : '#333',
-                    backgroundColor: imageGenMode === m ? 'rgba(179,136,255,0.15)' : '#111',
-                    color: imageGenMode === m ? '#b388ff' : '#888',
-                    cursor: 'pointer', fontSize: '11px', textTransform: 'capitalize',
-                  }}>{m}</button>
-                ))}
-              </div>
-            </div>
-
-            {/* Dimensions */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+            {/* Art style selector (shared to generate/animate) */}
+            {(imageGenSubTab === 'generate' || imageGenSubTab === 'animate') && (
               <div>
-                <label style={{ fontSize: '11px', color: '#888' }}>Width</label>
-                <input type="number" value={imageGenWidth} onChange={e => setImageGenWidth(+e.target.value)} min={512} max={2048} step={64}
+                <label style={{ fontSize: '11px', color: '#888', marginBottom: '4px', display: 'block' }}>Art Style</label>
+                <select value={imageGenArtStyle} onChange={e => setImageGenArtStyle(e.target.value)}
+                  style={{ width: '100%', padding: '7px 10px', borderRadius: '8px', backgroundColor: '#111', color: '#fff', border: '1px solid #333', fontSize: '12px' }}>
+                  {(artStyles.length > 0 ? artStyles : [{name:'anime',prefix:''},{name:'ghibli',prefix:''},{name:'manga',prefix:''},{name:'painterly',prefix:''},{name:'game_concept',prefix:''},{name:'realistic',prefix:''},{name:'custom',prefix:''}]).map(s => (
+                    <option key={s.name} value={s.name}>{s.name}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {/* ──── Generate sub-tab controls ──── */}
+            {imageGenSubTab === 'generate' && (<>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888', marginBottom: '4px', display: 'block' }}>Mode</label>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  {(['normal', 'explicit'] as const).map(m => (
+                    <button key={m} onClick={() => setImageGenMode(m)} style={{
+                      flex: 1, padding: '6px', borderRadius: '8px', border: '1px solid',
+                      borderColor: imageGenMode === m ? '#b388ff' : '#333',
+                      backgroundColor: imageGenMode === m ? 'rgba(179,136,255,0.15)' : '#111',
+                      color: imageGenMode === m ? '#b388ff' : '#888',
+                      cursor: 'pointer', fontSize: '11px', textTransform: 'capitalize',
+                    }}>{m}</button>
+                  ))}
+                </div>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                <div>
+                  <label style={{ fontSize: '11px', color: '#888' }}>Width</label>
+                  <input type="number" value={imageGenWidth} onChange={e => setImageGenWidth(+e.target.value)} min={512} max={2048} step={64}
+                    style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+                </div>
+                <div>
+                  <label style={{ fontSize: '11px', color: '#888' }}>Height</label>
+                  <input type="number" value={imageGenHeight} onChange={e => setImageGenHeight(+e.target.value)} min={512} max={2048} step={64}
+                    style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+                </div>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                <div>
+                  <label style={{ fontSize: '11px', color: '#888' }}>Steps ({imageGenSteps})</label>
+                  <input type="range" min={10} max={80} value={imageGenSteps} onChange={e => setImageGenSteps(+e.target.value)} style={{ width: '100%', accentColor: '#b388ff' }} />
+                </div>
+                <div>
+                  <label style={{ fontSize: '11px', color: '#888' }}>CFG ({imageGenCfg.toFixed(1)})</label>
+                  <input type="range" min={1} max={20} step={0.5} value={imageGenCfg} onChange={e => setImageGenCfg(+e.target.value)} style={{ width: '100%', accentColor: '#b388ff' }} />
+                </div>
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Seed (-1 = random)</label>
+                <input type="number" value={imageGenSeed} onChange={e => setImageGenSeed(+e.target.value)}
                   style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
               </div>
               <div>
-                <label style={{ fontSize: '11px', color: '#888' }}>Height</label>
-                <input type="number" value={imageGenHeight} onChange={e => setImageGenHeight(+e.target.value)} min={512} max={2048} step={64}
-                  style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+                <label style={{ fontSize: '11px', color: '#888' }}>Custom Negative (optional)</label>
+                <textarea value={imageGenNegative} onChange={e => setImageGenNegative(e.target.value)} placeholder="Leave empty for smart defaults..."
+                  rows={2} style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '11px', resize: 'vertical', fontFamily: 'inherit' }} />
               </div>
-            </div>
+            </>)}
 
-            {/* Steps & CFG */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+            {/* ──── Animate sub-tab controls ──── */}
+            {imageGenSubTab === 'animate' && (<>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                <div>
+                  <label style={{ fontSize: '11px', color: '#888' }}>Frames ({imageGenFrames})</label>
+                  <input type="range" min={4} max={120} value={imageGenFrames} onChange={e => setImageGenFrames(+e.target.value)} style={{ width: '100%', accentColor: '#b388ff' }} />
+                </div>
+                <div>
+                  <label style={{ fontSize: '11px', color: '#888' }}>FPS ({imageGenFps})</label>
+                  <input type="range" min={2} max={30} value={imageGenFps} onChange={e => setImageGenFps(+e.target.value)} style={{ width: '100%', accentColor: '#b388ff' }} />
+                </div>
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Frame Strength ({imageGenFrameStrength.toFixed(2)}) — lower = more consistent</label>
+                <input type="range" min={0.1} max={0.7} step={0.05} value={imageGenFrameStrength} onChange={e => setImageGenFrameStrength(+e.target.value)} style={{ width: '100%', accentColor: '#b388ff' }} />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                <div>
+                  <label style={{ fontSize: '11px', color: '#888' }}>Width</label>
+                  <input type="number" value={imageGenWidth} onChange={e => setImageGenWidth(+e.target.value)} min={256} max={1024} step={64}
+                    style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+                </div>
+                <div>
+                  <label style={{ fontSize: '11px', color: '#888' }}>Height</label>
+                  <input type="number" value={imageGenHeight} onChange={e => setImageGenHeight(+e.target.value)} min={256} max={1024} step={64}
+                    style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+                </div>
+              </div>
               <div>
                 <label style={{ fontSize: '11px', color: '#888' }}>Steps ({imageGenSteps})</label>
-                <input type="range" min={10} max={80} value={imageGenSteps} onChange={e => setImageGenSteps(+e.target.value)}
-                  style={{ width: '100%', accentColor: '#b388ff' }} />
+                <input type="range" min={10} max={50} value={imageGenSteps} onChange={e => setImageGenSteps(+e.target.value)} style={{ width: '100%', accentColor: '#b388ff' }} />
               </div>
               <div>
-                <label style={{ fontSize: '11px', color: '#888' }}>CFG ({imageGenCfg.toFixed(1)})</label>
-                <input type="range" min={1} max={20} step={0.5} value={imageGenCfg} onChange={e => setImageGenCfg(+e.target.value)}
-                  style={{ width: '100%', accentColor: '#b388ff' }} />
+                <label style={{ fontSize: '11px', color: '#888' }}>Output Format</label>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  {(['gif', 'mp4', 'both'] as const).map(f => (
+                    <button key={f} onClick={() => setImageGenOutputFormat(f)} style={{
+                      flex: 1, padding: '5px', borderRadius: '6px', border: '1px solid',
+                      borderColor: imageGenOutputFormat === f ? '#b388ff' : '#333',
+                      backgroundColor: imageGenOutputFormat === f ? 'rgba(179,136,255,0.15)' : '#111',
+                      color: imageGenOutputFormat === f ? '#b388ff' : '#888',
+                      cursor: 'pointer', fontSize: '11px', textTransform: 'uppercase',
+                    }}>{f}</button>
+                  ))}
+                </div>
               </div>
-            </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Storyboard (one action per line, optional)</label>
+                <textarea value={storyboardDescs} onChange={e => setStoryboardDescs(e.target.value)}
+                  placeholder={"e.g.:\ncharacter turns head left\ncharacter smiles\ncharacter waves hand"}
+                  rows={4} style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '11px', resize: 'vertical', fontFamily: 'inherit' }} />
+              </div>
 
-            {/* Seed */}
-            <div>
-              <label style={{ fontSize: '11px', color: '#888' }}>Seed (-1 = random)</label>
-              <input type="number" value={imageGenSeed} onChange={e => setImageGenSeed(+e.target.value)}
-                style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
-            </div>
-
-            {/* Negative prompt */}
-            <div>
-              <label style={{ fontSize: '11px', color: '#888' }}>Custom Negative Prompt (optional)</label>
-              <textarea value={imageGenNegative} onChange={e => setImageGenNegative(e.target.value)} placeholder="Leave empty for smart defaults..."
-                rows={2} style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '11px', resize: 'vertical', fontFamily: 'inherit' }} />
-            </div>
-
-            {/* Animation toggle */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: '#ccc', cursor: 'pointer' }}>
-                <input type="checkbox" checked={imageGenAnimated} onChange={e => setImageGenAnimated(e.target.checked)} style={{ accentColor: '#b388ff' }} />
-                Animated GIF
-              </label>
-              {imageGenAnimated && (
-                <input type="number" value={imageGenFrames} onChange={e => setImageGenFrames(+e.target.value)} min={2} max={24}
-                  title="Number of frames"
-                  style={{ width: '50px', padding: '4px', borderRadius: '4px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '11px' }} />
+              {/* Animation jobs */}
+              {animJobs.length > 0 && (
+                <div style={{ borderTop: '1px solid #222', paddingTop: '10px' }}>
+                  <h4 style={{ margin: '0 0 6px', fontSize: '11px', color: '#888' }}>Saved Jobs</h4>
+                  {animJobs.map(j => (
+                    <div key={j.job_id} style={{ padding: '4px 6px', fontSize: '10px', color: '#aaa', borderRadius: '4px', backgroundColor: '#111', marginBottom: '4px' }}>
+                      <span style={{ color: j.status === 'complete' ? '#00cc88' : '#ff9900' }}>{j.status === 'complete' ? '✓' : '⏸'}</span>{' '}
+                      {j.job_id} — {j.current_frame}/{j.total_frames}
+                    </div>
+                  ))}
+                </div>
               )}
-            </div>
+            </>)}
 
-            {/* Model management */}
+            {/* ──── Storyboard sub-tab ──── */}
+            {imageGenSubTab === 'storyboard' && (<>
+              <div style={{ fontSize: '11px', color: '#888', lineHeight: '1.5' }}>
+                Generate a quick low-res sketch grid to preview your animation before committing to a full render.
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Frames</label>
+                <input type="number" value={imageGenFrames} onChange={e => setImageGenFrames(+e.target.value)} min={2} max={24}
+                  style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Frame Descriptions (one per line)</label>
+                <textarea value={storyboardDescs} onChange={e => setStoryboardDescs(e.target.value)}
+                  placeholder={"Character standing still\nCharacter raises hand\nCharacter waves"}
+                  rows={6} style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '11px', resize: 'vertical', fontFamily: 'inherit' }} />
+              </div>
+              <button onClick={handleStoryboardPreview} disabled={!imageGenPrompt.trim() || imageGenLoading}
+                style={{ width: '100%', padding: '10px', borderRadius: '8px', border: 'none', backgroundColor: imageGenLoading ? '#333' : '#7c4dff', color: '#fff', cursor: imageGenLoading ? 'wait' : 'pointer', fontSize: '13px', fontWeight: 'bold' }}>
+                {imageGenLoading ? '⏳ Sketching...' : '📋 Generate Storyboard'}
+              </button>
+            </>)}
+
+            {/* ──── Upscale sub-tab ──── */}
+            {imageGenSubTab === 'upscale' && (<>
+              <div style={{ fontSize: '11px', color: '#888', lineHeight: '1.5' }}>
+                Tile-based AI upscaler. Works within 8 GB VRAM by processing the image in overlapping tiles, then stitching them back seamlessly.
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Image Path</label>
+                <input type="text" value={upscaleImagePath} onChange={e => setUpscaleImagePath(e.target.value)}
+                  placeholder="C:\path\to\image.png"
+                  style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                <div>
+                  <label style={{ fontSize: '11px', color: '#888' }}>Scale ({upscaleScale.toFixed(1)}x)</label>
+                  <input type="range" min={1.5} max={4} step={0.5} value={upscaleScale} onChange={e => setUpscaleScale(+e.target.value)} style={{ width: '100%', accentColor: '#b388ff' }} />
+                </div>
+                <div>
+                  <label style={{ fontSize: '11px', color: '#888' }}>Tile Size</label>
+                  <select value={upscaleTileSize} onChange={e => setUpscaleTileSize(+e.target.value)}
+                    style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }}>
+                    <option value={512}>512 (low VRAM)</option>
+                    <option value={768}>768 (recommended)</option>
+                    <option value={1024}>1024 (fast)</option>
+                  </select>
+                </div>
+              </div>
+              <button onClick={handleUpscale} disabled={!upscaleImagePath.trim() || imageGenLoading}
+                style={{ width: '100%', padding: '10px', borderRadius: '8px', border: 'none', backgroundColor: imageGenLoading ? '#333' : '#7c4dff', color: '#fff', cursor: imageGenLoading ? 'wait' : 'pointer', fontSize: '13px', fontWeight: 'bold' }}>
+                {imageGenLoading ? '⏳ Upscaling...' : '🔍 Upscale Image'}
+              </button>
+            </>)}
+
+            {/* ──── Train sub-tab ──── */}
+            {imageGenSubTab === 'train' && (<>
+              <div style={{ fontSize: '11px', color: '#888', lineHeight: '1.5' }}>
+                Train a LoRA from reference images to learn a specific art style or character. Trained LoRAs appear in the LoRA Adapters list.
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>LoRA Name</label>
+                <input type="text" value={trainingName} onChange={e => setTrainingName(e.target.value)} placeholder="my_artstyle"
+                  style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Image Folder Path</label>
+                <input type="text" value={trainingImageDir} onChange={e => setTrainingImageDir(e.target.value)}
+                  placeholder="C:\path\to\training_images"
+                  style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Training Type</label>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  {(['style', 'character'] as const).map(t => (
+                    <button key={t} onClick={() => setTrainingType(t)} style={{
+                      flex: 1, padding: '5px', borderRadius: '6px', border: '1px solid',
+                      borderColor: trainingType === t ? '#b388ff' : '#333',
+                      backgroundColor: trainingType === t ? 'rgba(179,136,255,0.15)' : '#111',
+                      color: trainingType === t ? '#b388ff' : '#888',
+                      cursor: 'pointer', fontSize: '11px', textTransform: 'capitalize',
+                    }}>{t}</button>
+                  ))}
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: '6px' }}>
+                <button onClick={handleCritiqueDataset} disabled={!trainingImageDir.trim()}
+                  style={{ flex: 1, padding: '8px', borderRadius: '8px', border: '1px solid #ff9900', backgroundColor: 'transparent', color: '#ff9900', cursor: trainingImageDir.trim() ? 'pointer' : 'not-allowed', fontSize: '12px' }}>
+                  🔎 Critique Dataset
+                </button>
+                <button onClick={handleStartTraining} disabled={!trainingName.trim() || !trainingImageDir.trim()}
+                  style={{ flex: 1, padding: '8px', borderRadius: '8px', border: 'none', backgroundColor: (!trainingName.trim() || !trainingImageDir.trim()) ? '#333' : '#7c4dff', color: '#fff', cursor: (!trainingName.trim() || !trainingImageDir.trim()) ? 'not-allowed' : 'pointer', fontSize: '12px', fontWeight: 'bold' }}>
+                  🚀 Train
+                </button>
+              </div>
+
+              {/* Dataset critique results */}
+              {trainingCritique && trainingCritique.status === 'ok' && (
+                <div style={{ padding: '10px', borderRadius: '8px', backgroundColor: '#0a0a0a', border: '1px solid #222', fontSize: '11px' }}>
+                  <div style={{ color: trainingCritique.quality === 'good' ? '#00cc88' : trainingCritique.quality === 'needs_work' ? '#ff9900' : '#ff4444', fontWeight: 'bold', marginBottom: '6px' }}>
+                    {trainingCritique.quality === 'good' ? '✓ Dataset looks good' : trainingCritique.quality === 'needs_work' ? '⚠ Needs improvement' : '✗ Insufficient'}
+                  </div>
+                  <div style={{ color: '#888' }}>{trainingCritique.image_count} images (min: {trainingCritique.minimum_recommended})</div>
+                  {trainingCritique.issues?.map((issue: string, i: number) => (
+                    <div key={i} style={{ color: '#ff6666', marginTop: '3px' }}>• {issue}</div>
+                  ))}
+                  {trainingCritique.suggestions?.map((s: string, i: number) => (
+                    <div key={i} style={{ color: '#66aaff', marginTop: '3px' }}>💡 {s}</div>
+                  ))}
+                </div>
+              )}
+
+              {/* Training status */}
+              {trainingStatus && trainingStatus.status === 'training' && (
+                <div style={{ padding: '10px', borderRadius: '8px', backgroundColor: '#0a0a0a', border: '1px solid #b388ff33' }}>
+                  <div style={{ fontSize: '12px', color: '#b388ff', marginBottom: '6px' }}>Training: {trainingStatus.job_name}</div>
+                  <div style={{ height: '6px', borderRadius: '3px', backgroundColor: '#222', overflow: 'hidden' }}>
+                    <div style={{ height: '100%', width: `${trainingStatus.progress}%`, backgroundColor: '#7c4dff', transition: 'width 0.5s' }} />
+                  </div>
+                  <div style={{ fontSize: '10px', color: '#888', marginTop: '4px' }}>
+                    Epoch {trainingStatus.current_epoch}/{trainingStatus.total_epochs} — {trainingStatus.progress}%
+                  </div>
+                  <button onClick={fetchTrainingStatus} style={{ marginTop: '4px', padding: '3px 8px', borderRadius: '4px', border: '1px solid #555', backgroundColor: 'transparent', color: '#888', cursor: 'pointer', fontSize: '10px' }}>⟳ Refresh</button>
+                </div>
+              )}
+            </>)}
+
+            {/* Model management (always visible at bottom) */}
             <div style={{ borderTop: '1px solid #222', paddingTop: '12px', marginTop: '4px' }}>
-              <h4 style={{ margin: '0 0 8px', fontSize: '12px', color: '#888' }}>Model Management</h4>
+              <h4 style={{ margin: '0 0 8px', fontSize: '12px', color: '#888' }}>Models</h4>
               {imageModels.map(m => (
-                <div key={m.path} style={{
-                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                  padding: '4px 0', fontSize: '11px', color: '#ccc',
-                }}>
+                <div key={m.path} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '4px 0', fontSize: '11px', color: '#ccc' }}>
                   <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {m.type === 'lora' ? '🔗 ' : '🧠 '}{m.name}
                     <span style={{ color: '#666', marginLeft: '4px' }}>({m.size_mb}MB)</span>
                   </span>
-                  <button onClick={() => deleteImageModel(m.path)}
-                    title="Delete model"
+                  <button onClick={() => deleteImageModel(m.path)} title="Delete model"
                     style={{ background: 'none', border: 'none', color: '#ff4444', cursor: 'pointer', fontSize: '12px', padding: '2px 6px' }}>🗑</button>
                 </div>
               ))}
-              {imageModels.length === 0 && <div style={{ fontSize: '11px', color: '#555' }}>No models found in models/ folder</div>}
-              <div style={{ fontSize: '10px', color: '#555', marginTop: '6px' }}>
-                Drop .safetensors files into models/ folder. LoRAs go in models/loras/
-              </div>
+              {imageModels.length === 0 && <div style={{ fontSize: '11px', color: '#555' }}>No models in models/</div>}
+              <div style={{ fontSize: '10px', color: '#555', marginTop: '6px' }}>Drop .safetensors into models/. LoRAs: models/loras/</div>
             </div>
           </div>
 
@@ -4407,7 +4742,7 @@ return (
               <textarea
                 value={imageGenPrompt}
                 onChange={e => setImageGenPrompt(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleImageGenerate(); } }}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (imageGenSubTab === 'storyboard') handleStoryboardPreview(); else handleImageGenerate(); } }}
                 placeholder="Describe what to generate... (supports long prompts, no 77-token limit)"
                 rows={3}
                 style={{
@@ -4418,7 +4753,11 @@ return (
               />
               <button
                 disabled={!imageGenPrompt.trim() || imageGenLoading}
-                onClick={handleImageGenerate}
+                onClick={() => {
+                  if (imageGenSubTab === 'animate') { setImageGenAnimated(true); handleImageGenerate(); }
+                  else if (imageGenSubTab === 'storyboard') { handleStoryboardPreview(); }
+                  else { setImageGenAnimated(false); handleImageGenerate(); }
+                }}
                 style={{
                   padding: '12px 24px', borderRadius: '10px', border: 'none',
                   backgroundColor: imageGenLoading ? '#333' : '#7c4dff', color: '#fff',
@@ -4426,7 +4765,10 @@ return (
                   whiteSpace: 'nowrap', transition: 'background 0.2s',
                 }}
               >
-                {imageGenLoading ? '⏳ Generating...' : imageGenAnimated ? '🎬 Animate' : '🎨 Generate'}
+                {imageGenLoading ? '⏳ Working...'
+                  : imageGenSubTab === 'animate' ? '🎬 Animate'
+                  : imageGenSubTab === 'storyboard' ? '📋 Sketch'
+                  : '🎨 Generate'}
               </button>
             </div>
 

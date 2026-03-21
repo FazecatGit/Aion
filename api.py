@@ -1844,17 +1844,28 @@ class AnimatedGenRequest(BaseModel):
     width: int = 512
     height: int = 512
     model: Optional[str] = None
+    loras: list[str] = []
+    lora_weights: list[float] = []
     mode: str = "normal"
-    num_frames: int = 8
+    num_frames: int = 16
     steps: int = 25
     guidance_scale: float = 7.5
     seed: int = -1
+    art_style: str = "anime"
+    frame_strength: float = 0.35
+    fps: int = 8
+    storyboard: Optional[list[str]] = None
+    job_id: Optional[str] = None
+    resume: bool = False
+    output_format: str = "gif"   # "gif", "mp4", or "both"
+    negative_prompt: Optional[str] = None
 
 
 @app.post("/generate/animated")
 async def generate_animated_endpoint(req: AnimatedGenRequest):
-    """Generate an animated GIF from a text prompt."""
-    _api_log.info("[API] /generate/animated — prompt=%s, frames=%d", req.prompt[:60], req.num_frames)
+    """Generate a frame-consistent animated sequence with img2img chaining."""
+    _api_log.info("[API] /generate/animated — prompt=%s, frames=%d, style=%s",
+                  req.prompt[:60], req.num_frames, req.art_style)
     from agent.image_generation import generate_animated, list_models
 
     model_path = None
@@ -1863,6 +1874,14 @@ async def generate_animated_endpoint(req: AnimatedGenRequest):
         match = next((m for m in models if m["name"] == req.model), None)
         if match:
             model_path = match["path"]
+
+    lora_paths = []
+    if req.loras:
+        models = list_models()
+        for ln in req.loras:
+            lmatch = next((m for m in models if m["name"] == ln and m["type"] == "lora"), None)
+            if lmatch:
+                lora_paths.append(lmatch["path"])
 
     def _gen():
         return generate_animated(
@@ -1875,6 +1894,106 @@ async def generate_animated_endpoint(req: AnimatedGenRequest):
             steps=req.steps,
             guidance_scale=req.guidance_scale,
             seed=req.seed,
+            art_style=req.art_style,
+            frame_strength=req.frame_strength,
+            fps=req.fps,
+            storyboard=req.storyboard,
+            job_id=req.job_id,
+            resume=req.resume,
+            output_format=req.output_format,
+            lora_paths=lora_paths or None,
+            lora_weights=req.lora_weights or None,
+            negative_prompt=req.negative_prompt,
+        )
+
+    result = await asyncio.to_thread(_gen)
+    if result.get("status") == "error":
+        return result
+
+    path = result.get("path", "")
+    media = "image/gif" if path.endswith(".gif") else "video/mp4" if path.endswith(".mp4") else "image/png"
+    from starlette.responses import FileResponse
+    import json as _json
+    response = FileResponse(path, media_type=media, filename=Path(path).name)
+    response.headers["X-Animation-Meta"] = _json.dumps({
+        "job_id": result.get("job_id"),
+        "num_frames": result.get("num_frames"),
+        "seed": result.get("seed"),
+        "art_style": result.get("art_style"),
+        "checkpoint": result.get("checkpoint"),
+        "gif_path": result.get("gif_path"),
+        "mp4_path": result.get("mp4_path"),
+    })
+    return response
+
+
+# ── Animation job management ──────────────────────────────────────────────
+
+@app.get("/generate/animated/jobs")
+async def list_animation_jobs():
+    """List all saved animation jobs with resume status."""
+    from agent.image_generation import list_animation_jobs
+    return {"status": "ok", "jobs": list_animation_jobs()}
+
+
+class RegenerateFrameRequest(BaseModel):
+    job_id: str
+    frame_index: int
+    fix_prompt: Optional[str] = None
+    strength: float = 0.40
+    steps: int = 25
+
+@app.post("/generate/animated/frame/edit")
+async def edit_animation_frame(req: RegenerateFrameRequest):
+    """Re-generate a single frame in an animation job."""
+    from agent.image_generation import regenerate_frame
+    result = await asyncio.to_thread(
+        regenerate_frame, req.job_id, req.frame_index, req.fix_prompt, req.strength, req.steps
+    )
+    return result
+
+
+# ── Art styles ────────────────────────────────────────────────────────────
+
+@app.get("/generate/styles")
+async def list_art_styles():
+    """List available art style presets."""
+    from agent.image_generation import get_art_styles, STYLE_NAMES
+    return {"status": "ok", "styles": get_art_styles(), "names": STYLE_NAMES}
+
+
+# ── Storyboard preview ───────────────────────────────────────────────────
+
+class StoryboardRequest(BaseModel):
+    prompt: str
+    num_frames: int = 8
+    width: int = 256
+    height: int = 256
+    model: Optional[str] = None
+    storyboard_descriptions: Optional[list[str]] = None
+    seed: int = -1
+
+@app.post("/generate/storyboard")
+async def generate_storyboard_endpoint(req: StoryboardRequest):
+    """Generate a quick low-res storyboard sketch for animation preview."""
+    from agent.image_generation import generate_storyboard, list_models
+
+    model_path = None
+    if req.model:
+        models = list_models()
+        match = next((m for m in models if m["name"] == req.model), None)
+        if match:
+            model_path = match["path"]
+
+    def _gen():
+        return generate_storyboard(
+            prompt=req.prompt,
+            num_frames=req.num_frames,
+            width=req.width,
+            height=req.height,
+            model_path=model_path,
+            storyboard_descriptions=req.storyboard_descriptions,
+            seed=req.seed,
         )
 
     result = await asyncio.to_thread(_gen)
@@ -1882,7 +2001,170 @@ async def generate_animated_endpoint(req: AnimatedGenRequest):
         return result
 
     from starlette.responses import FileResponse
-    return FileResponse(result["path"], media_type="image/gif", filename="animated.gif")
+    return FileResponse(result["grid_path"], media_type="image/png", filename="storyboard.png")
+
+
+# ── Quick preview (two-pass: low-res then full) ──────────────────────────
+
+class PreviewGenRequest(BaseModel):
+    prompt: str
+    width: int = 1024
+    height: int = 1024
+    model: Optional[str] = None
+    loras: list[str] = []
+    lora_weights: list[float] = []
+    mode: str = "normal"
+    steps: int = 35
+    guidance_scale: float = 7.5
+    seed: int = -1
+    art_style: str = "anime"
+    negative_prompt: Optional[str] = None
+
+@app.post("/generate/preview")
+async def generate_preview_endpoint(req: PreviewGenRequest):
+    """Two-pass generation: quick low-res preview, then full-res render."""
+    from agent.image_generation import generate_with_preview, list_models
+
+    model_path = None
+    if req.model:
+        models = list_models()
+        match = next((m for m in models if m["name"] == req.model), None)
+        if match:
+            model_path = match["path"]
+
+    lora_paths = []
+    if req.loras:
+        models = list_models()
+        for ln in req.loras:
+            lmatch = next((m for m in models if m["name"] == ln and m["type"] == "lora"), None)
+            if lmatch:
+                lora_paths.append(lmatch["path"])
+
+    def _gen():
+        return generate_with_preview(
+            prompt=req.prompt,
+            width=req.width,
+            height=req.height,
+            model_path=model_path,
+            mode=req.mode,
+            steps=req.steps,
+            guidance_scale=req.guidance_scale,
+            seed=req.seed,
+            art_style=req.art_style,
+            lora_paths=lora_paths or None,
+            lora_weights=req.lora_weights or None,
+            negative_prompt=req.negative_prompt,
+        )
+
+    result = await asyncio.to_thread(_gen)
+    return result
+
+
+# ── Tiled upscaler ────────────────────────────────────────────────────────
+
+class UpscaleRequest(BaseModel):
+    image_path: str
+    scale: float = 2.0
+    tile_size: int = 768
+    model: Optional[str] = None
+    prompt: str = ""
+    steps: int = 20
+    strength: float = 0.35
+
+@app.post("/generate/upscale")
+async def upscale_image_endpoint(req: UpscaleRequest):
+    """Tile-based VRAM-friendly image upscaling."""
+    from agent.image_generation import upscale_image, list_models
+
+    model_path = None
+    if req.model:
+        models = list_models()
+        match = next((m for m in models if m["name"] == req.model), None)
+        if match:
+            model_path = match["path"]
+
+    def _gen():
+        return upscale_image(
+            image_path=req.image_path,
+            scale=req.scale,
+            tile_size=req.tile_size,
+            model_path=model_path,
+            prompt=req.prompt,
+            steps=req.steps,
+            strength=req.strength,
+        )
+
+    result = await asyncio.to_thread(_gen)
+    if result.get("status") == "error":
+        return result
+
+    from starlette.responses import FileResponse
+    return FileResponse(result["path"], media_type="image/png", filename="upscaled.png")
+
+
+# ── LoRA training ─────────────────────────────────────────────────────────
+
+class TrainingCritiqueRequest(BaseModel):
+    image_dir: str
+    training_type: str = "style"   # "style" or "character"
+
+@app.post("/generate/train/critique")
+async def critique_dataset_endpoint(req: TrainingCritiqueRequest):
+    """Analyse training images and return quality report."""
+    from agent.image_generation import critique_training_dataset
+    return critique_training_dataset(req.image_dir, req.training_type)
+
+
+class StartTrainRequest(BaseModel):
+    name: str
+    image_dir: str
+    training_type: str = "style"
+    base_model: Optional[str] = None
+    epochs: int = 10
+    learning_rate: float = 1e-4
+    rank: int = 32
+    resolution: int = 1024
+    batch_size: int = 1
+    caption_method: str = "filename"  # "filename", "blip", or "txt"
+
+@app.post("/generate/train/start")
+async def start_training_endpoint(req: StartTrainRequest):
+    """Start LoRA fine-tuning on a set of training images."""
+    from agent.image_generation import start_lora_training, list_models
+
+    base_model = None
+    if req.base_model:
+        models = list_models()
+        match = next((m for m in models if m["name"] == req.base_model), None)
+        if match:
+            base_model = match["path"]
+
+    return start_lora_training(
+        name=req.name,
+        image_dir=req.image_dir,
+        training_type=req.training_type,
+        base_model=base_model,
+        epochs=req.epochs,
+        learning_rate=req.learning_rate,
+        rank=req.rank,
+        resolution=req.resolution,
+        batch_size=req.batch_size,
+        caption_method=req.caption_method,
+    )
+
+
+@app.get("/generate/train/status")
+async def training_status_endpoint():
+    """Get the status of the current LoRA training job."""
+    from agent.image_generation import get_training_status
+    return get_training_status()
+
+
+@app.post("/generate/train/cancel")
+async def cancel_training_endpoint():
+    """Cancel the currently running LoRA training job."""
+    from agent.image_generation import cancel_training
+    return cancel_training()
 
 
 # ── Image generation model management ─────────────────────────────────────
