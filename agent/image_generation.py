@@ -24,6 +24,7 @@ import json
 import logging
 import time
 import shutil
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -45,6 +46,23 @@ _active_loras: list[str] = []  # currently loaded LoRA names
 SUPPORTED_EXTENSIONS = {".safetensors", ".ckpt"}
 LORA_EXTENSIONS = {".safetensors"}
 
+# ── Global cancel flag ────────────────────────────────────────────────────
+_cancel_event = threading.Event()
+
+
+def cancel_generation():
+    """Signal all running generation loops to stop after the current step."""
+    _cancel_event.set()
+    return {"status": "ok", "message": "Cancellation requested"}
+
+
+def _check_cancelled():
+    """Check if cancellation was requested and clear the flag."""
+    if _cancel_event.is_set():
+        _cancel_event.clear()
+        return True
+    return False
+
 
 def list_models() -> list[dict]:
     """Discover all checkpoint models and LoRAs in the models folder."""
@@ -63,12 +81,14 @@ def list_models() -> list[dict]:
                 "type": "lora" if is_lora else "checkpoint",
             })
 
-    # Also scan subdirectories (e.g., models/loras/, models/characters/)
-    for subdir_name in ("loras", "characters"):
+    # Scan all LoRA subdirectories
+    LORA_CATEGORIES = ("styles", "characters", "clothing", "poses", "concept", "action", "loras")
+    for subdir_name in LORA_CATEGORIES:
         sub_dir = MODELS_DIR / subdir_name
         if sub_dir.exists():
             for f in sorted(sub_dir.iterdir()):
                 if f.suffix.lower() in LORA_EXTENSIONS and f.is_file():
+                    tw = get_trigger_words(f.stem)
                     models.append({
                         "name": f.stem,
                         "filename": f.name,
@@ -76,6 +96,7 @@ def list_models() -> list[dict]:
                         "size_mb": round(f.stat().st_size / (1024 * 1024), 1),
                         "type": "lora",
                         "category": subdir_name,
+                        "trigger_words": tw,
                     })
 
     return models
@@ -84,6 +105,78 @@ def list_models() -> list[dict]:
 def _is_lora_file(path: Path) -> bool:
     """Heuristic: LoRA files are generally < 300 MB."""
     return path.stat().st_size < 300 * 1024 * 1024
+
+
+# ── LoRA trigger word management ──────────────────────────────────────────
+
+_TRIGGER_WORDS_FILE = MODELS_DIR / "trigger_words.json"
+
+
+def _load_trigger_words() -> dict:
+    """Load the trigger words JSON file."""
+    if _TRIGGER_WORDS_FILE.exists():
+        try:
+            return json.loads(_TRIGGER_WORDS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_trigger_words(data: dict):
+    """Persist trigger words to disk."""
+    _TRIGGER_WORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _TRIGGER_WORDS_FILE.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def get_trigger_words(lora_name: str) -> list[str]:
+    """Get trigger words for a specific LoRA by name."""
+    data = _load_trigger_words()
+    return data.get(lora_name, [])
+
+
+def set_trigger_words(lora_name: str, words: list[str]) -> dict:
+    """Set trigger words for a LoRA. Overwrites any existing entry."""
+    data = _load_trigger_words()
+    data[lora_name] = [w.strip() for w in words if w.strip()]
+    _save_trigger_words(data)
+    return {"status": "ok", "lora": lora_name, "trigger_words": data[lora_name]}
+
+
+def delete_trigger_words(lora_name: str) -> dict:
+    """Remove trigger words for a LoRA."""
+    data = _load_trigger_words()
+    data.pop(lora_name, None)
+    _save_trigger_words(data)
+    return {"status": "ok", "lora": lora_name}
+
+
+def get_all_trigger_words() -> dict:
+    """Return the full trigger words mapping."""
+    return {"status": "ok", "trigger_words": _load_trigger_words()}
+
+
+def list_loras_by_category() -> dict:
+    """List all LoRAs organised by folder category with their trigger words."""
+    categories: dict[str, list[dict]] = {}
+    LORA_CATEGORIES = ("styles", "characters", "clothing", "poses", "concept", "action")
+    tw_data = _load_trigger_words()
+    for cat in LORA_CATEGORIES:
+        cat_dir = MODELS_DIR / cat
+        entries = []
+        if cat_dir.exists():
+            for f in sorted(cat_dir.iterdir()):
+                if f.suffix.lower() in LORA_EXTENSIONS and f.is_file():
+                    entries.append({
+                        "name": f.stem,
+                        "filename": f.name,
+                        "path": str(f),
+                        "size_mb": round(f.stat().st_size / (1024 * 1024), 1),
+                        "trigger_words": tw_data.get(f.stem, []),
+                    })
+        categories[cat] = entries
+    return {"status": "ok", "categories": categories}
 
 
 def get_active_model() -> str | None:
@@ -149,40 +242,75 @@ def unload_loras(pipe: StableDiffusionXLPipeline):
 
 def _chunk_prompt(prompt: str, pipe: StableDiffusionXLPipeline) -> str:
     """
-    Enable compel-style long prompt embedding when available.
-    For SDXL, we use the pipeline's built-in long prompt weighting
-    by splitting into weighted segments.
+    Split long prompts into 75-token chunks joined by BREAK keyword
+    so SDXL processes them in segments rather than truncating at 77 tokens.
     """
-    # SDXL diffusers >= 0.25 supports long prompts natively via
-    # the `encode_prompt` method with truncation disabled.
-    # We enable it by returning the prompt as-is and setting
-    # max_sequence_length in the generation call.
-    return prompt
+    tokenizer = pipe.tokenizer
+    if tokenizer is None:
+        return prompt
+
+    tokens = tokenizer.encode(prompt, add_special_tokens=False)
+    if len(tokens) <= 75:
+        return prompt  # fits in one segment, no chunking needed
+
+    _log.info("[IMAGE GEN] Chunking prompt: %d tokens → %d chunks",
+              len(tokens), (len(tokens) + 74) // 75)
+
+    chunks = []
+    for i in range(0, len(tokens), 75):
+        chunk_tokens = tokens[i:i + 75]
+        chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+        chunks.append(chunk_text.strip())
+
+    return " BREAK ".join(chunks)
 
 
 def _encode_long_prompt(pipe, prompt: str, negative_prompt: str, device: str = "cuda"):
     """
-    Encode prompts using compel for SDXL, which properly handles long prompts
-    beyond the 77-token CLIP limit by doing weighted sub-prompt blending.
-    Falls back to manual BREAK-based chunking if compel is not available.
+    Encode prompts for SDXL handling long prompts beyond the 77-token CLIP limit.
+
+    Strategy: Use two separate Compel instances (one per text encoder) which is
+    the correct approach for SDXL and avoids the EmbeddingsProviderMulti.empty_z bug.
+    Falls back to BREAK-based chunking if compel is unavailable.
     """
     try:
         from compel import Compel, ReturnedEmbeddingsType
         _log.info("[IMAGE GEN] Using compel for long prompt encoding (%d chars)", len(prompt))
 
-        # For SDXL we need to handle both text encoders
-        compel_proc = Compel(
-            tokenizer=[pipe.tokenizer, pipe.tokenizer_2],
-            text_encoder=[pipe.text_encoder, pipe.text_encoder_2],
+        # SDXL: create separate compel instances for each text encoder
+        # This avoids the EmbeddingsProviderMulti.empty_z error
+        compel_1 = Compel(
+            tokenizer=pipe.tokenizer,
+            text_encoder=pipe.text_encoder,
             returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
-            requires_pooled=[False, True],
-            truncate_long_prompts=False,  # Key: do NOT truncate
+            requires_pooled=False,
+            truncate_long_prompts=False,
         )
-        conditioning, pooled = compel_proc(prompt)
-        neg_conditioning, neg_pooled = compel_proc(negative_prompt)
-        [conditioning, neg_conditioning] = compel_proc.pad_conditioning_tensors_to_same_length(
-            [conditioning, neg_conditioning]
+        compel_2 = Compel(
+            tokenizer=pipe.tokenizer_2,
+            text_encoder=pipe.text_encoder_2,
+            returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
+            requires_pooled=True,
+            truncate_long_prompts=False,
         )
+
+        conditioning_1 = compel_1(prompt)
+        conditioning_2, pooled = compel_2(prompt)
+        neg_conditioning_1 = compel_1(negative_prompt)
+        neg_conditioning_2, neg_pooled = compel_2(negative_prompt)
+
+        # Pad to same length
+        [conditioning_1, neg_conditioning_1] = compel_1.pad_conditioning_tensors_to_same_length(
+            [conditioning_1, neg_conditioning_1]
+        )
+        [conditioning_2, neg_conditioning_2] = compel_2.pad_conditioning_tensors_to_same_length(
+            [conditioning_2, neg_conditioning_2]
+        )
+
+        # Concatenate along last dim for SDXL dual encoder
+        conditioning = torch.cat([conditioning_1, conditioning_2], dim=-1)
+        neg_conditioning = torch.cat([neg_conditioning_1, neg_conditioning_2], dim=-1)
+
         _log.info("[IMAGE GEN] compel encoding complete — embeds shape: %s", conditioning.shape)
         return {
             "prompt_embeds": conditioning,
@@ -200,29 +328,14 @@ def _encode_long_prompt(pipe, prompt: str, negative_prompt: str, device: str = "
 
 def _manual_chunk_encode(pipe, prompt: str, negative_prompt: str, device: str = "cuda"):
     """
-    Fallback: split prompt into 75-token chunks, encode each, and concatenate.
+    Fallback: split prompt into 75-token chunks joined by BREAK keyword.
     Works without compel installed.
     """
-    tokenizer = pipe.tokenizer
-    if tokenizer is None:
-        return None  # pipeline doesn't support manual encoding
+    chunked = _chunk_prompt(prompt, pipe)
+    neg_chunked = _chunk_prompt(negative_prompt, pipe)
 
-    def _get_chunks(text: str, max_len: int = 75):
-        tokens = tokenizer.encode(text, add_special_tokens=False)
-        chunks = []
-        for i in range(0, len(tokens), max_len):
-            chunk_tokens = tokens[i:i + max_len]
-            chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
-            chunks.append(chunk_text)
-        return chunks if chunks else [text]
-
-    # For SDXL, the simplest reliable approach is to use BREAK keyword
-    # which diffusers handles natively to separate prompt segments
-    chunks = _get_chunks(prompt)
-    if len(chunks) > 1:
-        # Join with BREAK keyword for SDXL native handling
-        enhanced_prompt = " BREAK ".join(chunks)
-        return {"_chunked_prompt": enhanced_prompt, "_chunked_negative": negative_prompt}
+    if chunked != prompt or neg_chunked != negative_prompt:
+        return {"_chunked_prompt": chunked, "_chunked_negative": neg_chunked}
 
     return None
 
@@ -231,6 +344,36 @@ def _manual_chunk_encode(pipe, prompt: str, negative_prompt: str, device: str = 
 
 _generation_history: list[dict] = []
 MAX_HISTORY = 50
+_HISTORY_FILE = Path(OUTPUT_DIR) / "generation_history.json"
+
+
+def _load_history_from_disk():
+    """Load persisted generation history from disk on module init."""
+    global _generation_history
+    if _HISTORY_FILE.exists():
+        try:
+            data = json.loads(_HISTORY_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                _generation_history = data[-MAX_HISTORY:]
+                _log.info("[IMAGE GEN] Loaded %d history entries from disk", len(_generation_history))
+        except Exception as e:
+            _log.warning("[IMAGE GEN] Failed to load history: %s", e)
+
+
+def _save_history_to_disk():
+    """Persist generation history to disk."""
+    try:
+        _HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _HISTORY_FILE.write_text(
+            json.dumps(_generation_history, indent=2, default=str),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        _log.warning("[IMAGE GEN] Failed to save history: %s", e)
+
+
+# Load history on module import
+_load_history_from_disk()
 
 
 def _analyze_prompt(prompt: str) -> dict:
@@ -252,7 +395,7 @@ def _analyze_prompt(prompt: str) -> dict:
 
 
 def record_generation(prompt: str, negative: str, settings: dict, result_path: str | None, feedback: str | None = None):
-    """Record generation for learning loop."""
+    """Record generation for learning loop. Persists to disk."""
     entry = {
         "timestamp": datetime.now().isoformat(),
         "prompt": prompt,
@@ -265,6 +408,7 @@ def record_generation(prompt: str, negative: str, settings: dict, result_path: s
     _generation_history.append(entry)
     if len(_generation_history) > MAX_HISTORY:
         _generation_history.pop(0)
+    _save_history_to_disk()
     return entry
 
 
@@ -273,7 +417,11 @@ def get_generation_history(last_n: int = 20) -> list[dict]:
 
 
 def apply_feedback_learnings(base_negative: str) -> str:
-    """Analyze recent negative feedback and add common issues to negative prompt."""
+    """Analyze recent negative feedback and add relevant issues to negative prompt.
+
+    Uses both hardcoded keyword→negative mappings AND persistent custom
+    learnings extracted from user feedback text.
+    """
     if not _generation_history:
         return base_negative
 
@@ -295,6 +443,9 @@ def apply_feedback_learnings(base_negative: str) -> str:
         "anatomy": "bad anatomy, extra limbs, fused limbs, anatomically incorrect",
         "feet": "bad feet, extra toes, poorly drawn feet",
         "proportion": "bad proportions, wrong proportions, disproportionate",
+        "bright": "overexposed, bloom, too bright, washed out",
+        "dark": "too dark, underexposed, crushed blacks",
+        "blurry": "blurry, out of focus, motion blur, unfocused",
     }
 
     additions = set()
@@ -306,9 +457,200 @@ def apply_feedback_learnings(base_negative: str) -> str:
             if key in fb:
                 additions.add(neg_text)
 
+        # Also extract user's actual feedback phrases as negative tokens.
+        # If user writes "too bright, bloom effect", add those directly.
+        fb_parts = [p.strip() for p in fb.split(",") if p.strip()]
+        for part in fb_parts:
+            # Skip very short or very long fragments
+            if 3 <= len(part) <= 60 and part not in base_negative.lower():
+                additions.add(part)
+
+    # Load persistent custom learnings if available
+    _load_custom_negatives(additions)
+
     if additions:
         return base_negative + ", " + ", ".join(additions)
     return base_negative
+
+
+# Persistent custom negative keyword file
+_CUSTOM_NEGATIVES_FILE = Path(OUTPUT_DIR) / "custom_negatives.json"
+
+
+def _load_custom_negatives(additions: set):
+    """Load persistent user-defined negative keywords."""
+    if _CUSTOM_NEGATIVES_FILE.exists():
+        try:
+            data = json.loads(_CUSTOM_NEGATIVES_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                additions.update(data)
+        except Exception:
+            pass
+
+
+def save_custom_negative(negative_text: str):
+    """Add a persistent custom negative keyword/phrase that applies to all future generations."""
+    existing = []
+    if _CUSTOM_NEGATIVES_FILE.exists():
+        try:
+            existing = json.loads(_CUSTOM_NEGATIVES_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            existing = []
+    parts = [p.strip() for p in negative_text.split(",") if p.strip()]
+    for p in parts:
+        if p not in existing:
+            existing.append(p)
+    _CUSTOM_NEGATIVES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _CUSTOM_NEGATIVES_FILE.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    return {"status": "ok", "total": len(existing)}
+
+
+# ── Vocabulary Expansion (synonym suggestions for better prompts) ─────────
+
+# Curated mapping of common words to SD-friendly alternatives.
+# Helps users find the right tokens that the CLIP model weights strongly.
+_VOCAB_EXPANSION: dict[str, list[str]] = {
+    # ── explicit terms ─────────────────────────────────────────────────────────
+    "nsfw": ["erotic", "libidinous", "Lascivious", "salacious", "prurient", "lewd", "raunchy", "smutty", "depraved", "indecent", "randy"],
+    
+
+    # ── Emotions & expressions ────────────────────────────────────────────
+    "sexy": ["alluring", "seductive", "sensual", "sultry", "attractive"],
+    "beautiful": ["gorgeous", "stunning", "elegant", "radiant", "breathtaking"],
+    "angry": ["furious", "enraged", "fierce expression", "aggressive", "scowling"],
+    "sad": ["melancholic", "sorrowful", "grief-stricken", "teary-eyed", "downcast"],
+    "happy": ["joyful", "beaming", "cheerful", "elated", "gleeful"],
+    "scared": ["terrified", "wide-eyed fear", "cowering", "trembling", "petrified"],
+    "surprised": ["astonished", "jaw-dropped", "wide-eyed shock", "startled", "dumbfounded"],
+    "calm": ["serene", "tranquil", "composed", "placid", "unperturbed"],
+    "confident": ["self-assured", "commanding presence", "proud stance", "dignified", "resolute"],
+    "shy": ["bashful", "timid", "demure", "coy", "flustered"],
+    "tired": ["exhausted", "fatigued", "weary", "drowsy", "heavy-lidded"],
+    "smiling": ["grinning", "beaming smile", "radiant expression", "warm smile", "gentle smile"],
+    "crying": ["tears streaming", "sobbing", "weeping", "teary-eyed", "emotional tears"],
+    "laughing": ["cackling", "hearty laughter", "giggling", "roaring with laughter", "mirthful"],
+    "thinking": ["contemplative", "pensive", "deep in thought", "reflective", "pondering"],
+    "pleasure": ["ecstasy", "bliss", "sensual delight", "carnal joy", "intimate pleasure", "Rapture", "orgasmic", "satisfaction", "intoxication", "euphoria"],
+
+    # ── Physical descriptors ──────────────────────────────────────────────
+    "big": ["massive", "enormous", "towering", "imposing", "grand"],
+    "small": ["petite", "tiny", "diminutive", "compact", "delicate"],
+    "strong": ["muscular", "powerful", "athletic build", "toned", "robust"],
+    "cute": ["adorable", "kawaii", "charming", "sweet", "endearing"],
+    "old": ["aged", "weathered", "elderly", "ancient", "wizened"],
+    "young": ["youthful", "adolescent", "fresh-faced", "juvenile", "vibrant youth"],
+    "fat": ["plump", "voluptuous", "curvy", "rotund", "full-figured"],
+    "thin": ["slender", "lithe", "svelte", "willowy", "lean"],
+    "tall": ["towering", "statuesque", "elongated figure", "lofty", "imposing height"],
+    "short": ["petite", "compact stature", "diminutive frame", "stubby", "low to ground"],
+    "plump": ["voluptuous rear", "curvy buttocks", "well-defined glutes", "ample behind", "shapely posterior"],
+    "voluptuous": ["curvaceous", "full-figured", "ample", "buxom", "well-endowed", "zaftig", "rubenesque"],
+
+    # ── Lighting & atmosphere ─────────────────────────────────────────────
+    "dark": ["shadowy", "dimly lit", "noir", "tenebrous", "deep shadows"],
+    "bright": ["luminous", "radiant", "glowing", "vibrant", "brilliant"],
+    "scary": ["terrifying", "menacing", "ominous", "eldritch", "horrifying"],
+    "cool": ["stylish", "composed", "sleek", "suave", "effortlessly chic"],
+    "dramatic": ["cinematic", "high contrast", "chiaroscuro", "theatrical", "imposing composition"],
+    "soft": ["diffused light", "ethereal glow", "gentle illumination", "pastel tones", "dreamy"],
+    "warm": ["golden light", "amber tones", "cozy atmosphere", "sunset hues", "inviting glow"],
+    "cold": ["blue tones", "icy atmosphere", "frigid", "frosty", "glacial light"],
+
+    # ── Actions & movement (core) ─────────────────────────────────────────
+    "walking": ["striding confidently", "sauntering", "ambling gracefully", "marching", "strolling leisurely"],
+    "running": ["sprinting full speed", "dashing forward", "bolting", "racing with urgency", "fleet-footed sprint"],
+    "jumping": ["leaping into the air", "vaulting upward", "bounding", "sky-high jump", "acrobatic leap"],
+    "sitting": ["seated elegantly", "perched gracefully", "reclining", "cross-legged repose", "slouched casually"],
+    "standing": ["upright stance", "statuesque pose", "at attention", "planted firmly", "towering presence"],
+    "lying": ["recumbent", "sprawled out", "supine position", "prostrate", "lying on side"],
+    "kneeling": ["genuflecting", "on one knee", "crouched reverently", "bowed on knees", "supplicant pose"],
+    "crouching": ["hunched low", "defensive crouch", "squatting", "coiled to spring", "low stance"],
+    "flying": ["airborne", "soaring through sky", "hovering mid-air", "gliding effortlessly", "ascending rapidly"],
+    "falling": ["plummeting", "tumbling downward", "free-falling", "cascading descent", "spiraling down"],
+    "climbing": ["scaling upward", "clambering", "ascending vertically", "gripping handholds", "mountaineering"],
+    "swimming": ["submerged gliding", "backstroke", "treading water", "diving under", "aquatic movement"],
+    "dancing": ["pirouetting", "waltzing gracefully", "rhythmic movement", "twirling", "ballet en pointe"],
+    "fighting": ["combat stance", "throwing punches", "martial arts form", "defensive block", "aggressive assault"],
+    "fast": ["dynamic motion", "speed lines", "swift", "rapid movement", "motion blur"],
+    "slow": ["calm", "serene", "peaceful", "tranquil", "gentle movement"],
+    "bounce": ["springing", "rebounding", "bouncing energetically", "elastic motion", "vibrant bounce", "grinding", "riding"],
+
+    # ── Combat & battle actions ───────────────────────────────────────────
+    "attacking": ["lunging forward", "delivering a strike", "unleashing an assault", "cleaving through", "offensive charge"],
+    "blocking": ["parrying a blow", "raising shield", "defensive ward", "deflecting attack", "braced for impact"],
+    "dodging": ["evading nimbly", "sidestepping", "rolling away", "ducking under", "acrobatic evasion"],
+    "casting": ["channelling energy", "arcane invocation", "hands glowing with power", "spell weaving", "magical incantation"],
+    "slashing": ["sword arc", "blade sweep", "cleaving strike", "horizontal cut", "diagonal slash"],
+    "shooting": ["taking aim", "firing weapon", "pulling trigger", "archery draw", "projectile release"],
+    "punching": ["throwing a fist", "uppercut", "jab strike", "hook punch", "knuckle impact"],
+    "kicking": ["roundhouse kick", "high kick", "spinning kick", "front kick", "dropkick"],
+
+    # ── Poses & gestures ─────────────────────────────────────────────────
+    "posing": ["striking a pose", "model stance", "dramatic posture", "fashion pose", "contrapposto"],
+    "pointing": ["outstretched finger", "directing gesture", "indicating forward", "accusatory point", "beckoning"],
+    "waving": ["hand raised in greeting", "farewell wave", "beckoning gesture", "enthusiastic wave", "gentle wave"],
+    "hugging": ["embracing tightly", "warm embrace", "arms wrapped around", "tender hold", "affectionate clutch"],
+    "reaching": ["arm outstretched", "grasping forward", "stretching toward", "fingers extended", "yearning reach"],
+    "holding": ["gripping firmly", "cradling gently", "clasping", "bearing in hands", "wielding"],
+    "leaning": ["tilted posture", "resting against", "inclined forward", "slouched to one side", "propped against wall"],
+    "bowing": ["deep bow", "reverent inclination", "formal curtsy", "head lowered respectfully", "solemn genuflection"],
+    "stretching": ["arms above head stretch", "arching back", "limbering up", "reaching skyward", "full body extension"],
+    "looking": ["gazing intently", "glancing sideways", "staring ahead", "peering over shoulder", "upward gaze"],
+    "turning": ["pivoting", "rotating torso", "head turn", "swiveling", "looking back over shoulder"],
+
+    # ── Dynamic action descriptions ───────────────────────────────────────
+    "explosion": ["detonation blast wave", "fiery eruption", "shockwave impact", "debris scattering", "cataclysmic burst"],
+    "impact": ["collision force", "shattering on contact", "kinetic strike", "concussive blow", "thunderous crash"],
+    "pursuit": ["relentless chase", "hot on the trail", "predator stalking prey", "breakneck pursuit", "desperate flee"],
+    "transformation": ["metamorphosis", "shape-shifting", "power awakening", "form evolving", "dramatic change"],
+    "summoning": ["conjuring forth", "ritual invocation", "materializing from void", "calling upon power", "ethereal manifestation"],
+
+    # ── Environment & setting ─────────────────────────────────────────────
+    "magic": ["arcane", "mystical", "ethereal glow", "sorcery", "enchanted"],
+    "fire": ["flames", "blazing", "inferno", "ember glow", "pyroclastic"],
+    "water": ["aquatic", "submerged", "ripples", "ocean spray", "crystalline water"],
+    "passionate": ["fervent", "ardent", "amorousness", "intense desire", "buxom"],
+    "warrior": ["battle-ready", "armored fighter", "combat stance", "gladiator", "swordsman"],
+    "forest": ["lush woodland", "dense foliage", "ancient trees", "verdant canopy", "enchanted grove"],
+    "city": ["urban landscape", "metropolis", "cityscape", "neon-lit streets", "towering skyscrapers"],
+    "night": ["moonlit", "starry sky", "nocturnal", "midnight", "twilight"],
+    "day": ["sunlit", "golden hour", "daylight", "afternoon sun", "clear sky"],
+    "robot": ["mecha", "android", "cybernetic", "mechanical", "biomechanical"],
+    "monster": ["creature", "beast", "eldritch horror", "chimera", "abomination"],
+    "ocean": ["vast seascape", "crashing waves", "deep blue expanse", "maritime", "tempestuous sea"],
+    "mountain": ["alpine peak", "craggy summit", "snow-capped mountain", "towering ridge", "precipitous cliff"],
+    "sky": ["celestial expanse", "cloud-strewn heavens", "azure canopy", "atmospheric vista", "firmament"],
+    "rain": ["downpour", "drizzling", "raindrops cascading", "storm precipitation", "soaked in rain"],
+    "wind": ["gusting breeze", "windswept", "hair billowing in wind", "gale force", "zephyr"],
+    "snow": ["snowfall", "blizzard", "frost-covered", "pristine white blanket", "crystalline snowflakes"],
+
+    # ── Camera & composition ──────────────────────────────────────────────
+    "closeup": ["extreme close-up", "tight framing", "macro shot", "face portrait", "intimate detail"],
+    "portrait": ["head and shoulders", "bust shot", "character portrait", "three-quarter view", "profile shot"],
+    "wide": ["wide-angle shot", "panoramic view", "full body framing", "establishing shot", "expansive composition"],
+    "above": ["bird's eye view", "top-down perspective", "overhead angle", "aerial viewpoint", "looking down at"],
+    "below": ["low angle shot", "worm's eye view", "looking up at", "dramatic low perspective", "ground-level"],
+    "side": ["profile view", "lateral perspective", "side-on angle", "orthogonal view", "90-degree angle"],
+    "behind": ["rear view", "from behind", "over-the-shoulder", "back-facing", "posterior perspective"],
+
+    # ── Clothing & accessories ────────────────────────────────────────────
+    "armor": ["plate armor", "battle-worn armor", "ornate breastplate", "chainmail", "knight's regalia"],
+    "dress": ["flowing gown", "elegant dress", "ball gown", "sundress", "cocktail dress"],
+    "uniform": ["military uniform", "school uniform", "formal attire", "officer's garb", "ceremonial dress"],
+    "casual": ["streetwear", "relaxed outfit", "everyday clothing", "hoodie and jeans", "comfortable attire"],
+    "cloak": ["billowing cape", "hooded mantle", "flowing cloak", "mysterious shroud", "traveler's cloak"],
+}
+
+
+def expand_vocabulary(text: str) -> dict:
+    """Return synonym suggestions for words in the prompt to help users
+    find tokens the CLIP model weights more strongly."""
+    words = re.findall(r'\b\w+\b', text.lower())
+    suggestions = {}
+    for word in words:
+        if word in _VOCAB_EXPANSION:
+            suggestions[word] = _VOCAB_EXPANSION[word]
+    return {"status": "ok", "suggestions": suggestions}
 
 
 # ── Core generation ───────────────────────────────────────────────────────
@@ -340,6 +682,7 @@ def generate_image(
     guidance_scale: float = 7.5,
     negative_prompt: str | None = None,
     seed: int = -1,
+    art_style: str = "custom",
 ) -> dict:
     """
     Generate an image. Returns dict with path, prompt analysis, settings used.
@@ -384,11 +727,14 @@ def generate_image(
 
     # Build prompt based on mode
     if mode == "explicit":
-        full_prompt = f"masterpiece, best quality, amazing quality, {prompt}"
+        full_prompt = f"score_9, score_8_up, score_7_up, {prompt}"
         base_neg = negative_prompt or EXPLICIT_NEGATIVE
     else:
-        full_prompt = f"masterpiece, best quality, {prompt}"
+        full_prompt = prompt
         base_neg = negative_prompt or DEFAULT_NEGATIVE
+
+    # Apply art style
+    full_prompt, base_neg = _apply_art_style(full_prompt, base_neg, art_style)
 
     # Apply feedback learnings to negative prompt
     full_negative = apply_feedback_learnings(base_neg)
@@ -548,6 +894,17 @@ ART_STYLES: dict[str, dict] = {
         "negative_extra": (
             "anime, cartoon, drawing, painting, illustration, "
             "stylized, flat colours"
+        ),
+    },
+    "3d_blender": {
+        "prefix": (
+            "3d render, blender, unreal engine 5, octane render, "
+            "volumetric lighting, subsurface scattering, PBR materials, "
+            "video game character, detailed textures, sharp focus"
+        ),
+        "negative_extra": (
+            "anime, hand-drawn, sketch, painting, flat colours, "
+            "2d, cel shading, watercolour, pencil, photo"
         ),
     },
     "custom": {
@@ -767,6 +1124,11 @@ def generate_animated(
             prev_image = None
 
     for i in range(start_frame, num_frames):
+        # Check for cancellation
+        if _check_cancelled():
+            _log.info("[ANIM GEN] Cancelled at frame %d/%d", i, num_frames)
+            break
+
         # Build per-frame prompt
         frame_desc = frame_descriptions[i]
         if frame_desc:
@@ -794,16 +1156,29 @@ def generate_animated(
         else:
             # Subsequent frames: img2img from previous frame
             init = prev_image.resize((width, height), PILImage.LANCZOS)
+            # Ensure effective steps >= 1 (steps * strength must be >= 1)
+            effective = int(steps * frame_strength)
+            if effective < 1:
+                adjusted_steps = max(steps, int(1.0 / frame_strength) + 1)
+                _log.info("[ANIM GEN] Adjusted steps %d→%d for strength %.2f",
+                          steps, adjusted_steps, frame_strength)
+            else:
+                adjusted_steps = steps
             gen_kwargs = {
                 "prompt": frame_prompt,
                 "negative_prompt": full_negative,
                 "image": init,
                 "strength": frame_strength,
-                "num_inference_steps": steps,
+                "num_inference_steps": adjusted_steps,
                 "guidance_scale": guidance_scale,
                 "generator": generator,
             }
-            image = img2img_pipe(**gen_kwargs).images[0]
+            try:
+                image = img2img_pipe(**gen_kwargs).images[0]
+            except Exception as e:
+                _log.error("[ANIM GEN] Frame %d failed: %s", i, e)
+                # Use previous frame as fallback
+                image = prev_image
 
         # Save frame
         frame_path = str(job_dir / f"frame_{i:04d}.png")
@@ -1057,10 +1432,10 @@ def generate_storyboard(
     base_seed = seed if seed >= 0 else torch.randint(0, 2**32, (1,)).item()
 
     # Low-res, low-step sketch settings
-    preview_steps = 6
+    preview_steps = 15
     preview_neg = (
-        "colour, colorful, detailed shading, photorealistic, 3d, "
-        "highly detailed, smooth, best quality"
+        "photorealistic, 3d, highly detailed, smooth, "
+        "blurry, abstract, smudge, noise, artifacts, deformed"
     )
 
     output_dir_path = Path(OUTPUT_DIR) / "storyboards"
@@ -1074,17 +1449,18 @@ def generate_storyboard(
     for i in range(num_frames):
         idx = min(i, len(storyboard_descriptions) - 1)
         frame_prompt = (
-            f"rough sketch, storyboard, pencil lines, simple linework, "
+            f"pencil sketch, clean linework, storyboard panel, "
+            f"black and white drawing, clear composition, "
             f"{prompt}, {storyboard_descriptions[idx]}"
         )
         generator = torch.Generator(device="cuda").manual_seed(base_seed + i)
         image = pipe(
             prompt=frame_prompt,
             negative_prompt=preview_neg,
-            width=width,
-            height=height,
+            width=max(width, 384),
+            height=max(height, 384),
             num_inference_steps=preview_steps,
-            guidance_scale=5.0,
+            guidance_scale=7.0,
             generator=generator,
         ).images[0]
         fp = str(output_dir_path / f"{timestamp}_sb_{i:03d}.png")
@@ -1155,6 +1531,7 @@ def generate_with_preview(
         guidance_scale=guidance_scale,
         negative_prompt=negative_prompt,
         seed=seed,
+        art_style=art_style,
     )
     if preview.get("status") == "error":
         return preview
@@ -1174,6 +1551,7 @@ def generate_with_preview(
         guidance_scale=guidance_scale,
         negative_prompt=negative_prompt,
         seed=actual_seed,
+        art_style=art_style,
     )
 
     return {
@@ -1286,6 +1664,23 @@ def upscale_image(
     for c in range(3):
         output_np[:, :, c] /= weight_map
     output_np = np.clip(output_np, 0, 255).astype(np.uint8)
+
+    # ── Brightness preservation ──────────────────────────────────
+    # The img2img tiles tend to brighten the image. Match the mean
+    # luminance of the output to the (upscaled) source image.
+    upscaled_np = np.array(upscaled, dtype=np.float64)
+    src_lum = 0.2126 * upscaled_np[:,:,0] + 0.7152 * upscaled_np[:,:,1] + 0.0722 * upscaled_np[:,:,2]
+    out_lum = 0.2126 * output_np[:,:,0].astype(np.float64) + 0.7152 * output_np[:,:,1].astype(np.float64) + 0.0722 * output_np[:,:,2].astype(np.float64)
+    src_mean = np.mean(src_lum)
+    out_mean = np.mean(out_lum)
+    if out_mean > 1e-3:
+        lum_ratio = src_mean / out_mean
+        # Clamp ratio to avoid extreme corrections
+        lum_ratio = max(0.5, min(lum_ratio, 1.5))
+        if abs(lum_ratio - 1.0) > 0.02:
+            _log.info("[UPSCALE] Brightness correction: ratio=%.3f", lum_ratio)
+            output_np = np.clip(output_np.astype(np.float64) * lum_ratio, 0, 255).astype(np.uint8)
+
     final = PILImage.fromarray(output_np)
 
     output_dir_path = Path(OUTPUT_DIR)
@@ -1846,6 +2241,7 @@ def submit_feedback(generation_index: int, feedback_text: str) -> dict:
         return {"status": "error", "error": "Invalid generation index"}
 
     _generation_history[generation_index]["feedback"] = feedback_text
+    _save_history_to_disk()
     _log.info("[IMAGE GEN] Feedback recorded for generation %d: %s",
               generation_index, feedback_text[:100])
 
@@ -1871,3 +2267,56 @@ def delete_model(model_path: str) -> dict:
     p.unlink()
     _log.info("[IMAGE GEN] Deleted model: %s", model_path)
     return {"status": "ok", "message": f"Deleted {p.name}"}
+
+
+# ── Character search (from available LoRAs and generation history) ────────
+
+def search_characters(query: str) -> dict:
+    """Search all LoRA categories and past generations matching a query.
+
+    Searches file names, trigger words, and generation history prompts.
+    Returns matching LoRA adapters and recent history entries.
+    """
+    query_lower = query.lower().strip()
+    if not query_lower:
+        return {"status": "ok", "loras": [], "history_matches": []}
+
+    # Search ALL LoRA categories
+    LORA_CATEGORIES = ("styles", "characters", "clothing", "poses", "concept", "action")
+    tw_data = _load_trigger_words()
+    matching_loras = []
+    for cat in LORA_CATEGORIES:
+        cat_dir = MODELS_DIR / cat
+        if not cat_dir.exists():
+            continue
+        for f in cat_dir.iterdir():
+            if f.suffix.lower() not in LORA_EXTENSIONS or not f.is_file():
+                continue
+            name_match = query_lower in f.stem.lower()
+            trigger_match = any(query_lower in tw.lower() for tw in tw_data.get(f.stem, []))
+            if name_match or trigger_match:
+                matching_loras.append({
+                    "name": f.stem,
+                    "path": str(f),
+                    "size_mb": round(f.stat().st_size / (1024 * 1024), 1),
+                    "category": cat,
+                    "trigger_words": tw_data.get(f.stem, []),
+                })
+
+    # Search generation history for matching prompts
+    history_matches = []
+    for entry in _generation_history:
+        prompt = (entry.get("prompt") or "").lower()
+        if query_lower in prompt:
+            history_matches.append({
+                "prompt": entry.get("prompt", "")[:100],
+                "result_path": entry.get("result_path"),
+                "seed": entry.get("settings", {}).get("seed"),
+                "timestamp": entry.get("timestamp"),
+            })
+
+    return {
+        "status": "ok",
+        "loras": matching_loras,
+        "history_matches": history_matches[-10:],  # last 10 matches
+    }

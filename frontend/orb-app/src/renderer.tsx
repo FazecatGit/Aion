@@ -265,7 +265,9 @@ function App() {
   const [imageModels, setImageModels] = useState<ImageModel[]>([]);
   const [activeImageModel, setActiveImageModel] = useState<string | null>(null);
   const [selectedImageModel, setSelectedImageModel] = useState<string>('');
-  const [selectedLoras, setSelectedLoras] = useState<string[]>([]);
+  const [selectedLoras, setSelectedLoras] = useState<string[]>(() => {
+    try { const s = localStorage.getItem('aion_selectedLoras'); return s ? JSON.parse(s) : []; } catch { return []; }
+  });
   const [imageGenMode, setImageGenMode] = useState<'normal' | 'explicit'>('normal');
   const [imageGenSteps, setImageGenSteps] = useState(35);
   const [imageGenCfg, setImageGenCfg] = useState(7.5);
@@ -279,7 +281,9 @@ function App() {
   const [imageGenAnimated, setImageGenAnimated] = useState(false);
   const [imageGenFrames, setImageGenFrames] = useState(16);
   // ── New ImageStudio state ──────────────────────────────────────────────────
-  const [imageGenArtStyle, setImageGenArtStyle] = useState('anime');
+  const [imageGenArtStyle, setImageGenArtStyle] = useState(() => {
+    try { return localStorage.getItem('aion_imageGenArtStyle') || 'anime'; } catch { return 'anime'; }
+  });
   const [imageGenFrameStrength, setImageGenFrameStrength] = useState(0.35);
   const [imageGenFps, setImageGenFps] = useState(8);
   const [imageGenOutputFormat, setImageGenOutputFormat] = useState<'gif'|'mp4'|'both'>('gif');
@@ -295,6 +299,18 @@ function App() {
   const [upscaleImagePath, setUpscaleImagePath] = useState('');
   const [upscaleScale, setUpscaleScale] = useState(2.0);
   const [upscaleTileSize, setUpscaleTileSize] = useState(768);
+  // ── Vocab expansion & tag marking ──────────────────────────────────────────
+  const [vocabSuggestions, setVocabSuggestions] = useState<Record<string, string[]>>({});
+  const [tagRating, setTagRating] = useState<string>('');  // danbooru/e621 tag category
+  // ── LoRA browser & trigger word management ─────────────────────────────────
+  const [loraCategories, setLoraCategories] = useState<Record<string, {name:string; filename:string; path:string; size_mb:number; trigger_words:string[]}[]>>({});
+  const [loraBrowserOpen, setLoraBrowserOpen] = useState(false);
+  const [loraBrowserCategory, setLoraBrowserCategory] = useState('styles');
+  const [triggerWordInput, setTriggerWordInput] = useState('');
+  const [editingTriggerLora, setEditingTriggerLora] = useState<string | null>(null);
+  const [loraSearchQuery, setLoraSearchQuery] = useState('');
+  const [loraSearchResults, setLoraSearchResults] = useState<any[]>([]);
+  const [loraSearchHistoryResults, setLoraSearchHistoryResults] = useState<any[]>([]);
   // ── Image lightbox with zoom+pan ───────────────────────────────────────────
   const [lightboxZoom, setLightboxZoom] = useState(1);
   const [lightboxPan, setLightboxPan] = useState({ x: 0, y: 0 });
@@ -510,8 +526,16 @@ function App() {
   // Fetch gamification profile when entering tutor mode
   useEffect(() => {
     if (activeMode === 'tutor') fetchGamifProfile();
-    if (activeMode === 'imagegen') { fetchImageModels(); fetchImageHistory(); fetchArtStyles(); fetchAnimJobs(); }
+    if (activeMode === 'imagegen') { fetchImageModels(); fetchImageHistory(); fetchArtStyles(); fetchAnimJobs(); fetchLoraCategories(); }
   }, [activeMode]);
+
+  // Persist selectedLoras and artStyle to localStorage
+  useEffect(() => {
+    try { localStorage.setItem('aion_selectedLoras', JSON.stringify(selectedLoras)); } catch {}
+  }, [selectedLoras]);
+  useEffect(() => {
+    try { localStorage.setItem('aion_imageGenArtStyle', imageGenArtStyle); } catch {}
+  }, [imageGenArtStyle]);
 
   // Refresh gamification profile after solving a problem
   useEffect(() => {
@@ -1298,7 +1322,7 @@ const handleImageGenerate = async () => {
 
   try {
     const body: any = {
-      prompt: imageGenPrompt.trim(),
+      prompt: (tagRating ? tagRating + ', ' : '') + imageGenPrompt.trim(),
       width: imageGenWidth,
       height: imageGenHeight,
       mode: imageGenMode,
@@ -1309,9 +1333,9 @@ const handleImageGenerate = async () => {
     if (selectedImageModel) body.model = selectedImageModel;
     if (selectedLoras.length > 0) body.loras = selectedLoras;
     if (imageGenNegative.trim()) body.negative_prompt = imageGenNegative.trim();
+    body.art_style = imageGenArtStyle;
     if (imageGenAnimated) {
       body.num_frames = imageGenFrames;
-      body.art_style = imageGenArtStyle;
       body.frame_strength = imageGenFrameStrength;
       body.fps = imageGenFps;
       body.output_format = imageGenOutputFormat;
@@ -1420,6 +1444,51 @@ const fetchArtStyles = async () => {
   } catch {}
 };
 
+// Fetch LoRA categories with trigger words
+const fetchLoraCategories = async () => {
+  try {
+    const res = await fetch('http://localhost:8000/generate/loras/categories');
+    const data = await res.json();
+    if (data.status === 'ok') setLoraCategories(data.categories || {});
+  } catch {}
+};
+
+// Save trigger words for a LoRA
+const saveTriggerWords = async (loraName: string, words: string) => {
+  try {
+    const wordList = words.split(',').map((w: string) => w.trim()).filter(Boolean);
+    await fetch('http://localhost:8000/generate/loras/trigger-words', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lora_name: loraName, trigger_words: wordList }),
+    });
+    setEditingTriggerLora(null);
+    setTriggerWordInput('');
+    fetchLoraCategories();
+  } catch {}
+};
+
+// Search LoRAs across all categories
+const searchLoras = async (query: string) => {
+  if (!query.trim()) { setLoraSearchResults([]); setLoraSearchHistoryResults([]); return; }
+  try {
+    const res = await fetch(`http://localhost:8000/generate/characters/search?q=${encodeURIComponent(query)}`);
+    const data = await res.json();
+    if (data.status === 'ok') {
+      setLoraSearchResults(data.loras || []);
+      setLoraSearchHistoryResults(data.history_matches || []);
+    }
+  } catch {}
+};
+
+// Insert trigger word into prompt
+const insertTriggerWord = (word: string) => {
+  setImageGenPrompt(prev => {
+    const trimmed = prev.trim();
+    return trimmed ? trimmed + ', ' + word : word;
+  });
+};
+
 // Fetch animation jobs
 const fetchAnimJobs = async () => {
   try {
@@ -1507,7 +1576,7 @@ const handleStoryboardPreview = async () => {
     const body: any = {
       prompt: imageGenPrompt.trim(),
       num_frames: imageGenFrames,
-      width: 256, height: 256,
+      width: 384, height: 384,
       seed: imageGenSeed,
     };
     if (selectedImageModel) body.model = selectedImageModel;
@@ -1532,6 +1601,27 @@ const handleStoryboardPreview = async () => {
   } finally {
     setImageGenLoading(false);
   }
+};
+
+// Fetch vocabulary expansion suggestions
+const fetchVocabExpansion = async (text: string) => {
+  if (!text.trim()) { setVocabSuggestions({}); return; }
+  try {
+    const res = await fetch('http://localhost:8000/generate/vocab/expand', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    const data = await res.json();
+    if (data.status === 'ok') setVocabSuggestions(data.suggestions || {});
+  } catch {}
+};
+
+// Cancel running generation
+const handleCancelGeneration = async () => {
+  try {
+    await fetch('http://localhost:8000/generate/cancel', { method: 'POST' });
+  } catch {}
 };
 
 return (
@@ -4401,8 +4491,8 @@ return (
       {/* ── Image Generation Page ──────────────────────────────────── */}
       {activeMode === 'imagegen' && (
         <div style={{
-          position: 'fixed', top: '60px', left: '50%', transform: 'translateX(-50%)',
-          width: '92%', maxWidth: '1200px', bottom: '30px',
+          position: 'fixed', top: '60px', left: '16px', right: '16px',
+          bottom: '30px',
           display: 'flex', gap: '16px', color: '#fff', zIndex: 30,
         }}>
           {/* Left panel: Settings */}
@@ -4442,20 +4532,221 @@ return (
               </select>
             </div>
 
-            {/* LoRA selector (shared) */}
-            {imageModels.filter(m => m.type === 'lora').length > 0 && (
-              <div>
-                <label style={{ fontSize: '11px', color: '#888', marginBottom: '4px', display: 'block' }}>LoRA Adapters</label>
-                {imageModels.filter(m => m.type === 'lora').map(m => (
-                  <label key={m.name} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: '#ccc', cursor: 'pointer', padding: '3px 0' }}>
-                    <input type="checkbox" checked={selectedLoras.includes(m.name)}
-                      onChange={e => { if (e.target.checked) setSelectedLoras(prev => [...prev, m.name]); else setSelectedLoras(prev => prev.filter(l => l !== m.name)); }}
-                      style={{ accentColor: '#b388ff' }} />
-                    {m.name} ({m.size_mb}MB)
-                  </label>
-                ))}
+            {/* Character / LoRA Search (always visible) */}
+            <div>
+              <label style={{ fontSize: '11px', color: '#888', marginBottom: '4px', display: 'block' }}>🔍 Search Characters & LoRAs</label>
+              <input type="text" value={loraSearchQuery}
+                onChange={e => { setLoraSearchQuery(e.target.value); searchLoras(e.target.value); }}
+                placeholder="Search by name, trigger word, or past prompt..."
+                style={{ width: '100%', padding: '7px 10px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px', outline: 'none', boxSizing: 'border-box' }} />
+
+              {/* Search results dropdown */}
+              {loraSearchQuery && (loraSearchResults.length > 0 || loraSearchHistoryResults.length > 0) && (
+                <div style={{
+                  border: '1px solid #333', borderRadius: '8px', backgroundColor: '#0a0a0a',
+                  padding: '8px', maxHeight: '240px', overflowY: 'auto', marginTop: '4px',
+                }}>
+                  {/* LoRA matches */}
+                  {loraSearchResults.length > 0 && (
+                    <div style={{ marginBottom: loraSearchHistoryResults.length > 0 ? '8px' : '0' }}>
+                      <div style={{ fontSize: '10px', color: '#b388ff', marginBottom: '4px', fontWeight: 'bold' }}>LoRA Matches</div>
+                      {loraSearchResults.map((lr: any) => (
+                        <div key={lr.name} style={{ padding: '4px 6px', fontSize: '11px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderRadius: '4px', backgroundColor: '#111', marginBottom: '2px' }}>
+                          <div>
+                            <span style={{ color: '#ccc' }}>{lr.name}</span>
+                            <span style={{ color: '#555', fontSize: '9px', marginLeft: '6px' }}>{lr.category}</span>
+                            {lr.trigger_words?.length > 0 && (
+                              <div style={{ marginTop: '2px' }}>
+                                {lr.trigger_words.map((tw: string, j: number) => (
+                                  <span key={j} onClick={() => insertTriggerWord(tw)}
+                                    style={{ fontSize: '9px', color: '#00cc88', cursor: 'pointer', marginRight: '4px', textDecoration: 'underline' }}>{tw}</span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                          <button onClick={() => setSelectedLoras(prev => prev.includes(lr.name) ? prev.filter(x => x !== lr.name) : [...prev, lr.name])}
+                            style={{ background: 'none', border: '1px solid', borderColor: selectedLoras.includes(lr.name) ? '#b388ff' : '#444', borderRadius: '4px', color: selectedLoras.includes(lr.name) ? '#b388ff' : '#888', cursor: 'pointer', fontSize: '9px', padding: '1px 6px' }}>
+                            {selectedLoras.includes(lr.name) ? '✓' : '+ Use'}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* History matches */}
+                  {loraSearchHistoryResults.length > 0 && (
+                    <div>
+                      <div style={{ fontSize: '10px', color: '#ff9900', marginBottom: '4px', fontWeight: 'bold', borderTop: loraSearchResults.length > 0 ? '1px solid #222' : 'none', paddingTop: loraSearchResults.length > 0 ? '6px' : '0' }}>Past Generations</div>
+                      {loraSearchHistoryResults.map((h: any, i: number) => (
+                        <div key={i} onClick={() => {
+                          if (h.prompt) setImageGenPrompt(h.prompt);
+                          if (h.seed && h.seed !== -1) setImageGenSeed(h.seed);
+                        }} style={{
+                          padding: '4px 6px', fontSize: '11px', borderRadius: '4px', backgroundColor: '#111',
+                          marginBottom: '2px', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                        }}>
+                          <div style={{ flex: 1, overflow: 'hidden' }}>
+                            <span style={{ color: '#ccc', fontSize: '10px' }}>{h.prompt || 'Unknown'}</span>
+                            {h.timestamp && <div style={{ color: '#444', fontSize: '9px', marginTop: '1px' }}>{new Date(h.timestamp).toLocaleString()}</div>}
+                          </div>
+                          {h.seed && <span style={{ color: '#555', fontSize: '9px', marginLeft: '6px', flexShrink: 0 }}>seed:{h.seed}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {loraSearchResults.length === 0 && loraSearchHistoryResults.length === 0 && (
+                    <div style={{ color: '#444', fontSize: '10px', textAlign: 'center', padding: '8px 0' }}>No matches found</div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* LoRA Browser (categorized with trigger words) */}
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                <label style={{ fontSize: '11px', color: '#888' }}>LoRA Adapters</label>
+                <button onClick={() => { setLoraBrowserOpen(!loraBrowserOpen); if (!loraBrowserOpen) fetchLoraCategories(); }}
+                  style={{ background: 'none', border: '1px solid #444', borderRadius: '4px', color: '#b388ff', cursor: 'pointer', fontSize: '10px', padding: '2px 8px' }}>
+                  {loraBrowserOpen ? '▼ Close' : '▶ Browse'}
+                </button>
               </div>
-            )}
+
+              {/* Selected LoRAs chips */}
+              {selectedLoras.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' }}>
+                  {selectedLoras.map(l => (
+                    <span key={l} style={{
+                      padding: '2px 8px', borderRadius: '10px', fontSize: '10px',
+                      backgroundColor: 'rgba(179,136,255,0.15)', color: '#b388ff', border: '1px solid rgba(179,136,255,0.3)',
+                      display: 'flex', alignItems: 'center', gap: '4px',
+                    }}>
+                      {l}
+                      <span onClick={() => setSelectedLoras(prev => prev.filter(x => x !== l))} style={{ cursor: 'pointer', color: '#ff4444', fontWeight: 'bold' }}>×</span>
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {/* LoRA Browser panel */}
+              {loraBrowserOpen && (
+                <div style={{
+                  border: '1px solid #333', borderRadius: '8px', backgroundColor: '#0a0a0a',
+                  padding: '8px', maxHeight: '320px', overflowY: 'auto',
+                }}>
+                  {/* Search */}
+                  <input type="text" value={loraSearchQuery}
+                    onChange={e => { setLoraSearchQuery(e.target.value); searchLoras(e.target.value); }}
+                    placeholder="Search LoRAs by name or trigger word..."
+                    style={{ width: '100%', padding: '5px 8px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '11px', marginBottom: '6px', outline: 'none', boxSizing: 'border-box' }} />
+
+                  {/* Search results */}
+                  {loraSearchQuery && loraSearchResults.length > 0 && (
+                    <div style={{ marginBottom: '8px', borderBottom: '1px solid #222', paddingBottom: '6px' }}>
+                      <div style={{ fontSize: '10px', color: '#888', marginBottom: '4px' }}>Search Results</div>
+                      {loraSearchResults.map((lr: any) => (
+                        <div key={lr.name} style={{ padding: '4px 6px', fontSize: '11px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderRadius: '4px', backgroundColor: '#111', marginBottom: '2px' }}>
+                          <div>
+                            <span style={{ color: '#ccc' }}>{lr.name}</span>
+                            <span style={{ color: '#555', fontSize: '9px', marginLeft: '6px' }}>{lr.category}</span>
+                            {lr.trigger_words?.length > 0 && (
+                              <div style={{ marginTop: '2px' }}>
+                                {lr.trigger_words.map((tw: string, j: number) => (
+                                  <span key={j} onClick={() => insertTriggerWord(tw)}
+                                    style={{ fontSize: '9px', color: '#00cc88', cursor: 'pointer', marginRight: '4px', textDecoration: 'underline' }}>{tw}</span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                          <button onClick={() => setSelectedLoras(prev => prev.includes(lr.name) ? prev.filter(x => x !== lr.name) : [...prev, lr.name])}
+                            style={{ background: 'none', border: '1px solid', borderColor: selectedLoras.includes(lr.name) ? '#b388ff' : '#444', borderRadius: '4px', color: selectedLoras.includes(lr.name) ? '#b388ff' : '#888', cursor: 'pointer', fontSize: '9px', padding: '1px 6px' }}>
+                            {selectedLoras.includes(lr.name) ? '✓' : '+'}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Category tabs */}
+                  <div style={{ display: 'flex', gap: '2px', flexWrap: 'wrap', marginBottom: '6px' }}>
+                    {['styles', 'characters', 'clothing', 'poses', 'concept', 'action'].map(cat => {
+                      const count = (loraCategories[cat] || []).length;
+                      return (
+                        <button key={cat} onClick={() => setLoraBrowserCategory(cat)} style={{
+                          padding: '3px 6px', borderRadius: '4px', fontSize: '9px', cursor: 'pointer',
+                          border: '1px solid', textTransform: 'capitalize',
+                          borderColor: loraBrowserCategory === cat ? '#b388ff' : '#333',
+                          backgroundColor: loraBrowserCategory === cat ? 'rgba(179,136,255,0.15)' : 'transparent',
+                          color: loraBrowserCategory === cat ? '#b388ff' : '#666',
+                        }}>{cat} ({count})</button>
+                      );
+                    })}
+                  </div>
+
+                  {/* LoRAs in selected category */}
+                  {(loraCategories[loraBrowserCategory] || []).length === 0 && (
+                    <div style={{ color: '#444', fontSize: '10px', textAlign: 'center', padding: '12px 0' }}>No LoRAs in {loraBrowserCategory}/</div>
+                  )}
+                  {(loraCategories[loraBrowserCategory] || []).map(lora => (
+                    <div key={lora.name} style={{
+                      padding: '6px', borderRadius: '6px', backgroundColor: '#111', border: '1px solid #222',
+                      marginBottom: '4px', fontSize: '11px',
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span style={{ color: '#ccc', fontWeight: 500 }}>{lora.name}</span>
+                        <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                          <span style={{ color: '#555', fontSize: '9px' }}>{lora.size_mb}MB</span>
+                          <button onClick={() => setSelectedLoras(prev => prev.includes(lora.name) ? prev.filter(x => x !== lora.name) : [...prev, lora.name])}
+                            style={{ background: 'none', border: '1px solid', borderColor: selectedLoras.includes(lora.name) ? '#b388ff' : '#444', borderRadius: '4px', color: selectedLoras.includes(lora.name) ? '#b388ff' : '#888', cursor: 'pointer', fontSize: '9px', padding: '1px 6px' }}>
+                            {selectedLoras.includes(lora.name) ? '✓ Active' : '+ Use'}
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Trigger words display */}
+                      {lora.trigger_words?.length > 0 && editingTriggerLora !== lora.name && (
+                        <div style={{ marginTop: '4px', display: 'flex', flexWrap: 'wrap', gap: '3px', alignItems: 'center' }}>
+                          <span style={{ fontSize: '9px', color: '#666' }}>Triggers:</span>
+                          {lora.trigger_words.map((tw: string, j: number) => (
+                            <span key={j} onClick={() => insertTriggerWord(tw)}
+                              style={{
+                                padding: '1px 6px', borderRadius: '8px', fontSize: '9px',
+                                backgroundColor: 'rgba(0,204,136,0.1)', color: '#00cc88',
+                                border: '1px solid rgba(0,204,136,0.2)', cursor: 'pointer',
+                              }} title="Click to insert into prompt">{tw}</span>
+                          ))}
+                          <span onClick={() => { setEditingTriggerLora(lora.name); setTriggerWordInput(lora.trigger_words.join(', ')); }}
+                            style={{ fontSize: '9px', color: '#555', cursor: 'pointer' }} title="Edit triggers">✏️</span>
+                        </div>
+                      )}
+
+                      {/* No trigger words — add button */}
+                      {(!lora.trigger_words || lora.trigger_words.length === 0) && editingTriggerLora !== lora.name && (
+                        <button onClick={() => { setEditingTriggerLora(lora.name); setTriggerWordInput(''); }}
+                          style={{ marginTop: '4px', background: 'none', border: '1px dashed #444', borderRadius: '4px', color: '#666', cursor: 'pointer', fontSize: '9px', padding: '2px 8px', width: '100%' }}>
+                          + Add trigger words
+                        </button>
+                      )}
+
+                      {/* Trigger word edit mode */}
+                      {editingTriggerLora === lora.name && (
+                        <div style={{ marginTop: '4px', display: 'flex', gap: '4px' }}>
+                          <input type="text" value={triggerWordInput}
+                            onChange={e => setTriggerWordInput(e.target.value)}
+                            onKeyDown={e => { if (e.key === 'Enter') saveTriggerWords(lora.name, triggerWordInput); }}
+                            placeholder="word1, word2, ..."
+                            style={{ flex: 1, padding: '3px 6px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#0a0a0a', color: '#fff', fontSize: '10px', outline: 'none' }} />
+                          <button onClick={() => saveTriggerWords(lora.name, triggerWordInput)}
+                            style={{ background: '#00cc88', border: 'none', borderRadius: '4px', color: '#000', cursor: 'pointer', fontSize: '9px', padding: '3px 8px', fontWeight: 'bold' }}>Save</button>
+                          <button onClick={() => { setEditingTriggerLora(null); setTriggerWordInput(''); }}
+                            style={{ background: 'none', border: '1px solid #444', borderRadius: '4px', color: '#888', cursor: 'pointer', fontSize: '9px', padding: '3px 6px' }}>✕</button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
 
             {/* Art style selector (shared to generate/animate) */}
             {(imageGenSubTab === 'generate' || imageGenSubTab === 'animate') && (
@@ -4517,6 +4808,27 @@ return (
                 <label style={{ fontSize: '11px', color: '#888' }}>Custom Negative (optional)</label>
                 <textarea value={imageGenNegative} onChange={e => setImageGenNegative(e.target.value)} placeholder="Leave empty for smart defaults..."
                   rows={2} style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '11px', resize: 'vertical', fontFamily: 'inherit' }} />
+              </div>
+              {/* Tag rating (Danbooru/E621 style) */}
+              <div>
+                <label style={{ fontSize: '11px', color: '#888', marginBottom: '4px', display: 'block' }}>Tag Rating</label>
+                <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+                  {[
+                    { val: '', label: 'None', color: '#666' },
+                    { val: 'rating:general', label: '[G]', color: '#00cc88' },
+                    { val: 'rating:sensitive', label: '[S]', color: '#ff9900' },
+                    { val: 'rating:questionable', label: '[Q]', color: '#ff6644' },
+                    { val: 'rating:explicit', label: '[E]', color: '#ff2222' },
+                  ].map(r => (
+                    <button key={r.val} onClick={() => setTagRating(r.val)} style={{
+                      padding: '4px 8px', borderRadius: '4px', fontSize: '10px', fontWeight: 'bold',
+                      border: '1px solid', cursor: 'pointer',
+                      borderColor: tagRating === r.val ? r.color : '#333',
+                      backgroundColor: tagRating === r.val ? `${r.color}22` : '#111',
+                      color: tagRating === r.val ? r.color : '#555',
+                    }}>{r.label}</button>
+                  ))}
+                </div>
               </div>
             </>)}
 
@@ -4741,9 +5053,10 @@ return (
             }}>
               <textarea
                 value={imageGenPrompt}
-                onChange={e => setImageGenPrompt(e.target.value)}
+                onChange={e => { setImageGenPrompt(e.target.value); }}
+                onBlur={() => fetchVocabExpansion(imageGenPrompt)}
                 onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (imageGenSubTab === 'storyboard') handleStoryboardPreview(); else handleImageGenerate(); } }}
-                placeholder="Describe what to generate... (supports long prompts, no 77-token limit)"
+                placeholder="Describe what to generate... (supports long prompts, no 77-token limit, use (word:1.5) for weighting)"
                 rows={3}
                 style={{
                   flex: 1, padding: '10px 14px', borderRadius: '10px', border: '1px solid #333',
@@ -4770,7 +5083,44 @@ return (
                   : imageGenSubTab === 'storyboard' ? '📋 Sketch'
                   : '🎨 Generate'}
               </button>
+              {imageGenLoading && (
+                <button onClick={handleCancelGeneration}
+                  style={{
+                    padding: '12px 16px', borderRadius: '10px', border: '2px solid #ff4444',
+                    backgroundColor: 'rgba(255,68,68,0.1)', color: '#ff4444',
+                    cursor: 'pointer', fontSize: '14px', fontWeight: 'bold',
+                    whiteSpace: 'nowrap',
+                  }}>
+                  ⬛ Stop
+                </button>
+              )}
             </div>
+
+            {/* Vocab expansion suggestions */}
+            {Object.keys(vocabSuggestions).length > 0 && (
+              <div style={{
+                backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '10px',
+                border: '1px solid rgba(179,136,255,0.15)', padding: '10px',
+                fontSize: '11px',
+              }}>
+                <div style={{ color: '#888', marginBottom: '6px', fontSize: '10px' }}>💡 Synonym suggestions (click to insert):</div>
+                {Object.entries(vocabSuggestions).map(([word, synonyms]) => (
+                  <div key={word} style={{ marginBottom: '4px' }}>
+                    <span style={{ color: '#b388ff' }}>{word}</span>
+                    <span style={{ color: '#555' }}> → </span>
+                    {(synonyms as string[]).map((s, i) => (
+                      <span key={i}>
+                        <span
+                          onClick={() => setImageGenPrompt(prev => prev + ', ' + s)}
+                          style={{ color: '#00cc88', cursor: 'pointer', textDecoration: 'underline' }}
+                        >{s}</span>
+                        {i < (synonyms as string[]).length - 1 && <span style={{ color: '#333' }}> | </span>}
+                      </span>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
 
             {/* Result area */}
             <div style={{
@@ -4879,34 +5229,55 @@ return (
 
           {/* Right panel: History */}
           <div style={{
-            width: '250px', flexShrink: 0,
+            width: '280px', flexShrink: 0,
             backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '14px',
             border: '1px solid rgba(179,136,255,0.2)', backdropFilter: 'blur(16px)',
             overflowY: 'auto', padding: '12px', display: 'flex', flexDirection: 'column', gap: '8px',
           }}>
             <h4 style={{ margin: 0, fontSize: '13px', color: '#888', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              Recent Generations
+              Recent Generations ({imageGenHistory.length})
               <button onClick={fetchImageHistory} style={{ background: 'none', border: 'none', color: '#555', cursor: 'pointer', fontSize: '12px' }}>⟳</button>
             </h4>
-            {imageGenHistory.length === 0 && <div style={{ color: '#444', fontSize: '11px', textAlign: 'center', padding: '20px 0' }}>No history yet</div>}
+            {imageGenHistory.length === 0 && <div style={{ color: '#444', fontSize: '11px', textAlign: 'center', padding: '20px 0' }}>No history yet — generate an image to see it here</div>}
             {imageGenHistory.slice().reverse().map((h, i) => (
               <div key={i} style={{
                 padding: '8px', borderRadius: '8px', backgroundColor: '#111',
                 border: '1px solid #222', fontSize: '11px', cursor: 'pointer',
               }}
                 onClick={() => {
-                  if (h.result_path) {
-                    setImageGenPrompt(h.prompt?.replace(/^(masterpiece, best quality, |masterpiece, best quality, amazing quality, )/, '') || '');
-                  }
+                  const cleanPrompt = h.prompt?.replace(/^(score_9, score_8_up, score_7_up, |rating:\w+, )/, '') || '';
+                  setImageGenPrompt(cleanPrompt);
+                  if (h.settings?.seed) setImageGenSeed(h.settings.seed);
+                  if (h.settings?.steps) setImageGenSteps(h.settings.steps);
+                  if (h.settings?.guidance_scale) setImageGenCfg(h.settings.guidance_scale);
                 }}
               >
-                <div style={{ color: '#ccc', marginBottom: '4px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {h.prompt?.slice(0, 60) || 'Unknown'}
+                {h.result_path && (
+                  <img
+                    src={`http://localhost:8000/file?path=${encodeURIComponent(h.result_path)}`}
+                    alt=""
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setLightboxUrl(`http://localhost:8000/file?path=${encodeURIComponent(h.result_path)}`);
+                      setLightboxZoom(1);
+                      setLightboxPan({ x: 0, y: 0 });
+                    }}
+                    style={{ width: '100%', height: '120px', objectFit: 'cover', borderRadius: '6px', marginBottom: '6px', cursor: 'zoom-in' }}
+                    onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                  />
+                )}
+                <div style={{ color: '#ccc', marginBottom: '4px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '11px' }}>
+                  {h.prompt?.replace(/^(score_9, score_8_up, score_7_up, |rating:\w+, )/, '').slice(0, 80) || 'Unknown'}
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', color: '#555', fontSize: '10px' }}>
-                  <span>{h.settings?.model || '?'}</span>
-                  <span>seed:{h.settings?.seed}</span>
+                  <span>{h.settings?.model ? String(h.settings.model).split(/[/\\]/).pop()?.replace('.safetensors', '') : '?'}</span>
+                  <span>seed:{h.settings?.seed ?? '?'}</span>
                 </div>
+                {h.timestamp && (
+                  <div style={{ color: '#444', fontSize: '9px', marginTop: '2px' }}>
+                    {new Date(h.timestamp).toLocaleString()}
+                  </div>
+                )}
                 {h.feedback && (
                   <div style={{ marginTop: '4px', padding: '3px 6px', borderRadius: '4px', backgroundColor: 'rgba(255,153,0,0.1)', color: '#ff9900', fontSize: '10px' }}>
                     📝 {h.feedback.slice(0, 40)}

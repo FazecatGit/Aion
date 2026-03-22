@@ -1765,6 +1765,29 @@ async def voice_tts_kokoro(req: TTSKokoroRequest):
     return FileResponse(result["path"], media_type="audio/wav", filename="tts_output.wav")
 
 
+# ── File serving (for history thumbnails etc.) ────────────────────────────
+
+@app.get("/file")
+async def serve_file(path: str):
+    """Serve a local file by path. Only allows generated_images/ and cache/ dirs."""
+    from starlette.responses import FileResponse
+    p = Path(path).resolve()
+    # Safety: only serve from output dirs
+    allowed_roots = [
+        Path(OUTPUT_DIR).resolve(),
+        (Path(__file__).parent / "cache").resolve(),
+    ]
+    if not any(str(p).startswith(str(root)) for root in allowed_roots):
+        return {"status": "error", "error": "Access denied"}
+    if not p.exists():
+        return {"status": "error", "error": "File not found"}
+    suffix = p.suffix.lower()
+    media_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                 ".gif": "image/gif", ".webp": "image/webp", ".mp4": "video/mp4"}
+    media_type = media_map.get(suffix, "application/octet-stream")
+    return FileResponse(str(p), media_type=media_type, filename=p.name)
+
+
 # ── Image generation endpoints (delegated to agent/image_generation.py) ──
 
 class ImageGenRequest(BaseModel):
@@ -1779,6 +1802,7 @@ class ImageGenRequest(BaseModel):
     guidance_scale: float = 7.5
     negative_prompt: Optional[str] = None
     seed: int = -1
+    art_style: str = "custom"
 
 
 @app.post("/generate/image")
@@ -1819,6 +1843,7 @@ async def generate_image_endpoint(req: ImageGenRequest):
             guidance_scale=req.guidance_scale,
             negative_prompt=req.negative_prompt,
             seed=req.seed,
+            art_style=req.art_style,
         )
 
     result = await asyncio.to_thread(_gen)
@@ -1934,6 +1959,13 @@ async def list_animation_jobs():
     """List all saved animation jobs with resume status."""
     from agent.image_generation import list_animation_jobs
     return {"status": "ok", "jobs": list_animation_jobs()}
+
+
+@app.post("/generate/cancel")
+async def cancel_generation_endpoint():
+    """Cancel any running image/animation generation."""
+    from agent.image_generation import cancel_generation
+    return cancel_generation()
 
 
 class RegenerateFrameRequest(BaseModel):
@@ -2214,12 +2246,65 @@ async def image_feedback(req: ImageFeedbackRequest):
     return submit_feedback(req.generation_index, req.feedback)
 
 
+@app.get("/generate/characters/search")
+async def search_characters_endpoint(q: str = ""):
+    """Search all LoRA categories and past generations by name or trigger word."""
+    from agent.image_generation import search_characters
+    return search_characters(q)
+
+
 @app.get("/generate/history")
 async def image_gen_history(limit: int = 20):
     """Get recent image generation history with prompt analysis."""
     from agent.image_generation import get_generation_history
     return {"status": "ok", "history": get_generation_history(limit)}
 
+
+class VocabExpandRequest(BaseModel):
+    text: str
+
+@app.post("/generate/vocab/expand")
+async def expand_vocab_endpoint(req: VocabExpandRequest):
+    """Get synonym suggestions for prompt words."""
+    from agent.image_generation import expand_vocabulary
+    return expand_vocabulary(req.text)
+
+
+# ── LoRA trigger word management ──────────────────────────────────────────
+
+@app.get("/generate/loras/categories")
+async def list_loras_by_category_endpoint():
+    """List all LoRAs organized by folder category with trigger words."""
+    from agent.image_generation import list_loras_by_category
+    return list_loras_by_category()
+
+
+class TriggerWordRequest(BaseModel):
+    lora_name: str
+    trigger_words: list[str]
+
+@app.post("/generate/loras/trigger-words")
+async def set_trigger_words_endpoint(req: TriggerWordRequest):
+    """Set trigger words for a LoRA file."""
+    from agent.image_generation import set_trigger_words
+    return set_trigger_words(req.lora_name, req.trigger_words)
+
+
+@app.get("/generate/loras/trigger-words")
+async def get_all_trigger_words_endpoint():
+    """Get all saved trigger words for all LoRAs."""
+    from agent.image_generation import get_all_trigger_words
+    return get_all_trigger_words()
+
+
+class DeleteTriggerWordRequest(BaseModel):
+    lora_name: str
+
+@app.post("/generate/loras/trigger-words/delete")
+async def delete_trigger_words_endpoint(req: DeleteTriggerWordRequest):
+    """Remove trigger words for a LoRA."""
+    from agent.image_generation import delete_trigger_words
+    return delete_trigger_words(req.lora_name)
 
 
 # ── Math visualization compute endpoint ──────────────────────────────────
