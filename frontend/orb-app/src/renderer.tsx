@@ -288,9 +288,28 @@ function App() {
   const [imageGenFps, setImageGenFps] = useState(8);
   const [imageGenOutputFormat, setImageGenOutputFormat] = useState<'gif'|'mp4'|'both'>('gif');
   const [artStyles, setArtStyles] = useState<{name:string; prefix:string}[]>([]);
-  const [imageGenSubTab, setImageGenSubTab] = useState<'generate'|'animate'|'storyboard'|'upscale'|'train'>('generate');
+  const [imageGenSubTab, setImageGenSubTab] = useState<'generate'|'animate'|'storyboard'|'upscale'|'train'|'video'>('generate');
   const [storyboardDescs, setStoryboardDescs] = useState('');
   const [animJobs, setAnimJobs] = useState<any[]>([]);
+  // ── Animation anti-deterioration & dynamic controls ────────────────────────
+  const [animReferenceBlend, setAnimReferenceBlend] = useState(0.3);
+  const [animStrengthCurve, setAnimStrengthCurve] = useState<'constant'|'ease_in'|'pulse'>('constant');
+  const [animMotionIntensity, setAnimMotionIntensity] = useState(0.5);
+  // ── UI layout ──────────────────────────────────────────────────────────────
+  const [modelsExpanded, setModelsExpanded] = useState(false);
+  // ── GPU monitor & progress tracking ────────────────────────────────────────
+  const [gpuInfo, setGpuInfo] = useState<{ vram_used_mb: number; vram_total_mb: number; vram_percent: number; device_name: string; available?: boolean; error?: string } | null>(null);
+  const [genProgress, setGenProgress] = useState<{ active: boolean; type: string; current_step: number; total_steps: number; current_frame: number; total_frames: number; message: string }>({ active: false, type: 'idle', current_step: 0, total_steps: 0, current_frame: 0, total_frames: 0, message: '' });
+  const progressPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // ── Video generation (WAN) ─────────────────────────────────────────────────
+  const [videoRefImage, setVideoRefImage] = useState('');
+  const [videoFrames, setVideoFrames] = useState(81);
+  const [videoFps, setVideoFps] = useState(16);
+  const [videoSteps, setVideoSteps] = useState(30);
+  const [videoCfg, setVideoCfg] = useState(5.0);
+  const [videoActionLora, setVideoActionLora] = useState('');
+  const [actionLoras, setActionLoras] = useState<any[]>([]);
+  const [isVideoResult, setIsVideoResult] = useState(false);
   const [trainingStatus, setTrainingStatus] = useState<any>(null);
   const [trainingImageDir, setTrainingImageDir] = useState('');
   const [trainingName, setTrainingName] = useState('');
@@ -370,6 +389,22 @@ function App() {
       });
     }
   }, [processLogs, showProcessPanel]);
+
+  // ── GPU monitor + generation progress polling ─────────────────────────────
+  useEffect(() => {
+    const poll = setInterval(async () => {
+      try {
+        const [gpuRes, progRes] = await Promise.all([
+          fetch('http://localhost:8000/system/gpu'),
+          fetch('http://localhost:8000/generate/progress'),
+        ]);
+        if (gpuRes.ok) setGpuInfo(await gpuRes.json());
+        if (progRes.ok) setGenProgress(await progRes.json());
+      } catch { /* backend down */ }
+    }, imageGenLoading ? 1000 : 5000);  // poll faster during generation
+    progressPollRef.current = poll;
+    return () => clearInterval(poll);
+  }, [imageGenLoading]);
 
   // ── LLM connection status ──────────────────────────────────────────────────
   const [llmConnected, setLlmConnected] = useState<boolean | null>(null);  // null = unknown
@@ -1577,15 +1612,18 @@ const handleFullRenderFromPreview = async () => {
   }
 };
 
-const handleImageGenerate = async () => {
+const handleImageGenerate = async (animatedOverride?: boolean) => {
   if (!imageGenPrompt.trim() || imageGenLoading) return;
+  const isAnimated = animatedOverride !== undefined ? animatedOverride : imageGenAnimated;
+  setImageGenAnimated(isAnimated);
   setImageGenLoading(true);
   setImageGenResult(null);
+  setIsVideoResult(false);
   setImageGenMeta(null);
   setPreviewResult(null);
   setMode('querying');  // activate orb animation during generation
 
-  const endpoint = imageGenAnimated ? '/generate/animated' : '/generate/image';
+  const endpoint = isAnimated ? '/generate/animated' : '/generate/image';
 
   try {
     const body: any = {
@@ -1601,11 +1639,14 @@ const handleImageGenerate = async () => {
     if (selectedLoras.length > 0) body.loras = selectedLoras;
     if (imageGenNegative.trim()) body.negative_prompt = imageGenNegative.trim();
     body.art_style = imageGenArtStyle;
-    if (imageGenAnimated) {
+    if (isAnimated) {
       body.num_frames = imageGenFrames;
       body.frame_strength = imageGenFrameStrength;
       body.fps = imageGenFps;
       body.output_format = imageGenOutputFormat;
+      body.reference_blend = animReferenceBlend;
+      body.strength_curve = animStrengthCurve;
+      body.motion_intensity = animMotionIntensity;
       if (storyboardDescs.trim()) {
         body.storyboard = storyboardDescs.split('\n').filter((s: string) => s.trim());
       }
@@ -5084,7 +5125,7 @@ return (
 
             {/* Sub-tab selector */}
             <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
-              {([['generate','🖼'], ['animate','🎬'], ['storyboard','📋'], ['upscale','🔍'], ['train','🧪']] as const).map(([tab, icon]) => (
+              {([['generate','🖼'], ['animate','🎬'], ['storyboard','📋'], ['video','🎥'], ['upscale','🔍'], ['train','🧪']] as const).map(([tab, icon]) => (
                 <button key={tab} onClick={() => setImageGenSubTab(tab as any)} style={{
                   flex: 1, minWidth: '50px', padding: '5px 4px', borderRadius: '6px', border: '1px solid',
                   borderColor: imageGenSubTab === tab ? '#b388ff' : '#333',
@@ -5475,6 +5516,28 @@ return (
                 <label style={{ fontSize: '11px', color: '#888' }}>Frame Strength ({imageGenFrameStrength.toFixed(2)}) — lower = more consistent</label>
                 <input type="range" min={0.1} max={0.7} step={0.05} value={imageGenFrameStrength} onChange={e => setImageGenFrameStrength(+e.target.value)} style={{ width: '100%', accentColor: '#b388ff' }} />
               </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Reference Blend ({animReferenceBlend.toFixed(2)}) — anchors to frame 0</label>
+                <input type="range" min={0} max={0.6} step={0.05} value={animReferenceBlend} onChange={e => setAnimReferenceBlend(+e.target.value)} style={{ width: '100%', accentColor: '#00cc88' }} />
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Motion Intensity ({animMotionIntensity.toFixed(2)}) — subtle ↔ dramatic</label>
+                <input type="range" min={0} max={1} step={0.05} value={animMotionIntensity} onChange={e => setAnimMotionIntensity(+e.target.value)} style={{ width: '100%', accentColor: '#ff9900' }} />
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Strength Curve</label>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  {(['constant', 'ease_in', 'pulse'] as const).map(c => (
+                    <button key={c} onClick={() => setAnimStrengthCurve(c)} style={{
+                      flex: 1, padding: '5px', borderRadius: '6px', border: '1px solid',
+                      borderColor: animStrengthCurve === c ? '#b388ff' : '#333',
+                      backgroundColor: animStrengthCurve === c ? 'rgba(179,136,255,0.15)' : '#111',
+                      color: animStrengthCurve === c ? '#b388ff' : '#888',
+                      cursor: 'pointer', fontSize: '11px',
+                    }}>{c.replace('_', ' ')}</button>
+                  ))}
+                </div>
+              </div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
                 <div>
                   <label style={{ fontSize: '11px', color: '#888' }}>Width</label>
@@ -5512,6 +5575,28 @@ return (
                   rows={4} style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '11px', resize: 'vertical', fontFamily: 'inherit' }} />
               </div>
 
+              {/* Save State button */}
+              <button onClick={async () => {
+                try {
+                  const res = await fetch('http://localhost:8000/generate/animated/save', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      prompt: imageGenPrompt, negative_prompt: imageGenNegative, art_style: imageGenArtStyle,
+                      seed: imageGenSeed, num_frames: imageGenFrames, fps: imageGenFps,
+                      frame_strength: imageGenFrameStrength, width: imageGenWidth, height: imageGenHeight,
+                      steps: imageGenSteps, guidance_scale: imageGenCfg, output_format: imageGenOutputFormat,
+                      storyboard_descriptions: storyboardDescs ? storyboardDescs.split('\n').filter(Boolean) : [],
+                      reference_blend: animReferenceBlend, strength_curve: animStrengthCurve, motion_intensity: animMotionIntensity,
+                    }),
+                  });
+                  if (res.ok) { fetchAnimJobs(); }
+                } catch {}
+              }} disabled={!imageGenPrompt.trim()} style={{
+                width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #00cc8855',
+                backgroundColor: 'rgba(0,204,136,0.08)', color: '#00cc88', cursor: imageGenPrompt.trim() ? 'pointer' : 'not-allowed',
+                fontSize: '11px', fontWeight: 'bold',
+              }}>💾 Save State</button>
+
               {/* Animation jobs */}
               {animJobs.length > 0 && (
                 <div style={{ borderTop: '1px solid #222', paddingTop: '10px' }}>
@@ -5546,6 +5631,9 @@ return (
                           if (j.total_frames) setImageGenFrames(j.total_frames);
                           if (j.output_format) setImageGenOutputFormat(j.output_format);
                           if (j.storyboard?.length > 0) setStoryboardDescs(j.storyboard.join('\n'));
+                          if (j.reference_blend != null) setAnimReferenceBlend(j.reference_blend);
+                          if (j.strength_curve) setAnimStrengthCurve(j.strength_curve);
+                          if (j.motion_intensity != null) setAnimMotionIntensity(j.motion_intensity);
                         }} style={{ flex: 1, padding: '3px', borderRadius: '4px', border: '1px solid #333', backgroundColor: 'transparent', color: '#b388ff', cursor: 'pointer', fontSize: '9px' }}
                           title="Load this job's prompt and settings into the form">📋 Load</button>
                         {j.status !== 'complete' && (
@@ -5564,9 +5652,11 @@ return (
                             if (j.total_frames) setImageGenFrames(j.total_frames);
                             if (j.output_format) setImageGenOutputFormat(j.output_format);
                             if (j.storyboard?.length > 0) setStoryboardDescs(j.storyboard.join('\n'));
+                            if (j.reference_blend != null) setAnimReferenceBlend(j.reference_blend);
+                            if (j.strength_curve) setAnimStrengthCurve(j.strength_curve);
+                            if (j.motion_intensity != null) setAnimMotionIntensity(j.motion_intensity);
                             // Trigger resume generation
-                            setImageGenAnimated(true);
-                            setTimeout(() => handleImageGenerate(), 100);
+                            setTimeout(() => handleImageGenerate(true), 100);
                           }} style={{ flex: 1, padding: '3px', borderRadius: '4px', border: '1px solid #00cc88', backgroundColor: 'rgba(0,204,136,0.1)', color: '#00cc88', cursor: 'pointer', fontSize: '9px' }}
                             title="Resume generating from last frame">▶ Resume</button>
                         )}
@@ -5721,21 +5811,144 @@ return (
               )}
             </>)}
 
-            {/* Model management (always visible at bottom) */}
-            <div style={{ borderTop: '1px solid #222', paddingTop: '12px', marginTop: '4px' }}>
-              <h4 style={{ margin: '0 0 8px', fontSize: '12px', color: '#888' }}>Models</h4>
-              {imageModels.map(m => (
-                <div key={m.path} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '4px 0', fontSize: '11px', color: '#ccc' }}>
-                  <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {m.type === 'lora' ? '🔗 ' : '🧠 '}{m.name}
-                    <span style={{ color: '#666', marginLeft: '4px' }}>({m.size_mb}MB)</span>
-                  </span>
-                  <button onClick={() => deleteImageModel(m.path)} title="Delete model"
-                    style={{ background: 'none', border: 'none', color: '#ff4444', cursor: 'pointer', fontSize: '12px', padding: '2px 6px' }}>🗑</button>
+            {/* ──── Video sub-tab (WAN) ──── */}
+            {imageGenSubTab === 'video' && (<>
+              <div style={{ fontSize: '11px', color: '#888', lineHeight: '1.5' }}>
+                AI video generation using WAN 2.1. Supports text-to-video and image-to-video with dual-LoRA actions (high + low noise).
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Reference Image (optional — enables I2V mode)</label>
+                <input type="text" value={videoRefImage} onChange={e => setVideoRefImage(e.target.value)}
+                  placeholder="C:\path\to\reference.png (leave empty for text-to-video)"
+                  style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                <div>
+                  <label style={{ fontSize: '11px', color: '#888' }}>Frames ({videoFrames})</label>
+                  <input type="range" min={17} max={200} step={4} value={videoFrames} onChange={e => setVideoFrames(+e.target.value)} style={{ width: '100%', accentColor: '#b388ff' }} />
                 </div>
-              ))}
-              {imageModels.length === 0 && <div style={{ fontSize: '11px', color: '#555' }}>No models in models/</div>}
-              <div style={{ fontSize: '10px', color: '#555', marginTop: '6px' }}>Drop .safetensors into models/. LoRAs: models/loras/</div>
+                <div>
+                  <label style={{ fontSize: '11px', color: '#888' }}>FPS ({videoFps})</label>
+                  <input type="range" min={8} max={30} value={videoFps} onChange={e => setVideoFps(+e.target.value)} style={{ width: '100%', accentColor: '#b388ff' }} />
+                </div>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                <div>
+                  <label style={{ fontSize: '11px', color: '#888' }}>Width</label>
+                  <input type="number" value={imageGenWidth} onChange={e => setImageGenWidth(+e.target.value)} min={128} max={1280} step={16}
+                    style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+                </div>
+                <div>
+                  <label style={{ fontSize: '11px', color: '#888' }}>Height</label>
+                  <input type="number" value={imageGenHeight} onChange={e => setImageGenHeight(+e.target.value)} min={128} max={1280} step={16}
+                    style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+                </div>
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Steps ({videoSteps})</label>
+                <input type="range" min={10} max={50} value={videoSteps} onChange={e => setVideoSteps(+e.target.value)} style={{ width: '100%', accentColor: '#b388ff' }} />
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>CFG Scale ({videoCfg.toFixed(1)})</label>
+                <input type="range" min={1} max={15} step={0.5} value={videoCfg} onChange={e => setVideoCfg(+e.target.value)} style={{ width: '100%', accentColor: '#b388ff' }} />
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Action LoRA (auto-pairs high+low noise)</label>
+                <select value={videoActionLora} onChange={e => setVideoActionLora(e.target.value)}
+                  style={{ width: '100%', padding: '7px', borderRadius: '6px', backgroundColor: '#111', color: '#fff', border: '1px solid #333', fontSize: '12px' }}>
+                  <option value="">None</option>
+                  {actionLoras.map((l: any) => (
+                    <option key={l.name} value={l.name}>
+                      {l.noise_type === 'high_noise' ? '⬆ ' : l.noise_type === 'low_noise' ? '⬇ ' : ''}{l.name} ({l.size_mb}MB){l.has_pair ? ' [paired]' : ''}
+                    </option>
+                  ))}
+                </select>
+                <button onClick={async () => {
+                  try {
+                    const r = await fetch('http://localhost:8000/generate/video/action-loras');
+                    if (r.ok) { const d = await r.json(); setActionLoras(d.loras || []); }
+                  } catch {}
+                }} style={{ marginTop: '4px', padding: '3px 8px', borderRadius: '4px', border: '1px solid #555', backgroundColor: 'transparent', color: '#888', cursor: 'pointer', fontSize: '10px' }}>⟳ Refresh LoRAs</button>
+              </div>
+              <button onClick={async () => {
+                if (!imageGenPrompt.trim() || imageGenLoading) return;
+                setImageGenLoading(true);
+                setImageGenResult(null);
+                setIsVideoResult(false);
+                setMode('querying');
+                try {
+                  const res = await fetch('http://localhost:8000/generate/video', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      prompt: (tagRating ? tagRating + ', ' : '') + imageGenPrompt.trim(),
+                      image_path: videoRefImage || undefined,
+                      width: imageGenWidth, height: imageGenHeight,
+                      num_frames: videoFrames, fps: videoFps,
+                      steps: videoSteps, guidance_scale: videoCfg,
+                      seed: imageGenSeed,
+                      action_lora: videoActionLora || undefined,
+                      negative_prompt: imageGenNegative.trim() || undefined,
+                    }),
+                  });
+                  if (res.ok) {
+                    const ct = res.headers.get('content-type') ?? '';
+                    if (ct.includes('video')) {
+                      const blob = await res.blob();
+                      setIsVideoResult(true);
+                      setImageGenResult(URL.createObjectURL(blob));
+                    } else if (ct.includes('json')) {
+                      const data = await res.json();
+                      setImageGenResult(`Error: ${data.error || 'Unexpected response'}`);
+                    }
+                  } else {
+                    const err = await res.json().catch(() => ({}));
+                    setImageGenResult(`Error: ${err.error || 'Video generation failed'}`);
+                  }
+                } catch (e) {
+                  setImageGenResult(`Error: ${e}`);
+                } finally {
+                  setImageGenLoading(false);
+                  setMode('idle');
+                }
+              }} disabled={!imageGenPrompt.trim() || imageGenLoading} style={{
+                width: '100%', padding: '10px', borderRadius: '8px', border: 'none',
+                backgroundColor: imageGenLoading ? '#333' : '#7c4dff', color: '#fff',
+                cursor: imageGenLoading ? 'wait' : 'pointer', fontSize: '13px', fontWeight: 'bold',
+              }}>
+                {imageGenLoading ? '⏳ Generating Video...' : '🎥 Generate Video'}
+              </button>
+              <div style={{ fontSize: '10px', color: '#555', lineHeight: 1.4 }}>
+                Requires WAN 2.1 T2V (1.3B) model. First run will auto-download (~2.5GB).
+                Fits comfortably in 8GB VRAM. Supply an image for style reference.
+              </div>
+            </>)}
+
+            {/* Model management (collapsible) */}
+            <div style={{ borderTop: '1px solid #222', paddingTop: '12px', marginTop: '4px' }}>
+              <button onClick={() => setModelsExpanded(!modelsExpanded)} style={{
+                width: '100%', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                padding: '6px 8px', borderRadius: '6px', border: '1px solid #333',
+                backgroundColor: '#111', color: '#888', cursor: 'pointer', fontSize: '12px',
+              }}>
+                <span>🧠 Models ({imageModels.length})</span>
+                <span style={{ fontSize: '10px' }}>{modelsExpanded ? '▲' : '▼'}</span>
+              </button>
+              {modelsExpanded && (
+                <div style={{ marginTop: '6px' }}>
+                  {imageModels.map(m => (
+                    <div key={m.path} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '4px 0', fontSize: '11px', color: '#ccc' }}>
+                      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {m.type === 'lora' ? '🔗 ' : '🧠 '}{m.name}
+                        <span style={{ color: '#666', marginLeft: '4px' }}>({m.size_mb}MB)</span>
+                      </span>
+                      <button onClick={() => deleteImageModel(m.path)} title="Delete model"
+                        style={{ background: 'none', border: 'none', color: '#ff4444', cursor: 'pointer', fontSize: '12px', padding: '2px 6px' }}>🗑</button>
+                    </div>
+                  ))}
+                  {imageModels.length === 0 && <div style={{ fontSize: '11px', color: '#555' }}>No models in models/</div>}
+                  <div style={{ fontSize: '10px', color: '#555', marginTop: '6px' }}>Drop .safetensors into models/. LoRAs: models/loras/</div>
+                </div>
+              )}
             </div>
           </div>
 
@@ -5751,7 +5964,7 @@ return (
                 value={imageGenPrompt}
                 onChange={e => { setImageGenPrompt(e.target.value); updateTokenCount(e.target.value); }}
                 onBlur={() => fetchVocabExpansion(imageGenPrompt)}
-                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (imageGenSubTab === 'storyboard') handleStoryboardPreview(); else handleImageGenerate(); } }}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (imageGenSubTab === 'storyboard') handleStoryboardPreview(); else handleImageGenerate(imageGenSubTab === 'animate'); } }}
                 placeholder="Describe what to generate... (supports long prompts, no 77-token limit, use (word:1.5) for weighting)"
                 rows={3}
                 style={{
@@ -5763,9 +5976,10 @@ return (
               <button
                 disabled={!imageGenPrompt.trim() || imageGenLoading}
                 onClick={() => {
-                  if (imageGenSubTab === 'animate') { setImageGenAnimated(true); handleImageGenerate(); }
+                  if (imageGenSubTab === 'animate') { handleImageGenerate(true); }
                   else if (imageGenSubTab === 'storyboard') { handleStoryboardPreview(); }
-                  else { setImageGenAnimated(false); handleImageGenerate(); }
+                  else if (imageGenSubTab === 'video') { /* video has its own button */ }
+                  else { handleImageGenerate(false); }
                 }}
                 style={{
                   padding: '12px 24px', borderRadius: '10px', border: 'none',
@@ -5777,6 +5991,7 @@ return (
                 {imageGenLoading ? '⏳ Working...'
                   : imageGenSubTab === 'animate' ? '🎬 Animate'
                   : imageGenSubTab === 'storyboard' ? '📋 Sketch'
+                  : imageGenSubTab === 'video' ? '🎥 Video'
                   : '🎨 Generate'}
               </button>
               {imageGenSubTab === 'generate' && (
@@ -5873,6 +6088,86 @@ return (
               </div>
             )}
 
+            {/* GPU monitor + Generation progress */}
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              {/* GPU VRAM bar */}
+              {gpuInfo && (gpuInfo.vram_total_mb > 0 ? (
+                <div style={{
+                  flex: 1, minWidth: '180px', padding: '6px 10px', borderRadius: '8px',
+                  backgroundColor: '#0a0a14', border: `1px solid ${gpuInfo.vram_percent > 90 ? '#ff444466' : gpuInfo.vram_percent > 75 ? '#ff990033' : '#222'}`,
+                  fontSize: '10px',
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '3px' }}>
+                    <span style={{ color: '#888' }}>🖥 {gpuInfo.device_name || 'GPU'}</span>
+                    <span style={{ color: gpuInfo.vram_percent > 90 ? '#ff4444' : gpuInfo.vram_percent > 75 ? '#ff9900' : '#00cc88' }}>
+                      {gpuInfo.vram_used_mb.toFixed(0)} / {gpuInfo.vram_total_mb.toFixed(0)} MB ({gpuInfo.vram_percent.toFixed(1)}%)
+                    </span>
+                  </div>
+                  <div style={{ height: '4px', borderRadius: '2px', backgroundColor: '#1a1a2e', overflow: 'hidden' }}>
+                    <div style={{
+                      height: '100%', borderRadius: '2px', transition: 'width 0.5s, background 0.3s',
+                      width: `${gpuInfo.vram_percent}%`,
+                      background: gpuInfo.vram_percent > 90 ? '#ff4444' : gpuInfo.vram_percent > 75 ? '#ff9900' : '#00cc88',
+                    }} />
+                  </div>
+                </div>
+              ) : (
+                <div style={{
+                  flex: 1, minWidth: '180px', padding: '6px 10px', borderRadius: '8px',
+                  backgroundColor: '#0a0a14', border: '1px solid #222', fontSize: '10px',
+                }}>
+                  <span style={{ color: '#555' }}>🖥 {gpuInfo.device_name || 'GPU'} — {gpuInfo.error || (gpuInfo.available === false ? 'CUDA not available' : 'No VRAM data')}</span>
+                </div>
+              ))}
+              {/* Generation progress bar */}
+              {genProgress.active && (
+                <div style={{
+                  flex: 1, minWidth: '180px', padding: '6px 10px', borderRadius: '8px',
+                  backgroundColor: '#0a0a14', border: '1px solid #b388ff33',
+                  fontSize: '10px',
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '3px' }}>
+                    <span style={{ color: '#b388ff' }}>
+                      {genProgress.type === 'animation'
+                        ? `🎬 Frame ${genProgress.current_frame + 1}/${genProgress.total_frames}`
+                        : genProgress.type === 'video' ? '🎥 Video'
+                        : '🎨 Generating'}
+                    </span>
+                    <span style={{ color: '#aaa' }}>
+                      Step {genProgress.current_step}/{genProgress.total_steps}
+                      {genProgress.total_steps > 0 && ` (${Math.round(genProgress.current_step / genProgress.total_steps * 100)}%)`}
+                    </span>
+                  </div>
+                  <div style={{ height: '4px', borderRadius: '2px', backgroundColor: '#1a1a2e', overflow: 'hidden' }}>
+                    {genProgress.type === 'animation' ? (
+                      /* Two-layer bar: frame progress (outer) + step progress (inner shimmer) */
+                      <div style={{ height: '100%', display: 'flex' }}>
+                        <div style={{
+                          height: '100%', borderRadius: '2px', transition: 'width 0.3s',
+                          width: `${(genProgress.current_frame / Math.max(1, genProgress.total_frames)) * 100}%`,
+                          background: '#7c4dff',
+                        }} />
+                        <div style={{
+                          height: '100%', transition: 'width 0.3s',
+                          width: `${(genProgress.current_step / Math.max(1, genProgress.total_steps)) * (100 / Math.max(1, genProgress.total_frames))}%`,
+                          background: '#b388ff88',
+                        }} />
+                      </div>
+                    ) : (
+                      <div style={{
+                        height: '100%', borderRadius: '2px', transition: 'width 0.3s',
+                        width: `${genProgress.total_steps > 0 ? (genProgress.current_step / genProgress.total_steps * 100) : 0}%`,
+                        background: '#7c4dff',
+                      }} />
+                    )}
+                  </div>
+                  {genProgress.message && (
+                    <div style={{ color: '#666', marginTop: '2px', fontSize: '9px' }}>{genProgress.message}</div>
+                  )}
+                </div>
+              )}
+            </div>
+
             {/* Result area */}
             <div style={{
               flex: 1, backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '14px',
@@ -5942,6 +6237,16 @@ return (
               {!imageGenLoading && !previewLoading && imageGenResult && (
                 imageGenResult.startsWith('Error') ? (
                   <div style={{ padding: '20px', color: '#ff6666', fontSize: '14px' }}>{imageGenResult}</div>
+                ) : imageGenResult.startsWith('blob:') && isVideoResult ? (
+                  <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px', position: 'relative' }}>
+                    <video
+                      src={imageGenResult}
+                      controls
+                      autoPlay
+                      loop
+                      style={{ maxWidth: '100%', maxHeight: '100%', borderRadius: '8px', objectFit: 'contain' }}
+                    />
+                  </div>
                 ) : imageGenResult.startsWith('blob:') ? (
                   <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px', position: 'relative' }}>
                     <img

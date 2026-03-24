@@ -178,6 +178,20 @@ async def health_check():
     return {"status": "ok", "llm_connected": llm_ok, "llm_model": llm_model}
 
 
+@app.get("/system/gpu")
+async def gpu_info_endpoint():
+    """Return GPU VRAM stats (allocated, reserved, total, device name)."""
+    from agent.image_generation import get_gpu_info
+    return get_gpu_info()
+
+
+@app.get("/generate/progress")
+async def generation_progress_endpoint():
+    """Return real-time generation progress (step, frame, VRAM)."""
+    from agent.image_generation import get_generation_progress
+    return get_generation_progress()
+
+
 # ── Model management endpoints ────────────────────────────────────────────────
 
 @app.get("/models")
@@ -1971,6 +1985,9 @@ class AnimatedGenRequest(BaseModel):
     resume: bool = False
     output_format: str = "gif"   # "gif", "mp4", or "both"
     negative_prompt: Optional[str] = None
+    reference_blend: float = 0.3  # blend with frame 0 to prevent drift
+    strength_curve: str = "constant"  # "constant", "ease_in", "pulse"
+    motion_intensity: float = 0.5  # 0.0=subtle, 1.0=dramatic
 
 
 @app.post("/generate/animated")
@@ -2016,6 +2033,9 @@ async def generate_animated_endpoint(req: AnimatedGenRequest):
             lora_paths=lora_paths or None,
             lora_weights=req.lora_weights or None,
             negative_prompt=req.negative_prompt,
+            reference_blend=req.reference_blend,
+            strength_curve=req.strength_curve,
+            motion_intensity=req.motion_intensity,
         )
 
     result = await asyncio.to_thread(_gen)
@@ -2063,6 +2083,117 @@ async def cancel_generation_endpoint():
     """Cancel any running image/animation generation."""
     from agent.image_generation import cancel_generation
     return cancel_generation()
+
+
+class SaveAnimStateRequest(BaseModel):
+    prompt: str
+    negative_prompt: str = ""
+    art_style: str = ""
+    seed: int = -1
+    num_frames: int = 24
+    fps: int = 12
+    frame_strength: float = 0.35
+    width: int = 512
+    height: int = 768
+    steps: int = 25
+    guidance_scale: float = 7.0
+    output_format: str = "gif"
+    storyboard_descriptions: Optional[list[str]] = None
+    reference_blend: float = 0.3
+    strength_curve: str = "constant"
+    motion_intensity: float = 0.5
+
+
+@app.post("/generate/animated/save")
+async def save_animation_state_endpoint(req: SaveAnimStateRequest):
+    """Save current animation settings without generating."""
+    from agent.image_generation import save_animation_state
+    return save_animation_state(
+        prompt=req.prompt,
+        negative_prompt=req.negative_prompt,
+        art_style=req.art_style,
+        seed=req.seed,
+        num_frames=req.num_frames,
+        fps=req.fps,
+        frame_strength=req.frame_strength,
+        width=req.width,
+        height=req.height,
+        steps=req.steps,
+        guidance_scale=req.guidance_scale,
+        output_format=req.output_format,
+        storyboard_descriptions=req.storyboard_descriptions,
+        reference_blend=req.reference_blend,
+        strength_curve=req.strength_curve,
+        motion_intensity=req.motion_intensity,
+    )
+
+
+# ── WAN Video Generation ─────────────────────────────────────────────────
+
+class VideoGenRequest(BaseModel):
+    prompt: str
+    image_path: Optional[str] = None   # reference image for I2V mode
+    width: int = 480
+    height: int = 720
+    num_frames: int = 81
+    fps: int = 16
+    steps: int = 30
+    guidance_scale: float = 5.0
+    seed: int = -1
+    action_lora: Optional[str] = None  # keyword to match LoRA pair
+    negative_prompt: Optional[str] = None
+
+
+@app.post("/generate/video")
+async def generate_video_endpoint(req: VideoGenRequest):
+    """Generate a video using WAN 2.1 with optional dual-LoRA actions."""
+    _api_log.info("[API] /generate/video — prompt=%s, frames=%d", req.prompt[:60], req.num_frames)
+    from agent.image_generation import generate_video
+
+    def _gen():
+        return generate_video(
+            prompt=req.prompt,
+            image_path=req.image_path,
+            width=req.width,
+            height=req.height,
+            num_frames=req.num_frames,
+            fps=req.fps,
+            steps=req.steps,
+            guidance_scale=req.guidance_scale,
+            seed=req.seed,
+            action_lora=req.action_lora,
+            negative_prompt=req.negative_prompt,
+        )
+
+    result = await asyncio.to_thread(_gen)
+    if result.get("status") != "ok":
+        return result
+
+    from starlette.responses import FileResponse
+    import json as _json
+    response = FileResponse(result["path"], media_type="video/mp4", filename=Path(result["path"]).name)
+    response.headers["X-Video-Meta"] = _json.dumps({
+        "seed": result.get("seed"),
+        "num_frames": result.get("num_frames"),
+        "fps": result.get("fps"),
+        "action_loras": result.get("action_loras"),
+    })
+    return response
+
+
+@app.get("/generate/video/action-loras")
+async def list_action_loras_endpoint():
+    """List available action LoRAs with pair detection."""
+    from agent.image_generation import list_action_loras
+    return {"status": "ok", "loras": list_action_loras()}
+
+
+@app.post("/generate/video/flush")
+async def flush_wan_endpoint():
+    """Unload WAN pipeline from VRAM."""
+    from agent.image_generation import flush_wan_pipeline
+    flush_wan_pipeline()
+    return {"status": "ok", "message": "WAN pipeline flushed"}
 
 
 class RegenerateFrameRequest(BaseModel):

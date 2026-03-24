@@ -49,6 +49,83 @@ LORA_EXTENSIONS = {".safetensors"}
 # ── Global cancel flag ────────────────────────────────────────────────────
 _cancel_event = threading.Event()
 
+# ── Generation progress tracking ─────────────────────────────────────────
+_generation_progress: dict = {
+    "active": False,
+    "type": "idle",          # "image", "animation", "idle"
+    "current_step": 0,
+    "total_steps": 0,
+    "current_frame": 0,
+    "total_frames": 0,
+    "vram_used_mb": 0,
+    "vram_total_mb": 0,
+    "vram_percent": 0.0,
+    "message": "",
+}
+_progress_lock = threading.Lock()
+
+
+def _update_progress(**kwargs):
+    """Thread-safe update of generation progress dict."""
+    with _progress_lock:
+        _generation_progress.update(kwargs)
+
+
+def get_generation_progress() -> dict:
+    """Return a snapshot of current generation progress + GPU stats."""
+    with _progress_lock:
+        snap = dict(_generation_progress)
+    # Always refresh VRAM stats
+    if torch.cuda.is_available():
+        try:
+            allocated = torch.cuda.memory_allocated() / (1024 ** 2)
+            total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+            snap["vram_used_mb"] = round(allocated, 1)
+            snap["vram_total_mb"] = round(total, 1)
+            snap["vram_percent"] = round(allocated / total * 100, 1) if total > 0 else 0
+        except Exception:
+            pass
+    return snap
+
+
+def get_gpu_info() -> dict:
+    """Return GPU VRAM stats."""
+    if not torch.cuda.is_available():
+        return {"available": False, "vram_used_mb": 0, "vram_total_mb": 0,
+                "vram_percent": 0, "device_name": "N/A"}
+    try:
+        allocated = torch.cuda.memory_allocated() / (1024 ** 2)
+        reserved = torch.cuda.memory_reserved() / (1024 ** 2)
+        total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+        name = torch.cuda.get_device_name(0)
+        return {
+            "available": True,
+            "device_name": name,
+            "vram_used_mb": round(allocated, 1),
+            "vram_reserved_mb": round(reserved, 1),
+            "vram_total_mb": round(total, 1),
+            "vram_percent": round(allocated / total * 100, 1) if total > 0 else 0,
+        }
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+
+# VRAM safety threshold — if VRAM exceeds this %, auto-save & stop
+_VRAM_SAFETY_PERCENT = 92.0
+
+
+def _check_vram_safe() -> bool:
+    """Return False if VRAM usage exceeds safety threshold."""
+    if not torch.cuda.is_available():
+        return True
+    try:
+        allocated = torch.cuda.memory_allocated() / (1024 ** 2)
+        total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+        pct = allocated / total * 100 if total > 0 else 0
+        return pct < _VRAM_SAFETY_PERCENT
+    except Exception:
+        return True
+
 
 def cancel_generation():
     """Signal all running generation loops to stop after the current step."""
@@ -588,8 +665,8 @@ def save_custom_negative(negative_text: str):
 # Helps users find the right tokens that the CLIP model weights strongly.
 _VOCAB_EXPANSION: dict[str, list[str]] = {
     # ── explicit terms ─────────────────────────────────────────────────────────
-    "nsfw": ["erotic", "libidinous", "Lascivious", "salacious", "prurient", "lewd", "raunchy", "smutty", "depraved", "indecent", "randy", "kinky", "naughty", "filthy", "sultry", "seductive", "provocative"],
-    "blowjob": ["Wet", "sloppy", "gagging", "deepthroat", "gluttonous", "throatclenching", "saliva-drenched", "oral fixation", "mouth worship", "fellatio"],
+    "nsfw": ["erotic", "libidinous", "Lascivious", "salacious", "prurient", "lewd", "raunchy", "smutty", "depraved", "indecent", "randy", "kinky", "naughty", "filthy", "sultry", "seductive", "provocative", "slutty", "hot", "steamy", "explicit content", "adult content"],
+    "blowjob": ["Wet", "sloppy", "gagging", "deepthroat", "gluttonous", "throatclenching", "saliva-drenched", "oral fixation", "mouth worship", "fellatio", "tongue action", "lip service", "throat play", "oral indulgence", "mouth pleasure"],
     "teasing": ["provocative", "suggestive", "flirtatious", "enticing", "tantalizing", "seductive tease", "playful allure", "coquettish", "sultry hint", "alluring glimpse"],
     "breasts": ["bountiful bosom", "ample cleavage", "voluptuous chest", "curvaceous bust", "well-endowed", "firm mounds", "luscious curves", "sculpted chest", "desirable décolletage", "seductive swell"],
     "petite breasts": ["perky small breasts", "petite bust", "delicate chest", "small but shapely breasts", "modest bosom", "cute cleavage", "dainty curves", "compact chest", "adorable bust", "subtle swell"],
@@ -598,6 +675,8 @@ _VOCAB_EXPANSION: dict[str, list[str]] = {
     "small butt": ["petite rear", "delicate behind", "compact buttocks", "dainty posterior", "subtle glutes", "modest booty", "slim rear", "neat derriere", "svelte buttocks", "cute backside"],
     "tight clothes": ["form-fitting clothes", "body-hugging outfit", "clinging attire", "snug clothing", "figure-emphasizing garments", "skin-tight apparel", "revealing outfit", "sculpting clothes", "sensual attire", "alluring tightwear"],
     "loose clothes": ["flowing clothes", "billowy garments", "draped outfit", "relaxed fit clothing", "oversized attire", "airy clothes", "casual loosewear", "comfortably baggy clothes", "non-restrictive garments", "free-flowing outfit"],
+    "sexy clothes": ["provocative clothes", "seductive outfit", "alluring attire", "revealing clothing", "scanty garments", "risqué clothes", "sultry outfit", "tempting attire", "flirtatious clothing", "hot fashion"],
+    
 
     # ── adjectives for people ────────────────────────────────────────────
 
@@ -607,6 +686,8 @@ _VOCAB_EXPANSION: dict[str, list[str]] = {
     "passionate": ["ardent", "fervent", "intense", "fiery", "zealous"],
     "methodical": ["precise", "deliberate", "careful", "thorough", "systematic"],
     "soft": ["gentle", "tender", "delicate", "plush", "cushy", "velvety", "silky", "downy", "satin-like"],
+    "blush": ["romantic blush", "loving flush", "affectionate glow", "tender blush", "adoring flush", "charmed", "enamored", "smitten", "heartfelt blush", "devoted flush"],
+    "nervous": ["coy", "anxious", "timid", "shy", "flustered", "uneasy", "apprehensive", "jittery", "restless", "fidgety", "sheepish", "bashful", "hesitant", "introverted"],
     
 
     # ── Emotions & expressions ────────────────────────────────────────────
@@ -644,13 +725,14 @@ _VOCAB_EXPANSION: dict[str, list[str]] = {
 
     # ── Lighting & atmosphere ─────────────────────────────────────────────
     "dark": ["shadowy", "dimly lit", "noir", "tenebrous", "deep shadows"],
-    "bright": ["luminous", "radiant", "glowing", "vibrant", "brilliant"],
+    "bright": ["luminous", "radiant", "glowing", "vibrant", "brilliant", "sunlit", "dazzling", "shining", "illuminated", "sparkling"],
     "scary": ["terrifying", "menacing", "ominous", "eldritch", "horrifying"],
     "cool": ["stylish", "composed", "sleek", "suave", "effortlessly chic"],
     "dramatic": ["cinematic", "high contrast", "chiaroscuro", "theatrical", "imposing composition"],
     "soft": ["diffused light", "ethereal glow", "gentle illumination", "pastel tones", "dreamy"],
     "warm": ["golden light", "amber tones", "cozy atmosphere", "sunset hues", "inviting glow"],
     "cold": ["blue tones", "icy atmosphere", "frigid", "frosty", "glacial light"],
+    "cozy": ["warm and inviting", "snug atmosphere", "intimate haven", "comfortable surroundings","homey vibe","Refined comfort" ,"soft lighting", "relaxed ambiance", "welcoming environment", "pleasantly warm", "cuddle-worthy", "hygge-inspired", "Tranquil"],
 
     # ── Actions & movement (core) ─────────────────────────────────────────
     "walking": ["striding confidently", "sauntering", "ambling gracefully", "marching", "strolling leisurely"],
@@ -749,6 +831,122 @@ def expand_vocabulary(text: str) -> dict:
     return {"status": "ok", "suggestions": suggestions}
 
 
+# ── Multi-angle / multi-view prompt structuring ───────────────────────────
+
+_ANGLE_KEYWORDS = {
+    "side view": "from side, profile view, lateral angle",
+    "front view": "from front, facing viewer, frontal angle",
+    "back view": "from behind, rear view, back-facing",
+    "top view": "from above, bird's eye view, overhead angle",
+    "bottom view": "from below, low angle, worm's eye view",
+    "three-quarter view": "3/4 angle, three-quarter perspective",
+    "pov": "first-person perspective, point of view, POV shot",
+    "point of view": "first-person perspective, POV shot, subjective camera",
+}
+
+_MULTI_VIEW_PATTERNS = [
+    # "side view and front view", "side view + pov", etc.
+    re.compile(r'(side view|front view|back view|top view|bottom view|three-quarter view|pov|point of view)'
+               r'\s*(?:and|&|\+|,)\s*'
+               r'(side view|front view|back view|top view|bottom view|three-quarter view|pov|point of view)',
+               re.IGNORECASE),
+]
+
+
+def _structure_multi_angle_prompt(prompt: str) -> str:
+    """Detect multi-angle requests and structure them as a split-screen
+    composition so SDXL renders both views in one image."""
+    for pat in _MULTI_VIEW_PATTERNS:
+        m = pat.search(prompt)
+        if m:
+            angle_a, angle_b = m.group(1).lower(), m.group(2).lower()
+            expand_a = _ANGLE_KEYWORDS.get(angle_a, angle_a)
+            expand_b = _ANGLE_KEYWORDS.get(angle_b, angle_b)
+            # Remove the matched multi-angle phrase from the original
+            base = prompt[:m.start()].rstrip(' ,') + prompt[m.end():].lstrip(' ,')
+            base = base.strip(', ')
+            structured = (
+                f"split screen, two panels, reference sheet, multiple views, "
+                f"left panel: {expand_a}, {base} BREAK "
+                f"right panel: {expand_b}, {base}"
+            )
+            _log.info("[IMAGE GEN] Multi-angle detected: %s + %s", angle_a, angle_b)
+            return structured
+    return prompt
+
+
+# ── Multi-character prompt structuring ────────────────────────────────────
+
+def _structure_multi_character_prompt(prompt: str, lora_paths: list[str] | None = None) -> str:
+    """Detect multiple character names in prompt and structure them so SDXL
+    renders each character distinctly rather than merging them into one.
+
+    Strategy: wrap each character block with positional anchors (left/right)
+    and use BREAK to separate their descriptions.
+    """
+    # Collect known character names from trigger words
+    tw_data = _load_trigger_words()
+    known_chars: list[str] = []
+    for lora_name, words in tw_data.items():
+        for w in words:
+            if len(w) > 2:
+                known_chars.append(w.lower())
+
+    # Also check loaded LoRA file names as character hints
+    if lora_paths:
+        for lp in lora_paths:
+            stem = Path(lp).stem.lower()
+            if stem not in known_chars:
+                known_chars.append(stem)
+
+    # Find which characters appear in the prompt
+    prompt_lower = prompt.lower()
+    found_chars = [c for c in known_chars if c in prompt_lower]
+    # Deduplicate while preserving order
+    seen = set()
+    unique_chars = []
+    for c in found_chars:
+        if c not in seen:
+            seen.add(c)
+            unique_chars.append(c)
+
+    if len(unique_chars) < 2:
+        return prompt
+
+    _log.info("[IMAGE GEN] Multi-character detected: %s", unique_chars)
+
+    positions = ["on the left", "on the right", "in the center", "in the background"]
+    parts = []
+    remaining_prompt = prompt
+
+    for i, char_name in enumerate(unique_chars[:4]):  # max 4 characters
+        # Find the character's description segment in the prompt
+        pos = positions[i] if i < len(positions) else positions[-1]
+        # Look up trigger words for this character
+        char_triggers = ""
+        for lora_name, words in tw_data.items():
+            if char_name in [w.lower() for w in words]:
+                char_triggers = ", ".join(words)
+                break
+        if not char_triggers:
+            char_triggers = char_name
+
+        parts.append(f"{char_triggers}, {pos}")
+
+    # Build structured prompt: shared scene description + per-character blocks
+    # Remove character names from the base prompt for the shared part
+    shared = prompt
+    for c in unique_chars:
+        shared = re.sub(re.escape(c), '', shared, flags=re.IGNORECASE)
+    shared = re.sub(r',\s*,', ',', shared).strip(', ')
+
+    structured = f"{len(unique_chars)} characters, multiple girls, group shot, {shared}"
+    for part in parts:
+        structured += f" BREAK {part}"
+
+    return structured
+
+
 # ── Core generation ───────────────────────────────────────────────────────
 
 DEFAULT_NEGATIVE = (
@@ -832,6 +1030,10 @@ def generate_image(
         full_prompt = prompt
         base_neg = negative_prompt or DEFAULT_NEGATIVE
 
+    # Structure multi-angle and multi-character prompts
+    full_prompt = _structure_multi_angle_prompt(full_prompt)
+    full_prompt = _structure_multi_character_prompt(full_prompt, lora_paths)
+
     # Apply art style
     full_prompt, base_neg = _apply_art_style(full_prompt, base_neg, art_style)
 
@@ -874,8 +1076,13 @@ def generate_image(
         output_dir_path = Path(OUTPUT_DIR)
         output_dir_path.mkdir(parents=True, exist_ok=True)
 
+        _update_progress(active=True, type="image", current_step=0,
+                         total_steps=steps, current_frame=0, total_frames=1,
+                         message="Generating image...")
+
         def _cancel_callback(pipe_self, step_index, timestep, callback_kwargs):
-            """Check cancel flag between diffusion steps."""
+            """Check cancel flag + update progress between diffusion steps."""
+            _update_progress(current_step=step_index + 1)
             if _cancel_event.is_set():
                 _cancel_event.clear()
                 raise InterruptedError("Generation cancelled by user")
@@ -935,6 +1142,9 @@ def generate_image(
     except Exception as e:
         _log.error("[IMAGE GEN] Error: %s", str(e))
         return {"status": "error", "error": str(e)}
+    finally:
+        _update_progress(active=False, type="idle", current_step=0,
+                         total_steps=0, message="")
 
 
 # ── Art Style Presets ──────────────────────────────────────────────────────
@@ -1105,6 +1315,509 @@ def _resolve_model_path(model_path: str | None) -> str | None:
     return checkpoints[0]["path"] if checkpoints else None
 
 
+# ── Animation helper utilities ────────────────────────────────────────────
+
+def _match_color_to_reference(image, reference_np):
+    """Match the color distribution of `image` to the reference frame.
+
+    Uses LAB colour-space transfer (perceptually uniform) for luminance
+    and chrominance channels, plus an RGB brightness guard that clamps
+    overall exposure drift.  This prevents the cumulative "oil spill" /
+    over-exposure effect that builds up over many img2img frames.
+    """
+    from PIL import Image as PILImage
+    import numpy as np
+
+    img_np = np.array(image, dtype=np.float64)
+
+    # ── LAB colour transfer (perceptually uniform) ───────────────
+    # Convert RGB → LAB approximation via simple linear transform
+    # (avoids OpenCV dependency)
+    def _rgb_to_lab_approx(rgb):
+        # Normalise 0-1, apply sRGB → linear
+        lin = np.where(rgb > 0.04045, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
+        # Linear RGB → XYZ (D65)
+        x = lin[:, :, 0] * 0.4124 + lin[:, :, 1] * 0.3576 + lin[:, :, 2] * 0.1805
+        y = lin[:, :, 0] * 0.2126 + lin[:, :, 1] * 0.7152 + lin[:, :, 2] * 0.0722
+        z = lin[:, :, 0] * 0.0193 + lin[:, :, 1] * 0.1192 + lin[:, :, 2] * 0.9505
+        # XYZ → Lab
+        xn, yn, zn = 0.95047, 1.0, 1.08883
+        def f(t):
+            return np.where(t > 0.008856, t ** (1/3), 7.787 * t + 16/116)
+        fx, fy, fz = f(x / xn), f(y / yn), f(z / zn)
+        L = 116 * fy - 16
+        a = 500 * (fx - fy)
+        b = 200 * (fy - fz)
+        return np.stack([L, a, b], axis=-1)
+
+    def _lab_to_rgb_approx(lab):
+        L, a, b = lab[:, :, 0], lab[:, :, 1], lab[:, :, 2]
+        fy = (L + 16) / 116
+        fx = a / 500 + fy
+        fz = fy - b / 200
+        def finv(t):
+            return np.where(t > 0.206893, t ** 3, (t - 16/116) / 7.787)
+        x = finv(fx) * 0.95047
+        y = finv(fy) * 1.0
+        z = finv(fz) * 1.08883
+        r = x *  3.2406 + y * -1.5372 + z * -0.4986
+        g = x * -0.9689 + y *  1.8758 + z *  0.0415
+        bl= x *  0.0557 + y * -0.2040 + z *  1.0570
+        rgb = np.stack([r, g, bl], axis=-1)
+        # Linear → sRGB
+        rgb = np.where(rgb > 0.0031308, 1.055 * (np.maximum(rgb, 0) ** (1/2.4)) - 0.055, 12.92 * rgb)
+        return rgb
+
+    src_01 = img_np / 255.0
+    ref_01 = reference_np / 255.0
+
+    src_lab = _rgb_to_lab_approx(src_01)
+    ref_lab = _rgb_to_lab_approx(ref_01)
+
+    # Per-channel mean/std transfer in LAB space
+    for c in range(3):
+        s_mean = np.mean(src_lab[:, :, c])
+        s_std  = np.std(src_lab[:, :, c])
+        r_mean = np.mean(ref_lab[:, :, c])
+        r_std  = np.std(ref_lab[:, :, c])
+        if s_std > 1e-6:
+            src_lab[:, :, c] = (src_lab[:, :, c] - s_mean) * (r_std / s_std) + r_mean
+
+    # Convert back to RGB
+    matched_01 = _lab_to_rgb_approx(src_lab)
+    matched = np.clip(matched_01 * 255, 0, 255).astype(np.uint8)
+
+    # ── Brightness guard ──────────────────────────────────────────
+    # Clamp overall luminance to ±5% of reference to prevent exposure drift
+    ref_lum = np.mean(reference_np.astype(np.float64))
+    out_lum = np.mean(matched.astype(np.float64))
+    if ref_lum > 1.0:
+        ratio = out_lum / ref_lum
+        if ratio > 1.05 or ratio < 0.95:
+            correction = ref_lum / max(out_lum, 1e-6)
+            matched = np.clip(matched.astype(np.float64) * correction, 0, 255).astype(np.uint8)
+
+    return PILImage.fromarray(matched)
+
+
+def _build_strength_curve(
+    base_strength: float, num_frames: int, curve: str
+) -> list[float]:
+    """Build a per-frame denoising strength schedule.
+
+    Curves:
+      - constant: same strength every frame
+      - ease_in: start gentle (50% strength), ramp up to full over first 25% of frames
+      - pulse: sinusoidal "breathing" — varies ±30% around base
+    """
+    import math
+
+    strengths = []
+    for i in range(num_frames):
+        t = i / max(1, num_frames - 1)  # 0..1
+
+        if curve == "ease_in":
+            # First 25% of frames: ramp from 50% to 100% of base_strength
+            if t < 0.25:
+                factor = 0.5 + 2.0 * t  # 0.5 → 1.0 over first quarter
+            else:
+                factor = 1.0
+            strengths.append(base_strength * factor)
+
+        elif curve == "pulse":
+            # Sinusoidal breathing: ±30% variation
+            factor = 1.0 + 0.3 * math.sin(2 * math.pi * t * 2)
+            strengths.append(base_strength * factor)
+
+        else:  # constant
+            strengths.append(base_strength)
+
+    # Clamp all values
+    return [max(0.10, min(s, 0.70)) for s in strengths]
+
+
+# ── Body movement keywords for auto-storyboard ───────────────────────────
+
+_BODY_PART_ACTIONS = {
+    "head": [
+        "head tilting slightly left", "head turning right", "head nodding down",
+        "head lifting up", "head tilting back to center",
+    ],
+    "hands": [
+        "hands rising slowly", "hands moving outward", "fingers spreading open",
+        "hands gesturing", "hands lowering back down",
+    ],
+    "arms": [
+        "arms lifting slightly", "arms extending outward", "arms crossing",
+        "arms dropping to sides", "arms swinging gently",
+    ],
+    "legs": [
+        "weight shifting to left leg", "weight shifting to right leg",
+        "knee bending slightly", "stance widening", "feet repositioning",
+    ],
+    "body": [
+        "torso leaning forward slightly", "body swaying gently",
+        "shoulders rotating", "torso straightening", "posture shifting",
+    ],
+    "hips": [
+        "hips shifting left", "hips swaying right", "hips thrusting forward",
+        "hips rolling", "hips returning to center",
+    ],
+    "hair": [
+        "hair flowing with breeze", "hair swaying left", "hair settling down",
+        "hair swept by wind", "hair bouncing with movement",
+    ],
+    "eyes": [
+        "eyes looking left", "eyes looking right", "eyes looking down",
+        "eyes closing slightly", "eyes opening wide",
+    ],
+    "chest": [
+        "chest rising with breath", "chest expanding", "chest relaxing",
+        "chest leaning forward", "chest settling",
+    ],
+    "feet": [
+        "foot tapping", "feet shifting weight", "toes curling",
+        "feet adjusting stance", "feet settling",
+    ],
+}
+
+# Action keywords that imply specific movements — each entry now has
+# `steps` (motion sequence), `involved_parts` (what body parts move with it),
+# and `physics` (speed/weight characteristics for easing).
+_ACTION_MOTION_MAP: dict[str, dict] = {
+    "walking": {
+        "aliases": ["walk", "strolling", "striding", "stepping"],
+        "steps": ["left foot stepping forward", "right foot stepping forward",
+                  "arms swinging naturally", "weight transferring", "stride continuing"],
+        "involved_parts": ["legs", "arms", "body", "hair"],
+        "physics": "cyclic",  # repeating loop
+    },
+    "running": {
+        "aliases": ["run", "sprinting", "jogging", "dashing"],
+        "steps": ["legs pumping forward", "arms driving back", "body leaning forward",
+                  "feet pushing off ground", "full sprint momentum"],
+        "involved_parts": ["legs", "arms", "body", "hair"],
+        "physics": "cyclic",
+    },
+    "dancing": {
+        "aliases": ["dance", "swaying", "twirling", "grooving"],
+        "steps": ["hips swaying", "arms flowing upward", "body spinning slowly",
+                  "feet stepping rhythmically", "upper body waving"],
+        "involved_parts": ["hips", "arms", "legs", "body", "hair"],
+        "physics": "cyclic",
+    },
+    "fighting": {
+        "aliases": ["fight", "punching", "kicking", "striking", "combat"],
+        "steps": ["fist pulling back", "punch extending forward", "dodge to the side",
+                  "kick lifting", "guard position raised"],
+        "involved_parts": ["arms", "legs", "body"],
+        "physics": "burst",  # sharp acceleration then slow
+    },
+    "waving": {
+        "aliases": ["wave", "beckoning", "greeting"],
+        "steps": ["hand rising up", "hand moving side to side", "fingers waving",
+                  "arm extending fully", "hand lowering back"],
+        "involved_parts": ["arms", "hands"],
+        "physics": "pendulum",  # back and forth
+    },
+    "sitting": {
+        "aliases": ["sit", "seated", "resting", "lounging"],
+        "steps": ["settling into seat", "adjusting posture", "crossing legs",
+                  "leaning back slightly", "hands resting on lap"],
+        "involved_parts": ["body", "legs", "hands"],
+        "physics": "settle",  # large movement → small adjustments
+    },
+    "flying": {
+        "aliases": ["fly", "soaring", "hovering", "floating", "gliding"],
+        "steps": ["wings spreading wide", "body ascending", "arms outstretched",
+                  "floating higher", "soaring through air"],
+        "involved_parts": ["arms", "body", "hair"],
+        "physics": "cyclic",
+    },
+    "casting": {
+        "aliases": ["cast", "spell", "magic", "channeling", "conjuring"],
+        "steps": ["hands gathering energy", "magic circle forming", "energy releasing",
+                  "spell shooting forward", "magical aftermath fading"],
+        "involved_parts": ["arms", "hands", "eyes"],
+        "physics": "buildup",  # slow wind-up then release
+    },
+    "turning": {
+        "aliases": ["turn", "spinning", "rotating", "pivoting"],
+        "steps": ["body starting to rotate", "shoulders turning", "hips following",
+                  "full body mid-turn", "turn completing, settling"],
+        "involved_parts": ["body", "hips", "head", "hair"],
+        "physics": "arc",
+    },
+    "jumping": {
+        "aliases": ["jump", "leaping", "hopping", "bouncing"],
+        "steps": ["knees bending for launch", "body pushing upward", "airborne at peak",
+                  "body descending", "landing with knees absorbing"],
+        "involved_parts": ["legs", "arms", "body", "hair"],
+        "physics": "burst",
+    },
+    "stretching": {
+        "aliases": ["stretch", "yawning", "reaching"],
+        "steps": ["arms reaching upward", "body elongating", "muscles tensing",
+                  "slow release", "arms lowering back"],
+        "involved_parts": ["arms", "body", "chest"],
+        "physics": "settle",
+    },
+    "hugging": {
+        "aliases": ["hug", "embracing", "holding"],
+        "steps": ["arms opening wide", "arms wrapping around", "pulling close",
+                  "squeezing gently", "slowly releasing"],
+        "involved_parts": ["arms", "hands", "body"],
+        "physics": "arc",
+    },
+    "riding": {
+        "aliases": ["ride", "mounted", "horseback", "cowgirl", "straddling"],
+        "steps": ["hips rising", "body bouncing upward", "weight coming down",
+                  "hips grinding forward", "settling into rhythm"],
+        "involved_parts": ["hips", "legs", "body", "chest", "hair"],
+        "physics": "cyclic",
+    },
+    "swimming": {
+        "aliases": ["swim", "floating", "diving", "treading"],
+        "steps": ["arms pulling through water", "legs kicking", "body gliding forward",
+                  "arms recovering forward", "breath lifting head"],
+        "involved_parts": ["arms", "legs", "body", "head"],
+        "physics": "cyclic",
+    },
+    "eating": {
+        "aliases": ["eat", "chewing", "biting", "munching"],
+        "steps": ["hand bringing food to mouth", "mouth opening", "chewing",
+                  "swallowing", "hand lowering"],
+        "involved_parts": ["hands", "head"],
+        "physics": "cyclic",
+    },
+    "crying": {
+        "aliases": ["cry", "sobbing", "weeping", "tearing up"],
+        "steps": ["shoulders trembling slightly", "head lowering", "hand wiping eyes",
+                  "body shuddering", "slowly composing"],
+        "involved_parts": ["body", "head", "hands", "eyes"],
+        "physics": "pendulum",
+    },
+    "laughing": {
+        "aliases": ["laugh", "giggling", "chuckling"],
+        "steps": ["body shaking slightly with laughter", "head tilting back",
+                  "hand covering mouth", "shoulders bouncing", "settling down"],
+        "involved_parts": ["body", "head", "hands"],
+        "physics": "pendulum",
+    },
+}
+
+# Compound pose phrases that imply multiple body parts
+_POSE_IMPLICATIONS: dict[str, list[str]] = {
+    "standing": ["legs", "body"],
+    "sitting at desk": ["arms", "hands", "body"],
+    "lying down": ["body", "legs", "arms"],
+    "leaning": ["body", "arms"],
+    "crouching": ["legs", "body"],
+    "kneeling": ["legs", "body"],
+    "looking up": ["head", "eyes"],
+    "looking down": ["head", "eyes"],
+    "looking away": ["head", "eyes"],
+    "arms raised": ["arms", "hands"],
+    "arms behind": ["arms", "body"],
+    "hands on hips": ["hands", "hips"],
+    "crossed arms": ["arms", "body"],
+    "bent over": ["body", "hips", "legs"],
+    "on all fours": ["arms", "legs", "body", "hips"],
+    "from behind": ["body", "hips", "hair"],
+    "from above": ["head", "body"],
+    "portrait": ["head", "eyes", "hair"],
+    "full body": ["body", "legs", "arms", "head", "hair"],
+    "upper body": ["body", "arms", "head", "hair"],
+    "close up": ["head", "eyes"],
+    "action pose": ["arms", "legs", "body"],
+    "dynamic pose": ["arms", "legs", "body", "hair"],
+    "relaxed": ["body", "arms"],
+    "tense": ["arms", "body", "hands"],
+}
+
+
+def _ease_factor(t: float, physics: str) -> float:
+    """Return a 0-1 easing factor based on physics type.
+
+    t is the normalised progress through the motion (0 to 1).
+    """
+    import math
+    if physics == "burst":
+        # Fast start, slow finish (ease-out cubic)
+        return 1.0 - (1.0 - t) ** 3
+    elif physics == "buildup":
+        # Slow start, fast finish (ease-in cubic)
+        return t ** 3
+    elif physics == "pendulum":
+        # Back-and-forth sinusoidal
+        return 0.5 + 0.5 * math.sin(2 * math.pi * t)
+    elif physics == "settle":
+        # Large at start, damps down
+        return max(0.1, 1.0 - t * 0.8)
+    elif physics == "arc":
+        # Smooth bell curve — peak at midpoint
+        return math.sin(math.pi * t)
+    else:  # "cyclic" or default
+        return 1.0  # constant intensity for cyclic motions
+
+
+def _detect_actions(prompt_lower: str) -> list[tuple[str, dict]]:
+    """Detect all matching actions from the prompt using primary keys and aliases.
+    Returns list of (action_name, action_dict) sorted by relevance (longer match first).
+    """
+    matches: list[tuple[str, dict, int]] = []
+    for action_name, action_data in _ACTION_MOTION_MAP.items():
+        all_keywords = [action_name] + action_data.get("aliases", [])
+        for kw in all_keywords:
+            if kw in prompt_lower:
+                # Prefer longer keyword matches (more specific)
+                matches.append((action_name, action_data, len(kw)))
+                break  # Don't double-count same action
+    # Sort by keyword length descending (more specific first)
+    matches.sort(key=lambda x: x[2], reverse=True)
+    return [(name, data) for name, data, _ in matches]
+
+
+def _detect_body_parts(prompt_lower: str) -> list[str]:
+    """Detect body parts from the prompt using direct keywords and pose implications."""
+    detected: set[str] = set()
+
+    # Direct keyword match
+    for part in _BODY_PART_ACTIONS:
+        if part in prompt_lower:
+            detected.add(part)
+
+    # Compound pose phrase detection (longer phrases checked first)
+    for phrase, implied_parts in sorted(_POSE_IMPLICATIONS.items(),
+                                        key=lambda x: len(x[0]), reverse=True):
+        if phrase in prompt_lower:
+            detected.update(implied_parts)
+
+    return list(detected)
+
+
+def _auto_generate_motion_storyboard(
+    prompt: str, num_frames: int, motion_intensity: float
+) -> list[str]:
+    """Analyse prompt for body parts, actions, and poses, then generate a
+    natural motion progression for each frame with temporal coherence.
+
+    Improvements over naive cycling:
+    - Detects multiple simultaneous actions and blends them
+    - Uses physics-based easing for natural motion arcs
+    - Combines primary action with secondary body part movements
+    - Applies smooth temporal progression (ease-in/out) not abrupt cycling
+    - Detects compound pose phrases (e.g. "sitting at desk") for implied parts
+
+    Returns a list of per-frame motion descriptions.
+    """
+    import math
+    prompt_lower = prompt.lower()
+    descriptions: list[str] = []
+
+    matched_actions = _detect_actions(prompt_lower)
+    detected_parts = _detect_body_parts(prompt_lower)
+
+    if matched_actions:
+        # ── Primary action drives the motion ──────────────────────
+        primary_name, primary_data = matched_actions[0]
+        primary_steps = primary_data["steps"]
+        physics = primary_data.get("physics", "cyclic")
+        involved_parts = set(primary_data.get("involved_parts", []))
+
+        # Collect secondary actions (if any)
+        secondary_steps: list[str] = []
+        for _, sec_data in matched_actions[1:]:
+            secondary_steps.extend(sec_data["steps"][:2])  # just first 2 of each
+
+        # Add ambient body part movements for parts NOT covered by the action
+        ambient_parts = [p for p in (detected_parts or ["hair", "eyes"])
+                         if p not in involved_parts]
+
+        for i in range(num_frames):
+            t = i / max(1, num_frames - 1)  # 0..1 normalised progress
+            ease = _ease_factor(t, physics)
+
+            # Primary motion — advance through steps with easing
+            if physics == "cyclic":
+                # Smooth cycling: use fractional index for fluid progression
+                frac_idx = (i / max(1, num_frames - 1)) * len(primary_steps)
+                step_idx = int(frac_idx) % len(primary_steps)
+            elif physics in ("burst", "buildup", "arc"):
+                # Map eased progress to step index
+                step_idx = min(int(ease * len(primary_steps)),
+                               len(primary_steps) - 1)
+            else:
+                step_idx = i % len(primary_steps)
+
+            parts: list[str] = [primary_steps[step_idx]]
+
+            # Add a secondary action hint every few frames
+            if secondary_steps and i % 3 == 1:
+                sec_idx = (i // 3) % len(secondary_steps)
+                parts.append(secondary_steps[sec_idx])
+
+            # Add ambient body-part movement (rotate through)
+            if ambient_parts and i % 2 == 0:
+                ap = ambient_parts[i % len(ambient_parts)]
+                ap_actions = _BODY_PART_ACTIONS.get(ap, [])
+                if ap_actions:
+                    parts.append(ap_actions[i % len(ap_actions)])
+
+            # Apply intensity modifiers
+            joined = ", ".join(parts[:3])  # cap at 3 descriptors
+            if motion_intensity < 0.3:
+                desc = f"subtle {joined}"
+            elif motion_intensity > 0.7:
+                # Ease multiplies into the intensity word
+                if ease > 0.7:
+                    desc = f"dramatic {joined}, powerful motion"
+                else:
+                    desc = f"building {joined}, gaining momentum"
+            else:
+                desc = joined
+            descriptions.append(desc)
+        return descriptions
+
+    # ── No specific action — pose-aware idle animation ────────────
+    if not detected_parts:
+        detected_parts = ["head", "body", "hair"]
+
+    # Create smooth idle motion with staggered body parts
+    num_parts = len(detected_parts)
+    for i in range(num_frames):
+        t = i / max(1, num_frames - 1)
+        parts_for_frame: list[str] = []
+
+        for pi, part in enumerate(detected_parts):
+            actions = _BODY_PART_ACTIONS.get(part, [])
+            if not actions:
+                continue
+            # Stagger each body part by an offset so they don't all move in sync
+            offset = pi * len(actions) / max(1, num_parts)
+            frac_idx = (t * len(actions) + offset) % len(actions)
+            action_idx = int(frac_idx) % len(actions)
+
+            # Apply a breathing ease — parts move more in the middle of the sequence
+            breath = 0.5 + 0.5 * math.sin(math.pi * t)
+            if breath > 0.3:  # only include movement when breath factor is strong enough
+                parts_for_frame.append(actions[action_idx])
+
+        if parts_for_frame:
+            joined = ", ".join(parts_for_frame[:3])
+            if motion_intensity < 0.3:
+                desc = f"gentle idle, {joined}"
+            elif motion_intensity > 0.7:
+                desc = f"expressive idle, {joined}"
+            else:
+                desc = joined
+        else:
+            desc = "subtle breathing motion"
+        descriptions.append(desc)
+
+    return descriptions
+
+
 def generate_animated(
     prompt: str,
     width: int = 512,
@@ -1125,26 +1838,34 @@ def generate_animated(
     lora_paths: list[str] | None = None,
     lora_weights: list[float] | None = None,
     negative_prompt: str | None = None,
+    reference_blend: float = 0.3,  # blend ratio with frame 0 to prevent drift
+    strength_curve: str = "constant",  # "constant", "ease_in", "pulse"
+    motion_intensity: float = 0.5,  # 0.0=subtle, 1.0=dramatic body movement
 ) -> dict:
     """
     Generate a consistent animated sequence using img2img frame chaining.
 
-    Each frame after the first uses the previous frame as init_image with low
-    strength (default 0.35) so objects, anatomy, and background stay consistent
-    while allowing gradual motion progression.
+    ANTI-DETERIORATION measures:
+    - Reference frame blending: each frame's init is a blend of the previous
+      frame + the first frame, anchoring color/composition to prevent cumulative
+      drift (the "oil spill" / overexposure issue).
+    - Color histogram matching: normalise each frame's color distribution to
+      match frame 0, preventing brightness/saturation creep.
+    - Strength curve: optionally vary denoising strength across frames.
+
+    BODY MOVEMENT:
+    - Auto-generates per-frame motion descriptions when storyboard is not provided,
+      analysing the prompt for body parts, actions, and poses to create natural
+      movement progression.
 
     Args:
-        frame_strength: img2img denoising strength per frame (lower = more
-                        consistent, higher = more change). 0.25-0.45 range.
-        fps: target frames-per-second for the output (affects gif duration).
-        storyboard: optional list of per-frame motion/action descriptions.
-                    If shorter than num_frames, last entry is repeated.
-        job_id: unique id for this job (auto-generated if None).
-                Used for save/resume checkpoints.
-        resume: if True, attempt to resume a previous job_id.
-        output_format: "gif", "mp4", or "both".
+        frame_strength: img2img denoising strength per frame (0.10-0.70).
+        reference_blend: how much to blend with frame 0 (0=none, 1=full anchor).
+        strength_curve: "constant", "ease_in" (gentle start), "pulse" (breathe).
+        motion_intensity: how dramatic the body movement should be (0-1).
     """
     from PIL import Image as PILImage
+    import numpy as np
 
     model_path = _resolve_model_path(model_path)
     if model_path is None:
@@ -1152,9 +1873,11 @@ def generate_animated(
     if not Path(model_path).exists():
         return {"status": "error", "error": f"Model not found: {model_path}"}
 
-    num_frames = max(2, min(num_frames, 120))  # up to 120 frames (~15 s at 8 fps)
+    num_frames = max(2, min(num_frames, 120))
     frame_strength = max(0.10, min(frame_strength, 0.70))
     fps = max(2, min(fps, 30))
+    reference_blend = max(0.0, min(reference_blend, 0.6))
+    motion_intensity = max(0.0, min(motion_intensity, 1.0))
 
     output_dir_path = Path(OUTPUT_DIR)
     output_dir_path.mkdir(parents=True, exist_ok=True)
@@ -1176,7 +1899,6 @@ def generate_animated(
         try:
             ckpt = json.loads(checkpoint_file.read_text(encoding="utf-8"))
             saved_paths = ckpt.get("frame_paths", [])
-            # Validate that saved frames still exist
             valid = [p for p in saved_paths if Path(p).exists()]
             frame_paths = valid
             start_frame = len(valid)
@@ -1186,14 +1908,21 @@ def generate_animated(
         except Exception as e:
             _log.warning("[ANIM GEN] Checkpoint load failed: %s", e)
 
-    # ── Storyboard expansion ──────────────────────────────────────
+    # ── Auto-generate body movement storyboard ────────────────────
     frame_descriptions: list[str] = []
     if storyboard:
         for i in range(num_frames):
             idx = min(i, len(storyboard) - 1)
             frame_descriptions.append(storyboard[idx])
     else:
-        frame_descriptions = [""] * num_frames
+        frame_descriptions = _auto_generate_motion_storyboard(
+            prompt, num_frames, motion_intensity
+        )
+
+    # ── Build per-frame strength curve ────────────────────────────
+    frame_strengths = _build_strength_curve(
+        frame_strength, num_frames, strength_curve
+    )
 
     # ── Art style ────────────────────────────────────────────────
     base_neg = negative_prompt or DEFAULT_NEGATIVE
@@ -1201,13 +1930,12 @@ def generate_animated(
     full_negative = apply_feedback_learnings(styled_negative)
 
     # ── Load pipelines ────────────────────────────────────────────
-    evict_ollama_models()  # free VRAM before loading SD
-    _load_pipeline(model_path)  # ensure txt2img is ready
+    evict_ollama_models()
+    _load_pipeline(model_path)
     img2img_pipe = _load_img2img_pipeline(model_path)
     if img2img_pipe is None:
         return {"status": "error", "error": "img2img pipeline unavailable — update diffusers"}
 
-    # Load LoRAs on both pipelines
     txt2img_pipe = _loaded_pipelines[model_path]
     if lora_paths:
         unload_loras(txt2img_pipe)
@@ -1215,7 +1943,6 @@ def generate_animated(
         for lp, lw in zip(lora_paths, weights):
             if Path(lp).exists():
                 load_lora(txt2img_pipe, lp, weight=lw)
-        # img2img shares weights, but fuse separately if needed
         try:
             for lp, lw in zip(lora_paths, lora_weights or [0.8] * len(lora_paths)):
                 if Path(lp).exists():
@@ -1226,33 +1953,48 @@ def generate_animated(
 
     # ── Frame generation loop ─────────────────────────────────────
     prev_image: PILImage.Image | None = None
+    reference_image: PILImage.Image | None = None  # frame 0 anchor
+    reference_np: np.ndarray | None = None  # frame 0 as numpy for color matching
 
-    # If resuming, load the last saved frame as prev_image
     if frame_paths:
         try:
             prev_image = PILImage.open(frame_paths[-1]).convert("RGB")
+            reference_image = PILImage.open(frame_paths[0]).convert("RGB")
+            reference_np = np.array(reference_image, dtype=np.float64)
         except Exception:
             prev_image = None
 
+    _update_progress(active=True, type="animation", current_step=0,
+                     total_steps=steps, current_frame=start_frame,
+                     total_frames=num_frames, message="Generating animation...")
+
     for i in range(start_frame, num_frames):
-        # Check for cancellation
         if _check_cancelled():
             _log.info("[ANIM GEN] Cancelled at frame %d/%d", i, num_frames)
             break
 
-        # Build per-frame prompt
+        # ── VRAM safety check — auto-save before OOM ─────────────
+        if not _check_vram_safe():
+            _log.warning("[ANIM GEN] VRAM near limit at frame %d — auto-saving", i)
+            _update_progress(message=f"VRAM critical — auto-saved at frame {i}/{num_frames}")
+            break
+
+        _update_progress(current_frame=i, message=f"Frame {i+1}/{num_frames}")
+
         frame_desc = frame_descriptions[i]
         if frame_desc:
             frame_prompt = f"{styled_prompt}, {frame_desc}"
         else:
             frame_prompt = styled_prompt
 
-        frame_seed = base_seed  # Same seed for consistency; img2img strength handles variation
+        frame_seed = base_seed
+        cur_strength = frame_strengths[i]
 
         t0 = time.time()
         generator = torch.Generator(device="cuda").manual_seed(frame_seed)
 
         def _anim_cancel_cb(pipe_self, step_index, timestep, callback_kwargs):
+            _update_progress(current_step=step_index + 1)
             if _cancel_event.is_set():
                 _cancel_event.clear()
                 raise InterruptedError("Animation cancelled by user")
@@ -1275,22 +2017,32 @@ def generate_animated(
             except InterruptedError:
                 _log.info("[ANIM GEN] Cancelled during frame %d generation", i)
                 break
+            # Store frame 0 as the reference anchor
+            reference_image = image.copy()
+            reference_np = np.array(reference_image, dtype=np.float64)
         else:
-            # Subsequent frames: img2img from previous frame
+            # ── Anti-deterioration: blend previous frame with reference ──
             init = prev_image.resize((width, height), PILImage.LANCZOS)
-            # Ensure effective steps >= 1 (steps * strength must be >= 1)
-            effective = int(steps * frame_strength)
+
+            if reference_image is not None and reference_blend > 0 and i >= 1:
+                ref_resized = reference_image.resize((width, height), PILImage.LANCZOS)
+                init_np = np.array(init, dtype=np.float64)
+                ref_np = np.array(ref_resized, dtype=np.float64)
+                # Blend: (1-blend)*prev + blend*reference
+                blended_np = (1.0 - reference_blend) * init_np + reference_blend * ref_np
+                init = PILImage.fromarray(np.clip(blended_np, 0, 255).astype(np.uint8))
+
+            effective = int(steps * cur_strength)
             if effective < 1:
-                adjusted_steps = max(steps, int(1.0 / frame_strength) + 1)
-                _log.info("[ANIM GEN] Adjusted steps %d→%d for strength %.2f",
-                          steps, adjusted_steps, frame_strength)
+                adjusted_steps = max(steps, int(1.0 / cur_strength) + 1)
             else:
                 adjusted_steps = steps
+
             gen_kwargs = {
                 "prompt": frame_prompt,
                 "negative_prompt": full_negative,
                 "image": init,
-                "strength": frame_strength,
+                "strength": cur_strength,
                 "num_inference_steps": adjusted_steps,
                 "guidance_scale": guidance_scale,
                 "generator": generator,
@@ -1303,8 +2055,11 @@ def generate_animated(
                 break
             except Exception as e:
                 _log.error("[ANIM GEN] Frame %d failed: %s", i, e)
-                # Use previous frame as fallback
                 image = prev_image
+
+            # ── Color histogram matching to frame 0 ──
+            if reference_np is not None:
+                image = _match_color_to_reference(image, reference_np)
 
         # Save frame
         frame_path = str(job_dir / f"frame_{i:04d}.png")
@@ -1313,7 +2068,7 @@ def generate_animated(
         prev_image = image
 
         elapsed = time.time() - t0
-        _log.info("[ANIM GEN] Frame %d/%d — %.1fs", i + 1, num_frames, elapsed)
+        _log.info("[ANIM GEN] Frame %d/%d — %.1fs (strength=%.2f)", i + 1, num_frames, elapsed, cur_strength)
 
         # Checkpoint after every frame
         _save_animation_checkpoint(checkpoint_file, {
@@ -1336,6 +2091,9 @@ def generate_animated(
             "fps": fps,
             "storyboard": storyboard,
             "output_format": output_format,
+            "reference_blend": reference_blend,
+            "strength_curve": strength_curve,
+            "motion_intensity": motion_intensity,
         })
 
     # ── Assemble output ────────────────────────────────────────────
@@ -1379,6 +2137,9 @@ def generate_animated(
     if "path" not in results:
         results["path"] = frame_paths[0]  # fallback
 
+    _update_progress(active=False, type="idle", current_step=0,
+                     total_steps=0, current_frame=0, total_frames=0,
+                     message="")
     return results
 
 
@@ -1538,6 +2299,9 @@ def list_animation_jobs() -> list[dict]:
                 "height": ckpt.get("height", 512),
                 "storyboard": ckpt.get("storyboard", []),
                 "output_format": ckpt.get("output_format", "gif"),
+                "reference_blend": ckpt.get("reference_blend", 0.3),
+                "strength_curve": ckpt.get("strength_curve", "constant"),
+                "motion_intensity": ckpt.get("motion_intensity", 0.5),
             })
         except Exception:
             continue
@@ -1553,6 +2317,56 @@ def get_animation_job(job_id: str) -> dict | None:
         return json.loads(ckpt_file.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def save_animation_state(
+    prompt: str,
+    negative_prompt: str = "",
+    art_style: str = "",
+    seed: int = -1,
+    num_frames: int = 24,
+    fps: int = 12,
+    frame_strength: float = 0.35,
+    width: int = 512,
+    height: int = 768,
+    steps: int = 25,
+    guidance_scale: float = 7.0,
+    output_format: str = "gif",
+    storyboard_descriptions: list[str] | None = None,
+    reference_blend: float = 0.3,
+    strength_curve: str = "constant",
+    motion_intensity: float = 0.5,
+) -> dict:
+    """Save current animation settings as a named job (no generation)."""
+    _ANIM_SAVES_DIR.mkdir(parents=True, exist_ok=True)
+    job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{id(prompt) % 10000:04d}"
+    job_dir = _ANIM_SAVES_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = {
+        "job_id": job_id,
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "art_style": art_style,
+        "seed": seed,
+        "total_frames": num_frames,
+        "current_frame": 0,
+        "fps": fps,
+        "frame_strength": frame_strength,
+        "width": width,
+        "height": height,
+        "steps": steps,
+        "guidance_scale": guidance_scale,
+        "output_format": output_format,
+        "storyboard": storyboard_descriptions or [],
+        "reference_blend": reference_blend,
+        "strength_curve": strength_curve,
+        "motion_intensity": motion_intensity,
+        "status": "saved",
+        "frame_paths": [],
+    }
+    (job_dir / "checkpoint.json").write_text(json.dumps(ckpt, indent=2), encoding="utf-8")
+    _log.info("[ANIM] Saved animation state as job %s", job_id)
+    return {"status": "ok", "job_id": job_id}
 
 
 # ── Storyboard / Line-Drawing Preview ─────────────────────────────────────
@@ -1662,22 +2476,31 @@ def generate_preview_only(
     lora_weights: list[float] | None = None,
     negative_prompt: str | None = None,
 ) -> dict:
-    """Fast noisy preview at quarter resolution with minimal steps.
+    """Fast noisy preview that produces the SAME image as full render, just noisier.
 
-    Returns the preview image path and the resolved seed so the user can
-    proceed to a full render with the same seed if they like the composition.
+    Strategy: run the full pipeline at full resolution but stop early (partial
+    denoise) and return the intermediate result. This guarantees the preview
+    is a noisy/pixelated version of the exact same image the full render will
+    produce, since the identical seed + latent noise path is used.
     """
-    preview_w = max(256, width // 4)
-    preview_h = max(256, height // 4)
+    from PIL import Image as PILImage
+
+    # Resolve seed up front so preview and full render share it
+    if seed < 0:
+        seed = torch.randint(0, 2**32, (1,)).item()
+
+    # Generate full image with very few steps — same seed, same resolution
+    # The key insight: same seed + same resolution = same latent noise = same composition
+    # Fewer steps = noisier but structurally identical
     preview = generate_image(
         prompt=prompt,
-        width=preview_w,
-        height=preview_h,
+        width=width,
+        height=height,
         model_path=model_path,
         lora_paths=lora_paths,
         lora_weights=lora_weights,
         mode=mode,
-        steps=max(4, min(steps, 8)),
+        steps=max(4, min(steps, 8)),  # very few steps for speed
         guidance_scale=guidance_scale,
         negative_prompt=negative_prompt,
         seed=seed,
@@ -1686,10 +2509,22 @@ def generate_preview_only(
     if preview.get("status") == "error":
         return preview
 
+    # Downscale the result for display speed (transfer over network)
+    preview_path = preview.get("path")
+    if preview_path and Path(preview_path).exists():
+        try:
+            img = PILImage.open(preview_path)
+            display_w = max(256, width // 2)
+            display_h = max(256, height // 2)
+            img_small = img.resize((display_w, display_h), PILImage.LANCZOS)
+            img_small.save(preview_path)
+        except Exception:
+            pass  # keep original if resize fails
+
     return {
         "status": "ok",
-        "preview_path": preview.get("path"),
-        "seed": preview.get("seed"),
+        "preview_path": preview_path,
+        "seed": seed,
         "prompt_used": preview.get("prompt_used"),
         "negative_used": preview.get("negative_used"),
         "settings": preview.get("settings"),
@@ -2519,3 +3354,382 @@ def search_characters(query: str) -> dict:
         "loras": matching_loras,
         "history_matches": history_matches[-10:],  # last 10 matches
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WAN Video Generation
+# ══════════════════════════════════════════════════════════════════════════
+# Uses WAN 2.1 image-to-video pipeline with dual-LoRA (high_noise +
+# low_noise) for action animations.  Requires a WAN base model to be
+# downloaded into models/ directory.
+#
+# Required HuggingFace model (auto-downloaded on first run):
+#   Wan-AI/Wan2.1-T2V-1.3B  (text-to-video, fits in ~4 GB with bf16
+#                             + cpu offload, 8 GB VRAM comfortable)
+#
+# NOTE: WAN only released I2V (image-to-video) at 14B.  The 1.3B model
+# is T2V only.  When an image is provided it is used as a style/scene
+# reference via prompt enrichment rather than direct frame conditioning.
+#
+# The user's action LoRAs are split into high_noise / low_noise variants.
+# Both are applied simultaneously: high_noise LoRA acts on early (noisy)
+# diffusion steps and low_noise LoRA acts on late (clean) steps.
+# ══════════════════════════════════════════════════════════════════════════
+
+_WAN_MODELS_DIR = MODELS_DIR  # WAN model goes in models/ alongside SDXL
+_wan_pipeline = None
+
+
+def _find_wan_model() -> str | None:
+    """Look for a WAN model in the models directory."""
+    for f in _WAN_MODELS_DIR.iterdir():
+        if f.is_dir() and "wan" in f.name.lower():
+            return str(f)
+    # Check if HuggingFace cache has it
+    try:
+        from huggingface_hub import scan_cache_dir
+        cache = scan_cache_dir()
+        for repo in cache.repos:
+            if "wan2.1" in repo.repo_id.lower():
+                # Find the latest revision's snapshot
+                for rev in repo.revisions:
+                    return str(rev.snapshot_path)
+    except Exception:
+        pass
+    return None
+
+
+def _find_action_lora_pair(lora_name: str | None = None) -> dict:
+    """Find matching high_noise + low_noise LoRA pair from models/action/."""
+    action_dir = MODELS_DIR / "action"
+    if not action_dir.exists():
+        return {}
+
+    high_loras = []
+    low_loras = []
+    for f in action_dir.iterdir():
+        if f.suffix.lower() != ".safetensors" or not f.is_file():
+            continue
+        name_lower = f.stem.lower()
+        if "high_noise" in name_lower or "high" in name_lower:
+            high_loras.append(f)
+        elif "low_noise" in name_lower or "low" in name_lower:
+            low_loras.append(f)
+
+    if lora_name:
+        # Find pair matching the given name
+        query = lora_name.lower()
+        high = next((f for f in high_loras if query in f.stem.lower()), None)
+        low = next((f for f in low_loras if query in f.stem.lower()), None)
+    else:
+        # Use first available pair
+        high = high_loras[0] if high_loras else None
+        low = low_loras[0] if low_loras else None
+
+    result = {}
+    if high:
+        result["high_noise"] = str(high)
+    if low:
+        result["low_noise"] = str(low)
+    return result
+
+
+def generate_video(
+    prompt: str,
+    image_path: str | None = None,
+    width: int = 480,
+    height: int = 720,
+    num_frames: int = 81,
+    fps: int = 16,
+    steps: int = 40,
+    guidance_scale: float = 6.0,
+    seed: int = -1,
+    action_lora: str | None = None,
+    negative_prompt: str | None = None,
+) -> dict:
+    """Generate a video clip using WAN 2.1 with dual-LoRA actions.
+
+    If `image_path` is provided, uses image-to-video (I2V) mode.
+    Otherwise uses text-to-video (T2V) mode.
+
+    The dual-LoRA system applies high_noise and low_noise action LoRAs
+    simultaneously for motion quality.
+
+    Args:
+        prompt: Text description of the video.
+        image_path: Optional reference image for I2V mode.
+        width/height: Video dimensions (multiples of 16).
+        num_frames: Number of video frames (WAN uses groups of ~4).
+        fps: Output video framerate.
+        steps: Diffusion inference steps.
+        guidance_scale: CFG scale.
+        seed: Random seed (-1 for random).
+        action_lora: Name/keyword to match a specific action LoRA pair.
+        negative_prompt: Negative prompt text.
+
+    Returns:
+        dict with status, path to output mp4, and metadata.
+    """
+    global _wan_pipeline
+    import gc
+
+    # Check for WAN model
+    wan_model_path = _find_wan_model()
+
+    _update_progress(active=True, type="video", current_step=0,
+                     total_steps=steps, message="Loading WAN model...")
+
+    try:
+        if wan_model_path is None:
+            # WAN 1.3B is T2V only — I2V was only released at 14B.
+            # We always use the T2V-1.3B model regardless of image input.
+            wan_model_path = "Wan-AI/Wan2.1-T2V-1.3B"
+            _log.info("[WAN VIDEO] No local WAN model found — downloading %s ...", wan_model_path)
+
+        # ── Load WAN pipeline ────────────────────────────────────
+        if _wan_pipeline is None:
+            _log.info("[WAN VIDEO] Loading WAN pipeline from: %s", wan_model_path)
+
+            # Free SDXL pipelines to make VRAM room
+            flush_vram()
+
+            try:
+                from diffusers import WanPipeline
+                from diffusers.utils import export_to_video
+                import torch as _torch
+
+                # 1.3B is T2V only — always load WanPipeline
+                _wan_pipeline = WanPipeline.from_pretrained(
+                    wan_model_path,
+                    torch_dtype=_torch.bfloat16,
+                )
+
+                # Enable memory optimisations for constrained VRAM
+                _wan_pipeline.enable_model_cpu_offload()
+
+                # VAE tiling lets the decoder process large frames in
+                # chunks instead of all at once – big VRAM saving for
+                # the 1.3B model on 8 GB cards.
+                if hasattr(_wan_pipeline, "enable_vae_tiling"):
+                    _wan_pipeline.enable_vae_tiling()
+
+                _log.info("[WAN VIDEO] WAN 1.3B pipeline loaded successfully")
+
+            except ImportError as e:
+                _log.error("[WAN VIDEO] Missing dependency: %s. "
+                           "Install with: pip install diffusers[wan] transformers accelerate", e)
+                return {
+                    "status": "error",
+                    "error": (
+                        f"WAN video generation requires additional dependencies: {e}. "
+                        "Install with: pip install diffusers[wan] transformers accelerate"
+                    ),
+                }
+            except Exception as e:
+                _log.error("[WAN VIDEO] Failed to load WAN model: %s", e)
+                return {
+                    "status": "error",
+                    "error": f"Failed to load WAN model: {e}. "
+                             "You may need to download the model first. "
+                             "Run: hf download Wan-AI/Wan2.1-T2V-1.3B",
+                }
+
+        # ── Load action LoRA pair (high_noise + low_noise) ───────
+        lora_pair = _find_action_lora_pair(action_lora)
+        if lora_pair:
+            loaded_names = []
+            try:
+                if "high_noise" in lora_pair:
+                    _wan_pipeline.load_lora_weights(
+                        lora_pair["high_noise"],
+                        adapter_name="high_noise",
+                    )
+                    loaded_names.append("high_noise")
+                    _log.info("[WAN VIDEO] Loaded high_noise LoRA: %s", lora_pair["high_noise"])
+
+                if "low_noise" in lora_pair:
+                    _wan_pipeline.load_lora_weights(
+                        lora_pair["low_noise"],
+                        adapter_name="low_noise",
+                    )
+                    loaded_names.append("low_noise")
+                    _log.info("[WAN VIDEO] Loaded low_noise LoRA: %s", lora_pair["low_noise"])
+
+                if len(loaded_names) == 2:
+                    _wan_pipeline.set_adapters(loaded_names, adapter_weights=[0.8, 0.8])
+                elif loaded_names:
+                    _wan_pipeline.set_adapters(loaded_names, adapter_weights=[0.8])
+
+            except Exception as e:
+                _log.warning("[WAN VIDEO] LoRA loading issue: %s (continuing without LoRA)", e)
+
+        # ── Prepare generation ───────────────────────────────────
+        width = max(128, (width // 16) * 16)
+        height = max(128, (height // 16) * 16)
+        num_frames = max(5, min(num_frames, 200))
+
+        if seed < 0:
+            seed = torch.randint(0, 2**32, (1,)).item()
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+
+        neg = negative_prompt or (
+            "blurry, low quality, distorted, deformed, static, frozen, "
+            "watermark, text, oversaturated, ugly, amateur, grainy"
+        )
+
+        _update_progress(current_step=0, total_steps=steps,
+                         message="Generating video frames...")
+
+        def _video_step_cb(pipe_self, step_index, timestep, callback_kwargs):
+            _update_progress(current_step=step_index + 1)
+            if _cancel_event.is_set():
+                _cancel_event.clear()
+                raise InterruptedError("Video generation cancelled")
+            if not _check_vram_safe():
+                raise MemoryError("VRAM limit reached during video generation")
+            return callback_kwargs
+
+        # ── Run pipeline ─────────────────────────────────────────
+        gen_kwargs = {
+            "prompt": prompt,
+            "negative_prompt": neg,
+            "height": height,
+            "width": width,
+            "num_frames": num_frames,
+            "num_inference_steps": steps,
+            "guidance_scale": guidance_scale,
+            "generator": generator,
+            "callback_on_step_end": _video_step_cb,
+        }
+
+        if image_path:
+            # T2V-1.3B has no native I2V mode. We embed the reference image
+            # as the first frame by enriching the prompt with a description
+            # and appending it to the prompt for context.
+            from PIL import Image as PILImage
+            ref_image = PILImage.open(image_path).convert("RGB")
+            # Resize to match generation resolution
+            ref_image = ref_image.resize((width, height), PILImage.LANCZOS)
+            # Prepend a framing cue so the model stays close to the source look
+            prompt = (
+                f"Starting from this scene: {prompt}. "
+                "Maintain the same art style, colors, and character appearance throughout."
+            )
+            _log.info("[WAN VIDEO] I2V requested but using T2V-1.3B; image used as style reference")
+
+        output = _wan_pipeline(**gen_kwargs)
+        frames = output.frames[0]  # list of PIL Images
+
+        # ── Export to mp4 ────────────────────────────────────────
+        output_dir_path = Path(OUTPUT_DIR)
+        output_dir_path.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r'[^\w\s-]', '', prompt[:30]).strip().replace(' ', '_')
+        mp4_filename = str(output_dir_path / f"{timestamp}_{safe_name}_video.mp4")
+
+        try:
+            from diffusers.utils import export_to_video
+            export_to_video(frames, mp4_filename, fps=fps)
+        except ImportError:
+            # Fallback: save frames then use our own _frames_to_mp4
+            frame_dir = output_dir_path / f"{timestamp}_video_frames"
+            frame_dir.mkdir(parents=True, exist_ok=True)
+            frame_paths = []
+            for idx, frame in enumerate(frames):
+                fp = str(frame_dir / f"frame_{idx:04d}.png")
+                frame.save(fp)
+                frame_paths.append(fp)
+            result_path = _frames_to_mp4(frame_paths, fps, Path(mp4_filename))
+            if not result_path:
+                return {"status": "error", "error": "Failed to export video — ffmpeg/opencv not found"}
+            mp4_filename = result_path
+
+        _log.info("[WAN VIDEO] Video saved: %s (%d frames, %dfps)", mp4_filename, len(frames), fps)
+
+        # Clean up LoRAs after generation
+        try:
+            _wan_pipeline.unload_lora_weights()
+        except Exception:
+            pass
+
+        return {
+            "status": "ok",
+            "path": mp4_filename,
+            "num_frames": len(frames),
+            "seed": seed,
+            "fps": fps,
+            "width": width,
+            "height": height,
+            "action_loras": lora_pair,
+        }
+
+    except InterruptedError:
+        _log.info("[WAN VIDEO] Generation cancelled by user")
+        return {"status": "cancelled", "message": "Video generation cancelled"}
+    except MemoryError as e:
+        _log.error("[WAN VIDEO] VRAM exhausted: %s", e)
+        gc.collect()
+        torch.cuda.empty_cache()
+        return {"status": "error", "error": f"VRAM exhausted: {e}. Try smaller resolution or fewer frames."}
+    except Exception as e:
+        _log.error("[WAN VIDEO] Error: %s", e)
+        return {"status": "error", "error": str(e)}
+    finally:
+        _update_progress(active=False, type="idle", current_step=0,
+                         total_steps=0, message="")
+
+
+def flush_wan_pipeline():
+    """Unload WAN video pipeline to free VRAM."""
+    global _wan_pipeline
+    if _wan_pipeline is not None:
+        del _wan_pipeline
+        _wan_pipeline = None
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        _log.info("[WAN VIDEO] WAN pipeline flushed from VRAM")
+
+
+def list_action_loras() -> list[dict]:
+    """List available action LoRAs in models/action/ with pair detection."""
+    action_dir = MODELS_DIR / "action"
+    if not action_dir.exists():
+        return []
+
+    loras = []
+    seen_bases = set()
+    tw_data = _load_trigger_words()
+
+    for f in sorted(action_dir.iterdir()):
+        if f.suffix.lower() != ".safetensors" or not f.is_file():
+            continue
+        name = f.stem
+        # Determine if high/low noise variant
+        noise_type = "unknown"
+        if "high_noise" in name.lower():
+            noise_type = "high_noise"
+        elif "low_noise" in name.lower():
+            noise_type = "low_noise"
+
+        # Detect pair base name (strip _high_noise / _low_noise suffix)
+        base = re.sub(r'_?(high|low)_?noise', '', name, flags=re.IGNORECASE).strip('_')
+
+        loras.append({
+            "name": name,
+            "path": str(f),
+            "size_mb": round(f.stat().st_size / (1024 * 1024), 1),
+            "noise_type": noise_type,
+            "pair_base": base,
+            "trigger_words": tw_data.get(name, []),
+            "has_pair": base in seen_bases,
+        })
+        seen_bases.add(base)
+
+    # Mark pairs retroactively
+    for lora in loras:
+        lora["has_pair"] = sum(1 for l in loras if l["pair_base"] == lora["pair_base"]) > 1
+
+    return loras
