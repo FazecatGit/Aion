@@ -327,9 +327,10 @@ function App() {
   const [promptTokenMethod, setPromptTokenMethod] = useState<string>('estimate');
   const tokenDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // ── LoRA browser & trigger word management ─────────────────────────────────
-  const [loraCategories, setLoraCategories] = useState<Record<string, {name:string; filename:string; path:string; size_mb:number; trigger_words:string[]}[]>>({});
+  const [loraCategories, setLoraCategories] = useState<Record<string, {name:string; filename:string; path:string; size_mb:number; trigger_words:string[]; preview_image?:string|null}[]>>({});
   const [loraBrowserOpen, setLoraBrowserOpen] = useState(false);
   const [loraBrowserCategory, setLoraBrowserCategory] = useState('styles');
+  const [expandedLoraCategories, setExpandedLoraCategories] = useState<Record<string, boolean>>({ characters: true });
   const [triggerWordInput, setTriggerWordInput] = useState('');
   const [editingTriggerLora, setEditingTriggerLora] = useState<string | null>(null);
   const [loraSearchQuery, setLoraSearchQuery] = useState('');
@@ -1836,11 +1837,39 @@ const updateTokenCount = (text: string) => {
   }
 };
 
-// Insert trigger word into prompt
+// Insert trigger word into prompt (with deduplication)
 const insertTriggerWord = (word: string) => {
   setImageGenPrompt(prev => {
     const trimmed = prev.trim();
+    // Check if the trigger word is already in the prompt (case-insensitive)
+    const parts = trimmed.split(/,\s*/);
+    if (parts.some(p => p.trim().toLowerCase() === word.toLowerCase())) return trimmed;
     return trimmed ? trimmed + ', ' + word : word;
+  });
+};
+
+// Remove a trigger word from the prompt
+const removeTriggerWord = (word: string) => {
+  setImageGenPrompt(prev => {
+    const parts = prev.split(/,\s*/);
+    const filtered = parts.filter(p => p.trim().toLowerCase() !== word.toLowerCase());
+    return filtered.join(', ');
+  });
+};
+
+// Toggle a LoRA and auto-insert/remove its primary trigger word
+const toggleLoraWithTrigger = (loraName: string, triggerWords?: string[]) => {
+  setSelectedLoras(prev => {
+    const isActive = prev.includes(loraName);
+    if (isActive) {
+      // Deselecting: remove primary trigger word from prompt
+      if (triggerWords?.length) removeTriggerWord(triggerWords[0]);
+      return prev.filter(x => x !== loraName);
+    } else {
+      // Selecting: auto-insert primary trigger word into prompt
+      if (triggerWords?.length) insertTriggerWord(triggerWords[0]);
+      return [...prev, loraName];
+    }
   });
 };
 
@@ -5187,19 +5216,24 @@ return (
                       <div style={{ fontSize: '10px', color: '#b388ff', marginBottom: '4px', fontWeight: 'bold' }}>LoRA Matches</div>
                       {loraSearchResults.map((lr: any) => (
                         <div key={lr.name} style={{ padding: '4px 6px', fontSize: '11px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderRadius: '4px', backgroundColor: '#111', marginBottom: '2px' }}>
-                          <div>
-                            <span style={{ color: '#ccc' }}>{lr.name}</span>
-                            <span style={{ color: '#555', fontSize: '9px', marginLeft: '6px' }}>{lr.category}</span>
-                            {lr.trigger_words?.length > 0 && (
-                              <div style={{ marginTop: '2px' }}>
-                                {lr.trigger_words.map((tw: string, j: number) => (
-                                  <span key={j} onClick={() => insertTriggerWord(tw)}
-                                    style={{ fontSize: '9px', color: '#00cc88', cursor: 'pointer', marginRight: '4px', textDecoration: 'underline' }}>{tw}</span>
-                                ))}
-                              </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: 1, minWidth: 0 }}>
+                            {lr.preview_image && (
+                              <img src={`http://localhost:8000/generate/lora-preview/${encodeURIComponent(lr.name)}`} alt="" style={{ width: '32px', height: '32px', borderRadius: '4px', objectFit: 'cover', flexShrink: 0 }} onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
                             )}
+                            <div style={{ minWidth: 0 }}>
+                              <span style={{ color: '#ccc' }}>{lr.name}</span>
+                              <span style={{ color: '#555', fontSize: '9px', marginLeft: '6px' }}>{lr.category}</span>
+                              {lr.trigger_words?.length > 0 && (
+                                <div style={{ marginTop: '2px' }}>
+                                  {lr.trigger_words.map((tw: string, j: number) => (
+                                    <span key={j} onClick={() => insertTriggerWord(tw)}
+                                      style={{ fontSize: '9px', color: '#00cc88', cursor: 'pointer', marginRight: '4px', textDecoration: 'underline' }}>{tw}</span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
                           </div>
-                          <button onClick={() => setSelectedLoras(prev => prev.includes(lr.name) ? prev.filter(x => x !== lr.name) : [...prev, lr.name])}
+                          <button onClick={() => toggleLoraWithTrigger(lr.name, lr.trigger_words)}
                             style={{ background: 'none', border: '1px solid', borderColor: selectedLoras.includes(lr.name) ? '#b388ff' : '#444', borderRadius: '4px', color: selectedLoras.includes(lr.name) ? '#b388ff' : '#888', cursor: 'pointer', fontSize: '9px', padding: '1px 6px' }}>
                             {selectedLoras.includes(lr.name) ? '✓' : '+ Use'}
                           </button>
@@ -5250,16 +5284,20 @@ return (
               {/* Selected LoRAs chips */}
               {selectedLoras.length > 0 && (
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' }}>
-                  {selectedLoras.map(l => (
+                  {selectedLoras.map(l => {
+                    // Find trigger words for this LoRA from loaded categories
+                    const loraTw = Object.values(loraCategories).flat().find((lr: any) => lr.name === l)?.trigger_words;
+                    return (
                     <span key={l} style={{
                       padding: '2px 8px', borderRadius: '10px', fontSize: '10px',
                       backgroundColor: 'rgba(179,136,255,0.15)', color: '#b388ff', border: '1px solid rgba(179,136,255,0.3)',
                       display: 'flex', alignItems: 'center', gap: '4px',
                     }}>
                       {l}
-                      <span onClick={() => setSelectedLoras(prev => prev.filter(x => x !== l))} style={{ cursor: 'pointer', color: '#ff4444', fontWeight: 'bold' }}>×</span>
+                      <span onClick={() => { if (loraTw?.length) removeTriggerWord(loraTw[0]); setSelectedLoras(prev => prev.filter(x => x !== l)); }} style={{ cursor: 'pointer', color: '#ff4444', fontWeight: 'bold' }}>×</span>
                     </span>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
 
@@ -5330,19 +5368,24 @@ return (
                       <div style={{ fontSize: '10px', color: '#888', marginBottom: '4px' }}>Search Results</div>
                       {loraSearchResults.map((lr: any) => (
                         <div key={lr.name} style={{ padding: '4px 6px', fontSize: '11px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderRadius: '4px', backgroundColor: '#111', marginBottom: '2px' }}>
-                          <div>
-                            <span style={{ color: '#ccc' }}>{lr.name}</span>
-                            <span style={{ color: '#555', fontSize: '9px', marginLeft: '6px' }}>{lr.category}</span>
-                            {lr.trigger_words?.length > 0 && (
-                              <div style={{ marginTop: '2px' }}>
-                                {lr.trigger_words.map((tw: string, j: number) => (
-                                  <span key={j} onClick={() => insertTriggerWord(tw)}
-                                    style={{ fontSize: '9px', color: '#00cc88', cursor: 'pointer', marginRight: '4px', textDecoration: 'underline' }}>{tw}</span>
-                                ))}
-                              </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: 1, minWidth: 0 }}>
+                            {lr.preview_image && (
+                              <img src={`http://localhost:8000/generate/lora-preview/${encodeURIComponent(lr.name)}`} alt="" style={{ width: '32px', height: '32px', borderRadius: '4px', objectFit: 'cover', flexShrink: 0 }} onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
                             )}
+                            <div style={{ minWidth: 0 }}>
+                              <span style={{ color: '#ccc' }}>{lr.name}</span>
+                              <span style={{ color: '#555', fontSize: '9px', marginLeft: '6px' }}>{lr.category}</span>
+                              {lr.trigger_words?.length > 0 && (
+                                <div style={{ marginTop: '2px' }}>
+                                  {lr.trigger_words.map((tw: string, j: number) => (
+                                    <span key={j} onClick={() => insertTriggerWord(tw)}
+                                      style={{ fontSize: '9px', color: '#00cc88', cursor: 'pointer', marginRight: '4px', textDecoration: 'underline' }}>{tw}</span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
                           </div>
-                          <button onClick={() => setSelectedLoras(prev => prev.includes(lr.name) ? prev.filter(x => x !== lr.name) : [...prev, lr.name])}
+                          <button onClick={() => toggleLoraWithTrigger(lr.name, lr.trigger_words)}
                             style={{ background: 'none', border: '1px solid', borderColor: selectedLoras.includes(lr.name) ? '#b388ff' : '#444', borderRadius: '4px', color: selectedLoras.includes(lr.name) ? '#b388ff' : '#888', cursor: 'pointer', fontSize: '9px', padding: '1px 6px' }}>
                             {selectedLoras.includes(lr.name) ? '✓' : '+'}
                           </button>
@@ -5351,36 +5394,42 @@ return (
                     </div>
                   )}
 
-                  {/* Category tabs */}
-                  <div style={{ display: 'flex', gap: '2px', flexWrap: 'wrap', marginBottom: '6px' }}>
-                    {['styles', 'characters', 'clothing', 'poses', 'concept', 'action'].map(cat => {
-                      const count = (loraCategories[cat] || []).length;
-                      return (
-                        <button key={cat} onClick={() => setLoraBrowserCategory(cat)} style={{
-                          padding: '3px 6px', borderRadius: '4px', fontSize: '9px', cursor: 'pointer',
-                          border: '1px solid', textTransform: 'capitalize',
-                          borderColor: loraBrowserCategory === cat ? '#b388ff' : '#333',
-                          backgroundColor: loraBrowserCategory === cat ? 'rgba(179,136,255,0.15)' : 'transparent',
-                          color: loraBrowserCategory === cat ? '#b388ff' : '#666',
-                        }}>{cat} ({count})</button>
-                      );
-                    })}
-                  </div>
-
-                  {/* LoRAs in selected category */}
-                  {(loraCategories[loraBrowserCategory] || []).length === 0 && (
-                    <div style={{ color: '#444', fontSize: '10px', textAlign: 'center', padding: '12px 0' }}>No LoRAs in {loraBrowserCategory}/</div>
-                  )}
-                  {(loraCategories[loraBrowserCategory] || []).map(lora => (
+                  {/* Collapsible category sections */}
+                  {['characters', 'styles', 'clothing', 'poses', 'concept', 'action'].map(cat => {
+                    const items = loraCategories[cat] || [];
+                    const isExpanded = expandedLoraCategories[cat] ?? false;
+                    return (
+                      <div key={cat} style={{ marginBottom: '4px' }}>
+                        <button onClick={() => setExpandedLoraCategories(prev => ({ ...prev, [cat]: !prev[cat] }))}
+                          style={{
+                            width: '100%', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                            padding: '6px 8px', borderRadius: '6px', border: '1px solid #333', cursor: 'pointer',
+                            backgroundColor: isExpanded ? 'rgba(179,136,255,0.1)' : '#0d0d0d',
+                            color: isExpanded ? '#b388ff' : '#888', fontSize: '11px', textTransform: 'capitalize',
+                          }}>
+                          <span>{isExpanded ? '▼' : '▶'} {cat}</span>
+                          <span style={{ fontSize: '9px', color: '#555' }}>{items.length}</span>
+                        </button>
+                        {isExpanded && items.length === 0 && (
+                          <div style={{ color: '#444', fontSize: '10px', textAlign: 'center', padding: '8px 0' }}>No LoRAs in {cat}/</div>
+                        )}
+                        {isExpanded && items.map(lora => (
                     <div key={lora.name} style={{
                       padding: '6px', borderRadius: '6px', backgroundColor: '#111', border: '1px solid #222',
-                      marginBottom: '4px', fontSize: '11px',
+                      marginBottom: '4px', marginTop: '4px', marginLeft: '4px', fontSize: '11px',
                     }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <span style={{ color: '#ccc', fontWeight: 500 }}>{lora.name}</span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: 1, minWidth: 0 }}>
+                          {lora.preview_image && (
+                            <img src={`http://localhost:8000/generate/lora-preview/${encodeURIComponent(lora.name)}`} alt=""
+                              style={{ width: '36px', height: '36px', borderRadius: '4px', objectFit: 'cover', flexShrink: 0, border: '1px solid #333' }}
+                              onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
+                          )}
+                          <span style={{ color: '#ccc', fontWeight: 500 }}>{lora.name}</span>
+                        </div>
                         <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
                           <span style={{ color: '#555', fontSize: '9px' }}>{lora.size_mb}MB</span>
-                          <button onClick={() => setSelectedLoras(prev => prev.includes(lora.name) ? prev.filter(x => x !== lora.name) : [...prev, lora.name])}
+                          <button onClick={() => toggleLoraWithTrigger(lora.name, lora.trigger_words)}
                             style={{ background: 'none', border: '1px solid', borderColor: selectedLoras.includes(lora.name) ? '#b388ff' : '#444', borderRadius: '4px', color: selectedLoras.includes(lora.name) ? '#b388ff' : '#888', cursor: 'pointer', fontSize: '9px', padding: '1px 6px' }}>
                             {selectedLoras.includes(lora.name) ? '✓ Active' : '+ Use'}
                           </button>
@@ -5428,6 +5477,9 @@ return (
                       )}
                     </div>
                   ))}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -6490,12 +6542,19 @@ return (
               }}
                 onClick={() => {
                   let cleanPrompt = h.prompt?.replace(/^(score_9, score_8_up, score_7_up, |rating:\w+, )/, '') || '';
-                  // Strip COMPEL/multi-character artifacts for cleaner reuse
+                  // Strip backend-injected multi-character artifacts but preserve user-authored weights
                   cleanPrompt = cleanPrompt
                     .replace(/\s*BREAK\s*/g, ' ')
                     .replace(/,?\s*(?:on the (?:left|right)|in the (?:center|background))\s*/gi, ' ')
-                    .replace(/\(:\d+\.?\d*\)/g, '')
-                    .replace(/\(([^:()]+):\d+\.?\d*\)/g, '$1')
+                    .replace(/^\d+ characters, (?:group shot, )?/i, '')
+                    // Strip known art style prefixes that the backend injects
+                    .replace(/^anime screencap, hand-drawn animation, cel shading, soft lighting, natural colour palette, expressive linework, high quality anime key visual, /i, '')
+                    .replace(/^studio ghibli style, watercolour background, warm lighting, soft pastel tones, hand-painted, detailed environment, gentle linework, /i, '')
+                    .replace(/^manga panel, black and white, screentone, detailed linework, dramatic shading, ink drawing, /i, '')
+                    .replace(/^oil painting, visible brush strokes, impressionist lighting, textured canvas, rich earth tones, gallery quality, /i, '')
+                    .replace(/^game concept art, splash art, dynamic composition, dramatic rim lighting, painterly rendering, detailed character design, /i, '')
+                    .replace(/^photorealistic, RAW photo, 8k UHD, DSLR, professional lighting, studio quality, /i, '')
+                    .replace(/^3d render, blender, unreal engine 5, octane render, volumetric lighting, subsurface scattering, PBR materials, video game character, detailed textures, sharp focus, /i, '')
                     .replace(/,\s*,+/g, ',')
                     .replace(/\s{2,}/g, ' ')
                     .trim().replace(/^,|,$/g, '').trim();
