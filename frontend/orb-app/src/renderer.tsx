@@ -5524,18 +5524,51 @@ return (
 
                       {/* Trigger words display */}
                       {lora.trigger_words?.length > 0 && editingTriggerLora !== lora.name && (
-                        <div style={{ marginTop: '4px', display: 'flex', flexWrap: 'wrap', gap: '3px', alignItems: 'center' }}>
-                          <span style={{ fontSize: '9px', color: '#666' }}>Triggers:</span>
-                          {lora.trigger_words.map((tw: string, j: number) => (
-                            <span key={j} onClick={() => insertTriggerWord(tw)}
-                              style={{
-                                padding: '1px 6px', borderRadius: '8px', fontSize: '9px',
-                                backgroundColor: 'rgba(0,204,136,0.1)', color: '#00cc88',
-                                border: '1px solid rgba(0,204,136,0.2)', cursor: 'pointer',
-                              }} title="Click to insert into prompt">{tw}</span>
-                          ))}
-                          <span onClick={() => { setEditingTriggerLora(lora.name); setTriggerWordInput(lora.trigger_words.join(', ')); }}
-                            style={{ fontSize: '9px', color: '#555', cursor: 'pointer' }} title="Edit triggers">✏️</span>
+                        <div style={{ marginTop: '4px' }}>
+                          {lora.trigger_words.length > 5 ? (
+                            <details>
+                              <summary style={{ fontSize: '9px', color: '#666', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                <span>Triggers ({lora.trigger_words.length})</span>
+                                {/* Show first 2 trigger words as preview */}
+                                <span style={{ display: 'inline-flex', gap: '3px', marginLeft: '2px' }}>
+                                  {lora.trigger_words.slice(0, 2).map((tw: string, j: number) => (
+                                    <span key={j} style={{
+                                      padding: '1px 5px', borderRadius: '8px', fontSize: '8px',
+                                      backgroundColor: 'rgba(0,204,136,0.08)', color: '#00aa77',
+                                      border: '1px solid rgba(0,204,136,0.15)',
+                                    }}>{tw.length > 20 ? tw.slice(0, 20) + '…' : tw}</span>
+                                  ))}
+                                  <span style={{ fontSize: '8px', color: '#555' }}>+{lora.trigger_words.length - 2}</span>
+                                </span>
+                              </summary>
+                              <div style={{ marginTop: '4px', display: 'flex', flexWrap: 'wrap', gap: '3px', alignItems: 'center' }}>
+                                {lora.trigger_words.map((tw: string, j: number) => (
+                                  <span key={j} onClick={() => insertTriggerWord(tw)}
+                                    style={{
+                                      padding: '1px 6px', borderRadius: '8px', fontSize: '9px',
+                                      backgroundColor: 'rgba(0,204,136,0.1)', color: '#00cc88',
+                                      border: '1px solid rgba(0,204,136,0.2)', cursor: 'pointer',
+                                    }} title="Click to insert into prompt">{tw}</span>
+                                ))}
+                                <span onClick={() => { setEditingTriggerLora(lora.name); setTriggerWordInput(lora.trigger_words.join(', ')); }}
+                                  style={{ fontSize: '9px', color: '#555', cursor: 'pointer' }} title="Edit triggers">✏️</span>
+                              </div>
+                            </details>
+                          ) : (
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '3px', alignItems: 'center' }}>
+                              <span style={{ fontSize: '9px', color: '#666' }}>Triggers:</span>
+                              {lora.trigger_words.map((tw: string, j: number) => (
+                                <span key={j} onClick={() => insertTriggerWord(tw)}
+                                  style={{
+                                    padding: '1px 6px', borderRadius: '8px', fontSize: '9px',
+                                    backgroundColor: 'rgba(0,204,136,0.1)', color: '#00cc88',
+                                    border: '1px solid rgba(0,204,136,0.2)', cursor: 'pointer',
+                                  }} title="Click to insert into prompt">{tw}</span>
+                              ))}
+                              <span onClick={() => { setEditingTriggerLora(lora.name); setTriggerWordInput(lora.trigger_words.join(', ')); }}
+                                style={{ fontSize: '9px', color: '#555', cursor: 'pointer' }} title="Edit triggers">✏️</span>
+                            </div>
+                          )}
                         </div>
                       )}
 
@@ -6558,21 +6591,60 @@ return (
                       <> | <span style={{ color: '#00cc88' }}>Long prompt ✓ (compel encoded)</span></>
                     )}
                   </div>
-                  {imageGenMeta.prompt_analysis?.estimated_focus && (
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
-                      {imageGenMeta.prompt_analysis.estimated_focus.map((f: any, i: number) => (
-                        <span key={i} style={{
-                          padding: '2px 8px', borderRadius: '12px', fontSize: '10px',
-                          backgroundColor: f.priority === 'high' ? 'rgba(0,204,136,0.2)' : f.priority === 'medium' ? 'rgba(255,153,0,0.15)' : 'rgba(100,100,100,0.15)',
-                          color: f.priority === 'high' ? '#00cc88' : f.priority === 'medium' ? '#ff9900' : '#666',
-                          border: '1px solid',
-                          borderColor: f.priority === 'high' ? 'rgba(0,204,136,0.3)' : f.priority === 'medium' ? 'rgba(255,153,0,0.2)' : 'rgba(100,100,100,0.2)',
-                        }}>
-                          {f.text}
-                        </span>
-                      ))}
-                    </div>
-                  )}
+                  {imageGenMeta.prompt_analysis?.estimated_focus && (() => {
+                    // Group tags by section for collapsible character rendering
+                    const groups: { section: string; items: any[] }[] = [];
+                    let currentSection = '';
+                    imageGenMeta.prompt_analysis.estimated_focus.forEach((f: any) => {
+                      const sec = f.section || 'shared';
+                      if (sec !== currentSection) {
+                        groups.push({ section: sec, items: [] });
+                        currentSection = sec;
+                      }
+                      groups[groups.length - 1].items.push(f);
+                    });
+
+                    return (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                        {groups.map((group, gi) => {
+                          const isChar = group.section !== 'shared';
+                          const tagElements = group.items.map((f: any, i: number) => (
+                            <span key={i} style={{
+                              padding: '2px 8px', borderRadius: '12px', fontSize: '10px',
+                              backgroundColor: f.priority === 'high' ? 'rgba(0,204,136,0.2)' : f.priority === 'character' ? 'rgba(124,77,255,0.2)' : f.priority === 'medium' ? 'rgba(255,153,0,0.15)' : 'rgba(100,100,100,0.15)',
+                              color: f.priority === 'high' ? '#00cc88' : f.priority === 'character' ? '#b388ff' : f.priority === 'medium' ? '#ff9900' : '#666',
+                              border: '1px solid',
+                              borderColor: f.priority === 'high' ? 'rgba(0,204,136,0.3)' : f.priority === 'character' ? 'rgba(124,77,255,0.3)' : f.priority === 'medium' ? 'rgba(255,153,0,0.2)' : 'rgba(100,100,100,0.2)',
+                            }}>
+                              {f.text}
+                            </span>
+                          ));
+
+                          if (isChar) {
+                            return (
+                              <details key={gi} open>
+                                <summary style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', margin: '2px 0' }}>
+                                  <span style={{ fontSize: '9px', color: '#7c4dff', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                                    BREAK — {group.section.replace('_', ' ')}
+                                  </span>
+                                  <span style={{ fontSize: '9px', color: '#555' }}>({group.items.length} tags)</span>
+                                  <div style={{ flex: 1, height: '1px', background: 'rgba(124,77,255,0.3)' }} />
+                                </summary>
+                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginTop: '4px', paddingLeft: '8px' }}>
+                                  {tagElements}
+                                </div>
+                              </details>
+                            );
+                          }
+                          return (
+                            <div key={gi} style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                              {tagElements}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })()}
                 </div>
 
                 {/* LoRA diagnostics */}
@@ -6590,12 +6662,18 @@ return (
                     </div>
                   </details>
                 )}
-                {imageGenMeta.injected_triggers && (
+                {imageGenMeta.injected_triggers?.length > 0 && (
                   <details style={{ fontSize: '11px', color: '#888' }}>
-                    <summary style={{ cursor: 'pointer', color: '#666' }}>Injected trigger words</summary>
-                    <pre style={{ marginTop: '4px', padding: '8px', backgroundColor: '#0a0a0a', borderRadius: '6px', whiteSpace: 'pre-wrap', wordBreak: 'break-all', fontSize: '10px', color: '#aaa', maxHeight: '80px', overflowY: 'auto' }}>
-                      {imageGenMeta.injected_triggers}
-                    </pre>
+                    <summary style={{ cursor: 'pointer', color: '#666' }}>Injected trigger words ({imageGenMeta.injected_triggers.length})</summary>
+                    <div style={{ marginTop: '4px', display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                      {imageGenMeta.injected_triggers.map((t: any, i: number) => (
+                        <div key={i} style={{ padding: '4px 8px', backgroundColor: '#0a0a0a', borderRadius: '6px', fontSize: '10px' }}>
+                          <span style={{ color: '#b388ff', fontWeight: 500 }}>{t.lora}</span>
+                          {t.method && <span style={{ color: '#555', marginLeft: '6px', fontSize: '9px' }}>({t.method})</span>}
+                          <div style={{ color: '#aaa', marginTop: '2px', wordBreak: 'break-all' }}>{t.injected}</div>
+                        </div>
+                      ))}
+                    </div>
                   </details>
                 )}
 

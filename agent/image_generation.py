@@ -774,21 +774,69 @@ def _save_history_to_disk():
 _load_history_from_disk()
 
 
+def _split_respecting_parens(text: str) -> list[str]:
+    """Split a prompt string by commas, but keep parenthesized groups intact.
+    e.g. '(h0l0r4t:1, black hair), 2 girls' → ['(h0l0r4t:1, black hair)', '2 girls']
+    """
+    parts = []
+    depth = 0
+    current = []
+    for ch in text:
+        if ch == '(':
+            depth += 1
+            current.append(ch)
+        elif ch == ')':
+            depth = max(0, depth - 1)
+            current.append(ch)
+        elif ch == ',' and depth == 0:
+            part = ''.join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+        else:
+            current.append(ch)
+    part = ''.join(current).strip()
+    if part:
+        parts.append(part)
+    return parts
+
+
 def _analyze_prompt(prompt: str) -> dict:
-    """Break down the prompt into weighted components for transparency."""
-    # Split by commas and weight markers
-    parts = [p.strip() for p in prompt.split(",") if p.strip()]
+    """Break down the prompt into weighted components for transparency.
+    Handles BREAK-separated sections and preserves parenthesized character groups.
+    """
+    # Split by BREAK tokens first to identify sections
+    sections = re.split(r'\s+BREAK\s+', prompt)
+
     analysis = {
-        "total_parts": len(parts),
-        "components": parts,
+        "total_parts": 0,
+        "components": [],
         "estimated_focus": [],
     }
 
-    # Early items get more attention from the model
-    for i, part in enumerate(parts):
-        weight = "high" if i < 3 else "medium" if i < 8 else "low"
-        analysis["estimated_focus"].append({"text": part, "priority": weight, "position": i + 1})
+    global_pos = 0
+    for sec_idx, section in enumerate(sections):
+        # Split by commas but keep parenthesized groups intact
+        parts = _split_respecting_parens(section)
 
+        for part in parts:
+            global_pos += 1
+            if sec_idx == 0:
+                # Shared section: use position-based priority
+                priority = "high" if global_pos <= 3 else "medium" if global_pos <= 8 else "low"
+            else:
+                # Character section: mark as character-specific
+                priority = "character"
+
+            analysis["estimated_focus"].append({
+                "text": part,
+                "priority": priority,
+                "position": global_pos,
+                "section": f"character_{sec_idx}" if sec_idx > 0 else "shared",
+            })
+            analysis["components"].append(part)
+
+    analysis["total_parts"] = len(analysis["components"])
     return analysis
 
 
@@ -1265,9 +1313,10 @@ def _structure_multi_character_prompt(prompt: str, lora_paths: list[str] | None 
     """Detect multiple character names in prompt and structure them so SDXL
     renders each character distinctly rather than merging them into one.
 
-    Only activates when 2+ character-category LoRAs are actively loaded,
-    preventing false positives from trigger words that happen to appear
-    in the prompt text.
+    Uses BREAK tokens to isolate each character's description into a separate
+    75-token attention window, preventing feature bleed between characters.
+
+    Only activates when 2+ character-category LoRAs are actively loaded.
 
     Args:
         selected_outfits: Optional dict of {lora_stem: outfit_name} for outfit selection.
@@ -1280,7 +1329,6 @@ def _structure_multi_character_prompt(prompt: str, lora_paths: list[str] | None 
     char_dir = MODELS_DIR / "characters"
     for lp in lora_paths:
         lp_path = Path(lp)
-        # Check if this LoRA lives in the characters/ folder
         try:
             if lp_path.parent.resolve() == char_dir.resolve():
                 char_lora_paths.append(lp)
@@ -1295,36 +1343,83 @@ def _structure_multi_character_prompt(prompt: str, lora_paths: list[str] | None 
 
     tw_data = _load_trigger_words()
     positions = ["on the left", "on the right", "in the center", "in the background"]
-    parts = []
     selected_outfits = selected_outfits or {}
 
-    for i, lp in enumerate(char_lora_paths[:4]):  # max 4 characters
+    # ── Step 1: Identify each character's primary trigger word ─────────────
+    char_info = []  # list of (lora_path, stem, primary_trigger, all_trigger_words)
+    for lp in char_lora_paths[:4]:
         stem = Path(lp).stem
-        pos = positions[i] if i < len(positions) else positions[-1]
-        # Use the new trigger word system for proper outfit-aware injection
         words = tw_data.get(stem, [])
-        if words:
-            outfit = selected_outfits.get(stem)
-            char_triggers = build_trigger_prompt(words, selected_outfit=outfit)
-        else:
-            char_triggers = stem
-        parts.append(f"{char_triggers}, {pos}")
+        primary = parse_trigger_word_entry(words[0])["word"] if words else stem
+        all_tw = [parse_trigger_word_entry(w)["word"] for w in words
+                  if parse_trigger_word_entry(w)["word"] and parse_trigger_word_entry(w)["word"] != ";"]
+        char_info.append((lp, stem, primary, all_tw))
 
-    # Remove character trigger words from the base prompt for the shared part
+    # ── Step 2: Extract parenthesized character blocks from the prompt ─────
+    # Users write e.g. "(h0l0r4t:1, black hair, short hair, ...)" to group a
+    # character's description.  We detect blocks containing a character's
+    # primary trigger and pull them out of the shared prompt.
     shared = prompt
-    for lp in char_lora_paths:
-        stem = Path(lp).stem
-        words = tw_data.get(stem, [])
-        for w in words:
-            tw_str = parse_trigger_word_entry(w)["word"]
-            if tw_str and tw_str != ";":
-                shared = re.sub(re.escape(tw_str), '', shared, flags=re.IGNORECASE)
-    shared = re.sub(r',\s*,', ',', shared).strip(', ')
+    char_blocks: dict[str, str] = {}  # stem -> extracted block text
 
-    structured = f"{len(char_lora_paths)} characters, group shot, {shared}"
+    for _lp, stem, primary, _all_tw in char_info:
+        # Match a parenthesized block containing the primary trigger,
+        # optionally preceded by BREAK and/or followed by a position phrase.
+        # This captures the entire "BREAK (trigger:1, tags...), on the left" segment.
+        paren_pat = r'\(\s*' + re.escape(primary) + r'[^)]*\)'
+        full_pat = (r'(?:\s*BREAK\s+)?' + paren_pat +
+                    r'(?:\s*,\s*(?:on the left|on the right|in the center|in the background))?')
+        match = re.search(full_pat, shared, re.IGNORECASE)
+        if match:
+            # Extract just the parenthesized block for the character section
+            paren_match = re.search(paren_pat, match.group(0), re.IGNORECASE)
+            char_blocks[stem] = paren_match.group(0) if paren_match else match.group(0)
+            # Remove the ENTIRE matched segment (including BREAK + position) from shared
+            shared = shared[:match.start()] + shared[match.end():]
+            _log.info("[IMAGE GEN] Extracted character block for %s: %s", stem, char_blocks[stem])
+
+    # ── Step 3: Strip any remaining standalone trigger words from shared ────
+    for _lp, stem, _primary, all_tw in char_info:
+        for tw_str in all_tw:
+            # Use word boundary to avoid partial matches
+            shared = re.sub(r'(?<![a-zA-Z])' + re.escape(tw_str) + r'(?![a-zA-Z])',
+                            '', shared, flags=re.IGNORECASE)
+
+    # Strip any leftover BREAK tokens and position phrases from shared
+    shared = re.sub(r'\bBREAK\b', '', shared)
+    shared = re.sub(r',?\s*on the (?:left|right)\b', '', shared, flags=re.IGNORECASE)
+    shared = re.sub(r',?\s*in the (?:center|background)\b', '', shared, flags=re.IGNORECASE)
+
+    # Clean up orphaned commas, empty parens, extra whitespace
+    shared = re.sub(r'\(\s*[:\d.]*\s*\)', '', shared)      # empty weighted parens like (:1)
+    shared = re.sub(r'\(\s*\)', '', shared)                 # empty parens
+    shared = re.sub(r',\s*,', ',', shared)                  # double commas
+    shared = re.sub(r',\s*,', ',', shared)                  # second pass
+    shared = re.sub(r'\s{2,}', ' ', shared)                 # collapse whitespace
+    shared = shared.strip(', \t\n')
+
+    # ── Step 4: Build BREAK-separated character sections ───────────────────
+    parts = []
+    for i, (lp, stem, primary, all_tw) in enumerate(char_info):
+        pos = positions[i] if i < len(positions) else positions[-1]
+
+        if stem in char_blocks:
+            # Use the user's own parenthesized character block
+            parts.append(f"{char_blocks[stem]}, {pos}")
+        else:
+            # Build from trigger word config (character wasn't manually grouped)
+            words = tw_data.get(stem, [])
+            outfit = selected_outfits.get(stem)
+            char_triggers = build_trigger_prompt(words, selected_outfit=outfit) if words else stem
+            parts.append(f"{char_triggers}, {pos}")
+
+    # ── Step 5: Assemble final prompt ──────────────────────────────────────
+    num_chars = len(char_info)
+    structured = f"{num_chars} characters, group shot, {shared}"
     for part in parts:
         structured += f" BREAK {part}"
 
+    _log.info("[IMAGE GEN] Structured multi-character prompt: %s", structured[:200])
     return structured
 
 
@@ -1427,15 +1522,39 @@ def generate_image(
                 _log.warning("[IMAGE GEN] ✗ LoRA not found: %s", lp)
 
     # Auto-inject missing trigger words for active LoRAs
+    # When 2+ character LoRAs are loaded, skip character LoRA injection here —
+    # _structure_multi_character_prompt will handle proper BREAK-separated injection.
     injected_triggers = []
     if lora_paths:
         tw_data = _load_trigger_words()
         prompt_lower = prompt.lower()
         selected_outfits = selected_outfits or {}
+
+        # Determine which LoRAs are character-type
+        char_dir = MODELS_DIR / "characters"
+        char_lora_stems = set()
+        for lp in lora_paths:
+            try:
+                if Path(lp).parent.resolve() == char_dir.resolve():
+                    char_lora_stems.add(Path(lp).stem)
+            except Exception:
+                pass
+        multi_char_mode = len(char_lora_stems) >= 2
+
         for lp in lora_paths:
             if not Path(lp).exists():
                 continue
             stem = Path(lp).stem
+            # Skip character LoRAs in multi-character mode — handled by BREAK structuring
+            if multi_char_mode and stem in char_lora_stems:
+                _log.info("[IMAGE GEN] Skipping auto-inject for character LoRA %s (multi-char mode)", stem)
+                words = tw_data.get(stem, [])
+                if words:
+                    outfit = selected_outfits.get(stem)
+                    trigger_str = build_trigger_prompt(words, selected_outfit=outfit)
+                    if trigger_str:
+                        injected_triggers.append({"lora": stem, "injected": trigger_str, "method": "BREAK section"})
+                continue
             words = tw_data.get(stem, [])
             if words:
                 # Build the full trigger prompt using outfit-aware system
@@ -2953,14 +3072,28 @@ def generate_preview_only(
                 load_lora(pipe, lp, weight=lw)
 
     # Build prompt with trigger word injection (same logic as generate_image)
+    # Skip character LoRA injection when 2+ character LoRAs are active
     selected_outfits = selected_outfits or {}
     if lora_paths:
         tw_data = _load_trigger_words()
         prompt_lower = prompt.lower()
+
+        char_dir = MODELS_DIR / "characters"
+        char_lora_stems = set()
+        for lp in lora_paths:
+            try:
+                if Path(lp).parent.resolve() == char_dir.resolve():
+                    char_lora_stems.add(Path(lp).stem)
+            except Exception:
+                pass
+        multi_char_mode = len(char_lora_stems) >= 2
+
         for lp in lora_paths:
             if not Path(lp).exists():
                 continue
             stem = Path(lp).stem
+            if multi_char_mode and stem in char_lora_stems:
+                continue
             words = tw_data.get(stem, [])
             if words:
                 outfit = selected_outfits.get(stem)
