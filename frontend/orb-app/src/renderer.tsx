@@ -302,6 +302,12 @@ function App() {
   const [animReferenceBlend, setAnimReferenceBlend] = useState(0.3);
   const [animStrengthCurve, setAnimStrengthCurve] = useState<'constant'|'ease_in'|'pulse'>('constant');
   const [animMotionIntensity, setAnimMotionIntensity] = useState(0.5);
+  // ── Multi-character composition panel ──────────────────────────────────────
+  type CharEntry = { lora: string; description: string; position: string; outfit: string };
+  const [charEntries, setCharEntries] = useState<CharEntry[]>([]);
+  const [charPanelOpen, setCharPanelOpen] = useState(true);
+  const [charOutfitOptions, setCharOutfitOptions] = useState<Record<string, string[]>>({}); // lora -> outfit names
+  const [charSharedPrompt, setCharSharedPrompt] = useState('');
   // ── UI layout ──────────────────────────────────────────────────────────────
   const [modelsExpanded, setModelsExpanded] = useState(false);
   // ── GPU monitor & progress tracking ────────────────────────────────────────
@@ -1920,6 +1926,137 @@ const toggleLoraWithTrigger = (loraName: string, triggerWords?: string[]) => {
       return [...prev, loraName];
     }
   });
+};
+
+// ── Multi-character composition helpers ──────────────────────────────────
+const getCharacterLoras = (): string[] => {
+  const charLoras = (loraCategories['characters'] || []) as any[];
+  return selectedLoras.filter(l => charLoras.some((lr: any) => lr.name === l));
+};
+
+// Fetch outfit options for a character LoRA
+const fetchCharOutfits = async (loraName: string) => {
+  try {
+    const res = await fetch(`http://localhost:8000/generate/loras/trigger-words/parsed/${encodeURIComponent(loraName)}`);
+    const data = await res.json();
+    if (data.has_outfits && data.outfits) {
+      setCharOutfitOptions(prev => ({ ...prev, [loraName]: Object.keys(data.outfits) }));
+    }
+  } catch {}
+};
+
+// Auto-sync character entries when selectedLoras changes
+useEffect(() => {
+  const charLoras = getCharacterLoras();
+  if (charLoras.length < 2) {
+    // Not multi-char mode
+    if (charEntries.length > 0) setCharEntries([]);
+    return;
+  }
+  const positions = ['on the left', 'on the right', 'in the center', 'in the background'];
+  setCharEntries(prev => {
+    const updated: CharEntry[] = [];
+    charLoras.forEach((l, i) => {
+      const existing = prev.find(e => e.lora === l);
+      if (existing) {
+        updated.push(existing);
+      } else {
+        // Find the LoRA data to get primary trigger
+        const loraData = (loraCategories['characters'] as any[] || []).find((lr: any) => lr.name === l);
+        const tw = loraData?.trigger_words || [];
+        // Get primary trigger: first word (or first part before colon)
+        let primaryTrigger = l;
+        if (tw.length > 0) {
+          const first = tw[0];
+          const colonMatch = first.match(/^(.+?):\s*(.+)/);
+          if (colonMatch) {
+            // Colon format: use the trigger code from first entry
+            const rest = colonMatch[1].trim();
+            primaryTrigger = rest.includes('Base') ? (tw[0]) : first;
+          } else {
+            primaryTrigger = first;
+          }
+        }
+        updated.push({ lora: l, description: '', position: positions[i] || positions[positions.length - 1], outfit: '' });
+        // Fetch outfit options
+        fetchCharOutfits(l);
+      }
+    });
+    return updated;
+  });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [selectedLoras, loraCategories]);
+
+// Compose BREAK-separated prompt from character panel
+const composeCharacterPrompt = () => {
+  const charLoras = getCharacterLoras();
+  if (charLoras.length < 2 || charEntries.length < 2) return;
+
+  const parts: string[] = [];
+
+  // Shared prompt (scene description)
+  const shared = charSharedPrompt.trim();
+  if (shared) {
+    parts.push(`${charEntries.length} characters, group shot, ${shared}`);
+  } else {
+    parts.push(`${charEntries.length} characters, group shot`);
+  }
+
+  // Each character section
+  for (const entry of charEntries) {
+    const loraData = (loraCategories['characters'] as any[] || []).find((lr: any) => lr.name === entry.lora);
+    const tw = loraData?.trigger_words || [];
+
+    let charBlock = '';
+
+    if (entry.description.trim()) {
+      // User has written a custom description
+      charBlock = entry.description.trim();
+    } else if (entry.outfit && tw.length > 0) {
+      // User selected an outfit — find the tags for it
+      for (const t of tw) {
+        if (t.toLowerCase().startsWith(entry.outfit.toLowerCase())) {
+          // Colon format: "Outfit Name:trigger, tag1, tag2"
+          const colonIdx = t.indexOf(':');
+          charBlock = colonIdx >= 0 ? t.substring(colonIdx + 1).trim() : t;
+          break;
+        }
+      }
+      if (!charBlock) charBlock = tw[0]; // fallback
+    } else if (tw.length > 0) {
+      // Use primary trigger as default
+      const first = tw[0];
+      const colonMatch = first.match(/^[^:]+:\s*(.+)/);
+      charBlock = colonMatch ? colonMatch[1].trim() : first;
+    } else {
+      charBlock = entry.lora;
+    }
+
+    // Wrap in parentheses with weight if not already wrapped
+    if (!charBlock.startsWith('(')) {
+      // Extract trigger code (first comma-separated part) and give it weight
+      const firstComma = charBlock.indexOf(',');
+      if (firstComma > 0) {
+        const trigger = charBlock.substring(0, firstComma).trim();
+        const rest = charBlock.substring(firstComma + 1).trim();
+        charBlock = `(${trigger}:1, ${rest})`;
+      } else {
+        charBlock = `(${charBlock}:1)`;
+      }
+    }
+
+    parts.push(`${charBlock}, ${entry.position}`);
+  }
+
+  // Set the composed prompt
+  setImageGenPrompt(parts.join(' BREAK '));
+
+  // Also set outfits for backend
+  const outfitMap: Record<string, string> = {};
+  for (const entry of charEntries) {
+    if (entry.outfit) outfitMap[entry.lora] = entry.outfit;
+  }
+  setSelectedOutfits(outfitMap);
 };
 
 // Fetch animation jobs
@@ -5338,15 +5475,23 @@ return (
                     const loraData = Object.values(loraCategories).flat().find((lr: any) => lr.name === l) as any;
                     const loraTw = loraData?.trigger_words;
                     const weight = loraWeights[l] ?? 0.8;
-                    // Check if this LoRA has outfit groups (semicolons in trigger words)
-                    const hasOutfits = loraTw && loraTw.some((tw: string) => tw === ';');
+                    // Check if this LoRA has outfit groups:
+                    // 1) Semicolon-delimited: ["trigger", ";", "outfitName", ...]
+                    // 2) Colon-delimited: ["OutfitName:TriggerCode, tag1, tag2", ...]
+                    const hasOutfitsSemicolon = loraTw && loraTw.some((tw: string) => tw === ';');
+                    const hasOutfitsColon = loraTw && !hasOutfitsSemicolon && loraTw.filter((tw: string) => /^.+:\s*.+/.test(tw)).length >= 2;
+                    const hasOutfits = hasOutfitsSemicolon || hasOutfitsColon;
                     let outfitNames: string[] = [];
-                    if (hasOutfits) {
-                      // Parse outfit names: words after each ";" that aren't tags
+                    if (hasOutfitsSemicolon) {
                       let inGroup = false;
                       for (const tw of loraTw) {
                         if (tw === ';') { inGroup = true; continue; }
                         if (inGroup) { outfitNames.push(tw); inGroup = false; }
+                      }
+                    } else if (hasOutfitsColon) {
+                      for (const tw of loraTw) {
+                        const m = tw.match(/^(.+?):\s*.+/);
+                        if (m) outfitNames.push(m[1].trim());
                       }
                     }
                     return (
@@ -6236,6 +6381,156 @@ return (
 
           {/* Center panel: Prompt + Result */}
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '12px', minWidth: 0 }}>
+
+            {/* Multi-character composition panel */}
+            {charEntries.length >= 2 && (
+              <div style={{
+                backgroundColor: 'rgba(10,10,30,0.95)', borderRadius: '14px',
+                border: '1px solid rgba(124,77,255,0.3)', backdropFilter: 'blur(16px)',
+                padding: '12px',
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: charPanelOpen ? '10px' : '0' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }} onClick={() => setCharPanelOpen(!charPanelOpen)}>
+                    <span style={{ fontSize: '12px', color: '#7c4dff', fontWeight: 600 }}>
+                      {charPanelOpen ? '▼' : '▶'} Character Composer ({charEntries.length} characters)
+                    </span>
+                    <span style={{ fontSize: '9px', color: '#555' }}>Build BREAK-separated prompts per character</span>
+                  </div>
+                  <button onClick={composeCharacterPrompt} style={{
+                    padding: '5px 14px', borderRadius: '8px', border: 'none',
+                    background: 'linear-gradient(135deg, #7c4dff, #b388ff)', color: '#fff',
+                    fontSize: '11px', fontWeight: 'bold', cursor: 'pointer',
+                  }}>⚡ Compose Prompt</button>
+                </div>
+
+                {charPanelOpen && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    {/* Shared scene description */}
+                    <div style={{ padding: '8px', borderRadius: '8px', backgroundColor: 'rgba(0,204,136,0.05)', border: '1px solid rgba(0,204,136,0.15)' }}>
+                      <label style={{ fontSize: '10px', color: '#00cc88', fontWeight: 600, display: 'block', marginBottom: '4px' }}>
+                        Scene Description (shared between all characters)
+                      </label>
+                      <input type="text" value={charSharedPrompt}
+                        onChange={e => setCharSharedPrompt(e.target.value)}
+                        placeholder="sloppy blowjob, throat clenching, euphoric, (anime screencap:0.8)..."
+                        style={{ width: '100%', padding: '6px 10px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#0a0a0a', color: '#fff', fontSize: '11px', outline: 'none', boxSizing: 'border-box' }} />
+                    </div>
+
+                    {/* Per-character entries */}
+                    {charEntries.map((entry, idx) => {
+                      const loraData = (loraCategories['characters'] as any[] || []).find((lr: any) => lr.name === entry.lora);
+                      const tw = loraData?.trigger_words || [];
+                      const outfits = charOutfitOptions[entry.lora] || [];
+                      // Detect colon-format outfit names from trigger words directly
+                      const colonOutfits = tw.filter((t: string) => /^.+:\s*.+/.test(t)).map((t: string) => {
+                        const m = t.match(/^(.+?):\s*/);
+                        return m ? m[1].trim() : t;
+                      });
+                      const allOutfits = outfits.length > 0 ? outfits : colonOutfits;
+
+                      return (
+                        <div key={entry.lora} style={{
+                          padding: '8px', borderRadius: '8px',
+                          backgroundColor: 'rgba(124,77,255,0.05)',
+                          border: '1px solid rgba(124,77,255,0.2)',
+                        }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                            <span style={{ fontSize: '11px', color: '#b388ff', fontWeight: 600 }}>
+                              Character {idx + 1}: {entry.lora}
+                            </span>
+                            <select value={entry.position}
+                              onChange={e => setCharEntries(prev => prev.map((c, i) => i === idx ? { ...c, position: e.target.value } : c))}
+                              style={{ padding: '2px 8px', borderRadius: '6px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '10px' }}>
+                              <option value="on the left">Left</option>
+                              <option value="on the right">Right</option>
+                              <option value="in the center">Center</option>
+                              <option value="in the background">Background</option>
+                            </select>
+                          </div>
+
+                          {/* Outfit selector */}
+                          {allOutfits.length > 0 && (
+                            <div style={{ marginBottom: '6px' }}>
+                              <label style={{ fontSize: '9px', color: '#666', display: 'block', marginBottom: '3px' }}>Outfit:</label>
+                              <div style={{ display: 'flex', gap: '3px', flexWrap: 'wrap' }}>
+                                {allOutfits.map((outfit: string) => (
+                                  <span key={outfit}
+                                    onClick={() => {
+                                      setCharEntries(prev => prev.map((c, i) => i === idx ? { ...c, outfit: c.outfit === outfit ? '' : outfit } : c));
+                                      // When outfit selected, auto-fill description
+                                      const matchingTw = tw.find((t: string) => t.toLowerCase().startsWith(outfit.toLowerCase()));
+                                      if (matchingTw) {
+                                        const colonIdx = matchingTw.indexOf(':');
+                                        const tags = colonIdx >= 0 ? matchingTw.substring(colonIdx + 1).trim() : matchingTw;
+                                        setCharEntries(prev => prev.map((c, i) => i === idx ? { ...c, description: tags, outfit: c.outfit === outfit ? '' : outfit } : c));
+                                      }
+                                    }}
+                                    style={{
+                                      padding: '2px 8px', borderRadius: '8px', fontSize: '9px', cursor: 'pointer',
+                                      backgroundColor: entry.outfit === outfit ? 'rgba(124,77,255,0.3)' : 'rgba(50,50,50,0.3)',
+                                      color: entry.outfit === outfit ? '#b388ff' : '#888',
+                                      border: `1px solid ${entry.outfit === outfit ? 'rgba(124,77,255,0.4)' : '#333'}`,
+                                      maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                                    }}
+                                    title={outfit}
+                                  >{outfit.length > 30 ? outfit.slice(0, 30) + '…' : outfit}</span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Character description */}
+                          <textarea
+                            value={entry.description}
+                            onChange={e => setCharEntries(prev => prev.map((c, i) => i === idx ? { ...c, description: e.target.value } : c))}
+                            placeholder={`Character tags for ${entry.lora}... (e.g., GigiBase, pink eyes, multicolored hair, short twintails)`}
+                            rows={2}
+                            style={{
+                              width: '100%', padding: '6px 10px', borderRadius: '6px', border: '1px solid #333',
+                              backgroundColor: '#0a0a0a', color: '#eee', fontSize: '11px', outline: 'none',
+                              resize: 'vertical', fontFamily: 'inherit', boxSizing: 'border-box',
+                            }}
+                          />
+
+                          {/* Quick-insert trigger tags */}
+                          {tw.length > 0 && (
+                            <details style={{ marginTop: '4px' }}>
+                              <summary style={{ fontSize: '9px', color: '#555', cursor: 'pointer' }}>Insert trigger tags</summary>
+                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '3px', marginTop: '4px' }}>
+                                {tw.map((t: string, j: number) => {
+                                  // For colon-format, show just the label as the tag
+                                  const isColonFmt = /^.+:\s*.+/.test(t);
+                                  const label = isColonFmt ? t.match(/^(.+?):/)?.[1]?.trim() || t : t;
+                                  return (
+                                    <span key={j}
+                                      onClick={() => {
+                                        const value = isColonFmt ? (t.substring(t.indexOf(':') + 1).trim()) : t;
+                                        setCharEntries(prev => prev.map((c, i) => {
+                                          if (i !== idx) return c;
+                                          const existing = c.description.trim();
+                                          return { ...c, description: existing ? existing + ', ' + value : value };
+                                        }));
+                                      }}
+                                      style={{
+                                        padding: '1px 6px', borderRadius: '8px', fontSize: '8px', cursor: 'pointer',
+                                        backgroundColor: 'rgba(0,204,136,0.08)', color: '#00aa77',
+                                        border: '1px solid rgba(0,204,136,0.15)',
+                                      }}
+                                      title={t}
+                                    >{label.length > 25 ? label.slice(0, 25) + '…' : label}</span>
+                                  );
+                                })}
+                              </div>
+                            </details>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Prompt input */}
             <div style={{
               backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '14px',

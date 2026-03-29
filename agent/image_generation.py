@@ -284,76 +284,113 @@ def format_trigger_word(entry) -> str:
 
 
 def parse_outfit_groups(words: list) -> dict:
-    """Parse a trigger word array that uses `;` as outfit/costume group separator.
+    """Parse a trigger word array into primary trigger + outfit groups.
 
-    Format in trigger_words.json:
+    Supports TWO formats:
+
+    1) Semicolon-delimited (legacy):
         ["primaryTrigger", ";", "outfitName", "tag1", "tag2", ";", "outfit2", ...]
+
+    2) Colon-delimited (ChamModels style):
+        Each entry is "Outfit Name:TriggerCode, tag1, tag2, tag3"
+        or "Base appearance (for custom outfits): TriggerCode, tag1, tag2"
 
     Returns:
         {
-            "primary": "primaryTrigger",         # first word before any ";"
-            "outfits": {                          # groups delimited by ";"
-                "outfitName": ["tag1", "tag2"],
-                "outfit2": [...]
+            "primary": "primaryTrigger",
+            "outfits": {
+                "outfitName": [{"word": "tag1", "weight": 1.0}, ...],
+                ...
             },
-            "flat_words": ["primaryTrigger", "tag1", "tag2", ...],  # all non-";" entries
+            "flat_words": [{"word": "...", "weight": 1.0}, ...],
             "has_outfits": True/False
         }
     """
     raw_entries = [parse_trigger_word_entry(w) for w in words]
-    # Check if semicolons are present
-    has_semicolons = any(e["word"] == ";" for e in raw_entries)
 
-    if not has_semicolons:
-        # Simple list — no outfit grouping. All words are trigger words.
-        flat = [e for e in raw_entries if e["word"]]
+    # ── Strategy 1: Semicolon-delimited format ─────────────────────────────
+    has_semicolons = any(e["word"] == ";" for e in raw_entries)
+    if has_semicolons:
+        groups: list[list[dict]] = []
+        current: list[dict] = []
+        for e in raw_entries:
+            if e["word"] == ";":
+                if current:
+                    groups.append(current)
+                current = []
+            else:
+                if e["word"]:
+                    current.append(e)
+        if current:
+            groups.append(current)
+
+        primary = groups[0][0]["word"] if groups and groups[0] else ""
+        outfits: dict[str, list[dict]] = {}
+        for g in groups[1:]:
+            if g:
+                outfit_name = g[0]["word"]
+                outfit_tags = g[1:] if len(g) > 1 else []
+                outfits[outfit_name] = outfit_tags
+
+        flat = [e for e in raw_entries if e["word"] and e["word"] != ";"]
         return {
-            "primary": flat[0]["word"] if flat else "",
-            "outfits": {},
+            "primary": primary,
+            "outfits": outfits,
             "flat_words": flat,
-            "has_outfits": False,
+            "has_outfits": bool(outfits),
         }
 
-    # Split by semicolons into groups
-    groups: list[list[dict]] = []
-    current: list[dict] = []
+    # ── Strategy 2: Colon-delimited format ─────────────────────────────────
+    # Detect entries like "Outfit Name:TriggerCode, tag1, tag2"
+    # or "Base appearance (for custom outfits): TriggerCode, tag1, tag2"
+    colon_entries = []
     for e in raw_entries:
-        if e["word"] == ";":
-            if current:
-                groups.append(current)
-            current = []
-        else:
-            if e["word"]:
-                current.append(e)
-    if current:
-        groups.append(current)
+        word = e["word"]
+        if not word:
+            continue
+        # Match "Label: tags" or "Label:tags" pattern  
+        # Labels typically contain words like "Outfit", "Default", "Base", "Casual", etc.
+        colon_match = re.match(r'^(.+?):\s*(.+)$', word)
+        if colon_match:
+            label = colon_match.group(1).strip()
+            rest = colon_match.group(2).strip()
+            colon_entries.append((label, rest, e))
 
-    # First group's first word (before any ";") = primary trigger
-    primary = groups[0][0]["word"] if groups and groups[0] else ""
+    # If most entries have colons, treat as colon-delimited outfit format
+    if len(colon_entries) >= 2 and len(colon_entries) >= len(raw_entries) * 0.5:
+        primary = ""
+        outfits = {}
 
-    # Everything in the first group beyond the primary is NOT an outfit — it's
-    # standalone trigger words. Remaining groups are outfit groups.
-    outfits: dict[str, list[dict]] = {}
-    standalone: list[dict] = []
+        for label, rest, _orig in colon_entries:
+            # Parse the rest as comma-separated tags
+            tags = [{"word": t.strip(), "weight": 1.0} for t in rest.split(",") if t.strip()]
+            is_base = "base" in label.lower() or "custom outfit" in label.lower()
 
-    if groups:
-        # First group: primary + any extras that aren't outfit groups
-        standalone = groups[0]
+            if is_base and not primary:
+                # Base appearance — first tag is typically the trigger code
+                primary = tags[0]["word"] if tags else label
+                outfits[label] = tags
+            else:
+                # Named outfit
+                outfits[label] = tags
+                if not primary and tags:
+                    primary = tags[0]["word"]
 
-    # Groups after the first — each starts with an outfit name
-    for g in groups[1:]:
-        if g:
-            outfit_name = g[0]["word"]
-            outfit_tags = g[1:] if len(g) > 1 else []
-            outfits[outfit_name] = outfit_tags
+        flat = [e for e in raw_entries if e["word"]]
+        return {
+            "primary": primary,
+            "outfits": outfits,
+            "flat_words": flat,
+            "has_outfits": bool(outfits),
+        }
 
-    flat = [e for e in raw_entries if e["word"] and e["word"] != ";"]
-
+    # ── Strategy 3: Simple flat list, no outfits ───────────────────────────
+    flat = [e for e in raw_entries if e["word"]]
     return {
-        "primary": primary,
-        "outfits": outfits,
+        "primary": flat[0]["word"] if flat else "",
+        "outfits": {},
         "flat_words": flat,
-        "has_outfits": bool(outfits),
+        "has_outfits": False,
     }
 
 
@@ -1338,6 +1375,14 @@ def _structure_multi_character_prompt(prompt: str, lora_paths: list[str] | None 
     if len(char_lora_paths) < 2:
         return prompt
 
+    # If the prompt already has BREAK sections with character triggers,
+    # it was likely composed by the frontend character panel — skip re-structuring
+    existing_breaks = len(re.findall(r'\bBREAK\b', prompt))
+    if existing_breaks >= len(char_lora_paths):
+        _log.info("[IMAGE GEN] Prompt already has %d BREAK sections for %d char LoRAs — skipping re-structure",
+                  existing_breaks, len(char_lora_paths))
+        return prompt
+
     _log.info("[IMAGE GEN] Multi-character structuring: %d character LoRAs active",
               len(char_lora_paths))
 
@@ -1389,6 +1434,9 @@ def _structure_multi_character_prompt(prompt: str, lora_paths: list[str] | None 
     shared = re.sub(r'\bBREAK\b', '', shared)
     shared = re.sub(r',?\s*on the (?:left|right)\b', '', shared, flags=re.IGNORECASE)
     shared = re.sub(r',?\s*in the (?:center|background)\b', '', shared, flags=re.IGNORECASE)
+    # Remove existing "N characters" and "group shot" to avoid duplication
+    shared = re.sub(r'\d+\s*characters?\b', '', shared, flags=re.IGNORECASE)
+    shared = re.sub(r'\bgroup\s+shot\b', '', shared, flags=re.IGNORECASE)
 
     # Clean up orphaned commas, empty parens, extra whitespace
     shared = re.sub(r'\(\s*[:\d.]*\s*\)', '', shared)      # empty weighted parens like (:1)
