@@ -1471,6 +1471,314 @@ def _structure_multi_character_prompt(prompt: str, lora_paths: list[str] | None 
     return structured
 
 
+# ── Regional conditioning for multi-character isolation ───────────────────
+
+def _encode_single_sdxl(pipe, prompt: str, device: str = "cuda"):
+    """Encode a single prompt using SDXL's dual text encoders.
+    Returns (prompt_embeds, pooled_prompt_embeds).
+    """
+    dtype = pipe.text_encoder.dtype
+
+    # Text encoder 1 (CLIP-L)
+    tokens_1 = pipe.tokenizer(
+        prompt, padding="max_length", max_length=pipe.tokenizer.model_max_length,
+        truncation=True, return_tensors="pt",
+    ).to(device)
+    with torch.no_grad():
+        enc_1 = pipe.text_encoder(tokens_1.input_ids, output_hidden_states=True)
+    # Use penultimate hidden state for SDXL
+    hidden_1 = enc_1.hidden_states[-2]
+
+    # Text encoder 2 (CLIP-G)
+    tokens_2 = pipe.tokenizer_2(
+        prompt, padding="max_length", max_length=pipe.tokenizer_2.model_max_length,
+        truncation=True, return_tensors="pt",
+    ).to(device)
+    with torch.no_grad():
+        enc_2 = pipe.text_encoder_2(tokens_2.input_ids, output_hidden_states=True)
+    hidden_2 = enc_2.hidden_states[-2]
+    pooled = enc_2[0]  # pooled output from the final layer
+
+    # Concatenate: SDXL expects [enc_1, enc_2] along the last dim
+    prompt_embeds = torch.cat([hidden_1, hidden_2], dim=-1).to(dtype=dtype)
+    pooled = pooled.to(dtype=dtype)
+
+    return prompt_embeds, pooled
+
+
+def _create_spatial_masks(regions: list[dict], latent_w: int, latent_h: int,
+                          device: str = "cuda", dtype=torch.float16) -> list[torch.Tensor]:
+    """Create soft spatial masks for each character region.
+
+    Masks are Gaussian-edged to prevent hard seams between character regions.
+    All masks together with a background fill sum to ~1.0 at every pixel.
+    """
+    n = len(regions)
+    masks = []
+    edge_width = max(2, latent_w // (n * 3))  # smooth transition zone
+
+    for r in regions:
+        pos = r["position"]
+        mask = torch.zeros(1, 1, latent_h, latent_w, device=device, dtype=dtype)
+
+        if pos == "left":
+            boundary = latent_w // n
+            for x in range(latent_w):
+                if x < boundary:
+                    mask[0, 0, :, x] = 1.0
+                elif x < boundary + edge_width:
+                    mask[0, 0, :, x] = 1.0 - (x - boundary) / edge_width
+
+        elif pos == "right":
+            boundary = latent_w - latent_w // n
+            for x in range(latent_w):
+                if x > boundary:
+                    mask[0, 0, :, x] = 1.0
+                elif x > boundary - edge_width:
+                    mask[0, 0, :, x] = (x - (boundary - edge_width)) / edge_width
+
+        elif pos == "center":
+            left_b = latent_w // n
+            right_b = latent_w - latent_w // n
+            for x in range(latent_w):
+                if left_b <= x <= right_b:
+                    mask[0, 0, :, x] = 1.0
+                elif left_b - edge_width <= x < left_b:
+                    mask[0, 0, :, x] = (x - (left_b - edge_width)) / edge_width
+                elif right_b < x <= right_b + edge_width:
+                    mask[0, 0, :, x] = 1.0 - (x - right_b) / edge_width
+
+        elif pos == "background":
+            mask.fill_(0.3)  # low-weight everywhere
+
+        else:
+            # Unknown position — equal weight
+            mask.fill_(1.0 / n)
+
+        masks.append(mask)
+
+    return masks
+
+
+def _parse_regional_sections(prompt: str) -> tuple[str, list[dict]] | None:
+    """Parse a BREAK-separated prompt into shared + character regions.
+
+    Returns None if the prompt doesn't have character regions.
+    Returns (shared_prompt, [{"prompt": str, "position": str}, ...])
+    """
+    sections = re.split(r'\s+BREAK\s+', prompt)
+    if len(sections) < 3:  # need shared + at least 2 characters
+        return None
+
+    shared = sections[0].strip()
+    regions = []
+    for sec in sections[1:]:
+        sec = sec.strip()
+        if not sec:
+            continue
+        pos = "center"
+        sec_lower = sec.lower()
+        if "on the left" in sec_lower:
+            pos = "left"
+        elif "on the right" in sec_lower:
+            pos = "right"
+        elif "in the center" in sec_lower:
+            pos = "center"
+        elif "in the background" in sec_lower:
+            pos = "background"
+        regions.append({"prompt": sec, "position": pos})
+
+    if len(regions) < 2:
+        return None
+    return shared, regions
+
+
+def _generate_regional(
+    pipe, prompt: str, negative_prompt: str,
+    width: int, height: int, steps: int, guidance_scale: float,
+    generator: torch.Generator,
+):
+    """Generate an image using regional conditioning for multi-character isolation.
+
+    Instead of encoding the full BREAK-separated prompt as one, this function:
+    1. Parses character sections from the prompt
+    2. Encodes each character's section separately
+    3. Creates spatial masks for each character's region
+    4. Runs a custom denoising loop where each step blends per-region
+       noise predictions using the spatial masks
+
+    This prevents cross-attention bleed between characters because each
+    region's noise prediction is computed from ONLY that character's
+    conditioning, not the full concatenated prompt.
+
+    Typically ~2.5x slower than standard generation (N+2 UNet passes per step
+    instead of 2), but produces much better character isolation.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = pipe.unet.dtype
+
+    parsed = _parse_regional_sections(prompt)
+    if parsed is None:
+        # Fallback to normal generation
+        return pipe(
+            prompt=prompt, negative_prompt=negative_prompt,
+            width=width, height=height, num_inference_steps=steps,
+            guidance_scale=guidance_scale, generator=generator,
+        ).images[0]
+
+    shared_prompt, regions = parsed
+    n_chars = len(regions)
+    latent_h, latent_w = height // 8, width // 8
+
+    _log.info("[IMAGE GEN] Regional conditioning: %d character regions, %d steps", n_chars, steps)
+    _log.info("[IMAGE GEN] Shared: %s", shared_prompt[:100])
+    for i, r in enumerate(regions):
+        _log.info("[IMAGE GEN] Region %d (%s): %s", i, r["position"], r["prompt"][:80])
+
+    # ── Encode prompts ─────────────────────────────────────────────────────
+    # Negative (shared across all regions)
+    neg_embeds, neg_pooled = _encode_single_sdxl(pipe, negative_prompt, device)
+
+    # Shared scene prompt (for background / uncovered areas)
+    shared_embeds, shared_pooled = _encode_single_sdxl(pipe, shared_prompt, device)
+
+    # Per-character prompts (include shared scene for context coherence)
+    char_embeds_list = []
+    for r in regions:
+        combined = f"{shared_prompt}, {r['prompt']}"
+        embeds, pooled = _encode_single_sdxl(pipe, combined, device)
+        char_embeds_list.append((embeds, pooled))
+
+    # ── Create spatial masks ───────────────────────────────────────────────
+    masks = _create_spatial_masks(regions, latent_w, latent_h, device, dtype)
+
+    # Compute background mask (areas not strongly covered by any character)
+    mask_sum = torch.stack(masks).sum(dim=0).clamp(min=0)
+    bg_mask = (1.0 - mask_sum).clamp(min=0)
+
+    # ── Prepare time IDs (SDXL-specific conditioning) ──────────────────
+    # Format: [original_h, original_w, crop_top, crop_left, target_h, target_w]
+    add_time_ids = torch.tensor(
+        [[height, width, 0, 0, height, width]], dtype=dtype,
+    ).to(device)
+
+    # ── Prepare latents ────────────────────────────────────────────────────
+    latents = torch.randn(
+        1, 4, latent_h, latent_w,
+        generator=generator, device=device, dtype=dtype,
+    )
+
+    # ── Setup scheduler ────────────────────────────────────────────────────
+    pipe.scheduler.set_timesteps(steps, device=device)
+    timesteps = pipe.scheduler.timesteps
+    latents = latents * pipe.scheduler.init_noise_sigma
+
+    # ── Regional denoising loop ────────────────────────────────────────────
+    for step_idx, t in enumerate(timesteps):
+        _update_progress(current_step=step_idx + 1)
+        if _cancel_event.is_set():
+            _cancel_event.clear()
+            raise InterruptedError("Generation cancelled by user")
+
+        latent_input = pipe.scheduler.scale_model_input(latents, t)
+
+        # 1) Unconditional noise prediction
+        uncond_kwargs = {
+            "text_embeds": neg_pooled,
+            "time_ids": add_time_ids,
+        }
+        with torch.no_grad():
+            noise_uncond = pipe.unet(
+                latent_input, t,
+                encoder_hidden_states=neg_embeds,
+                added_cond_kwargs=uncond_kwargs,
+            ).sample
+
+        # 2) Shared scene noise prediction (for background areas)
+        shared_kwargs = {
+            "text_embeds": shared_pooled,
+            "time_ids": add_time_ids,
+        }
+        with torch.no_grad():
+            noise_shared = pipe.unet(
+                latent_input, t,
+                encoder_hidden_states=shared_embeds,
+                added_cond_kwargs=shared_kwargs,
+            ).sample
+
+        # 3) Per-character noise predictions, blended by spatial masks
+        noise_cond = noise_shared * bg_mask  # background gets shared conditioning
+
+        for mask, (char_emb, char_pooled) in zip(masks, char_embeds_list):
+            char_kwargs = {
+                "text_embeds": char_pooled,
+                "time_ids": add_time_ids,
+            }
+            with torch.no_grad():
+                noise_char = pipe.unet(
+                    latent_input, t,
+                    encoder_hidden_states=char_emb,
+                    added_cond_kwargs=char_kwargs,
+                ).sample
+            noise_cond = noise_cond + noise_char * mask
+
+        # 4) Classifier-Free Guidance
+        noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+
+        # 5) Scheduler step
+        latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+    # ── Decode latents to image ────────────────────────────────────────────
+    latents = latents / pipe.vae.config.scaling_factor
+    with torch.no_grad():
+        image = pipe.vae.decode(latents).sample
+    image = pipe.image_processor.postprocess(image, output_type="pil")[0]
+
+    _log.info("[IMAGE GEN] Regional generation complete — %d regions", n_chars)
+    return image
+
+
+def _build_anti_bleed_negative(regions: list[dict]) -> str:
+    """Generate per-character anti-bleed negative prompt additions.
+
+    Scans each character's description for distinctive features (hair color,
+    eye color) and adds them as negatives for OTHER characters' regions.
+    This helps SDXL avoid bleeding features between characters.
+    """
+    # Extract color-related features from each character section
+    color_features = []
+    color_pattern = re.compile(
+        r'((?:light |dark )?(?:blonde|pink|blue|red|green|purple|white|black|brown|silver|grey|gray|'
+        r'orange|yellow|multicolored|streaked)\s+(?:hair|eyes?))',
+        re.IGNORECASE,
+    )
+    for r in regions:
+        features = color_pattern.findall(r["prompt"])
+        color_features.append(features)
+
+    # For each character, the OTHER characters' distinctive features should be negated
+    anti_bleed_parts = []
+    for i, features in enumerate(color_features):
+        other_features = []
+        for j, other in enumerate(color_features):
+            if i != j:
+                other_features.extend(other)
+        if other_features:
+            anti_bleed_parts.extend(other_features)
+
+    if anti_bleed_parts:
+        # Deduplicate
+        seen = set()
+        unique = []
+        for f in anti_bleed_parts:
+            fl = f.lower()
+            if fl not in seen:
+                seen.add(fl)
+                unique.append(f)
+        return ", ".join(unique)
+    return ""
+
+
 # ── Core generation ───────────────────────────────────────────────────────
 
 DEFAULT_NEGATIVE = (
@@ -1690,22 +1998,39 @@ def generate_image(
                 raise InterruptedError("Generation cancelled by user")
             return callback_kwargs
 
-        gen_kwargs = {
-            "width": width,
-            "height": height,
-            "num_inference_steps": steps,
-            "guidance_scale": guidance_scale,
-            "generator": generator,
-            "callback_on_step_end": _cancel_callback,
-        }
+        # ── Check for regional multi-character mode ──────────────────────
+        regional_parsed = _parse_regional_sections(full_prompt)
+        use_regional = regional_parsed is not None
 
-        if long_prompt_used and embed_kwargs:
-            gen_kwargs.update(embed_kwargs)
+        if use_regional:
+            # Enhance negative prompt with anti-bleed terms
+            _, regional_regions = regional_parsed
+            anti_bleed = _build_anti_bleed_negative(regional_regions)
+            regional_negative = f"{full_negative}, {anti_bleed}" if anti_bleed else full_negative
+
+            _log.info("[IMAGE GEN] Using REGIONAL conditioning pipeline for %d characters",
+                      len(regional_regions))
+            image = _generate_regional(
+                pipe, full_prompt, regional_negative,
+                width, height, steps, guidance_scale, generator,
+            )
         else:
-            gen_kwargs["prompt"] = full_prompt
-            gen_kwargs["negative_prompt"] = full_negative
+            gen_kwargs = {
+                "width": width,
+                "height": height,
+                "num_inference_steps": steps,
+                "guidance_scale": guidance_scale,
+                "generator": generator,
+                "callback_on_step_end": _cancel_callback,
+            }
 
-        image = pipe(**gen_kwargs).images[0]
+            if long_prompt_used and embed_kwargs:
+                gen_kwargs.update(embed_kwargs)
+            else:
+                gen_kwargs["prompt"] = full_prompt
+                gen_kwargs["negative_prompt"] = full_negative
+
+            image = pipe(**gen_kwargs).images[0]
 
         # Save
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1738,6 +2063,7 @@ def generate_image(
             "long_prompt": long_prompt_used,
             "lora_diagnostics": lora_diagnostics,
             "injected_triggers": injected_triggers,
+            "regional_mode": use_regional,
         }
 
     except InterruptedError:

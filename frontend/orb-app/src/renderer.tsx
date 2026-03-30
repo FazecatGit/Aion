@@ -6885,6 +6885,9 @@ return (
                     {imageGenMeta.long_prompt && (
                       <> | <span style={{ color: '#00cc88' }}>Long prompt ✓ (compel encoded)</span></>
                     )}
+                    {imageGenMeta.regional_mode && (
+                      <> | <span style={{ color: '#ff6e40' }}>Regional conditioning ✓ (per-character isolation)</span></>
+                    )}
                   </div>
                   {imageGenMeta.prompt_analysis?.estimated_focus && (() => {
                     // Group tags by section for collapsible character rendering
