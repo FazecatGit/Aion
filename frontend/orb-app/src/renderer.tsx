@@ -308,6 +308,8 @@ function App() {
   const [charPanelOpen, setCharPanelOpen] = useState(true);
   const [charOutfitOptions, setCharOutfitOptions] = useState<Record<string, string[]>>({}); // lora -> outfit names
   const [charSharedPrompt, setCharSharedPrompt] = useState('');
+  const [charEnvironment, setCharEnvironment] = useState('');
+  const [charClothingText, setCharClothingText] = useState('');
   // ── UI layout ──────────────────────────────────────────────────────────────
   const [modelsExpanded, setModelsExpanded] = useState(false);
   // ── GPU monitor & progress tracking ────────────────────────────────────────
@@ -1994,13 +1996,17 @@ const composeCharacterPrompt = () => {
 
   const parts: string[] = [];
 
-  // Shared prompt (scene description)
+  // Shared prompt (scene description + environment)
   const shared = charSharedPrompt.trim();
-  if (shared) {
-    parts.push(`${charEntries.length} characters, group shot, ${shared}`);
-  } else {
-    parts.push(`${charEntries.length} characters, group shot`);
-  }
+  const env = charEnvironment.trim();
+  const clothText = charClothingText.trim();
+
+  let sharedBlock = `${charEntries.length} characters, group shot`;
+  if (shared) sharedBlock += `, ${shared}`;
+  if (env) sharedBlock += `, ${env}`;
+  if (clothText) sharedBlock += `, ${clothText}`;
+
+  parts.push(sharedBlock);
 
   // Each character section
   for (const entry of charEntries) {
@@ -6380,7 +6386,8 @@ return (
           </div>
 
           {/* Center panel: Prompt + Result */}
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '12px', minWidth: 0 }}>
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '12px', minWidth: 0, overflow: 'hidden' }}>
+           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '12px', overflowY: 'auto', overflowX: 'hidden', minHeight: 0 }}>
 
             {/* Multi-character composition panel */}
             {charEntries.length >= 2 && (
@@ -6412,8 +6419,30 @@ return (
                       </label>
                       <input type="text" value={charSharedPrompt}
                         onChange={e => setCharSharedPrompt(e.target.value)}
-                        placeholder="sloppy blowjob, throat clenching, euphoric, (anime screencap:0.8)..."
+                        placeholder="animescreencap, stretching, dynamic angle, cinematic lighting..."
                         style={{ width: '100%', padding: '6px 10px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#0a0a0a', color: '#fff', fontSize: '11px', outline: 'none', boxSizing: 'border-box' }} />
+                    </div>
+
+                    {/* Environment & clothing text row */}
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <div style={{ flex: 1, padding: '8px', borderRadius: '8px', backgroundColor: 'rgba(68,170,255,0.05)', border: '1px solid rgba(68,170,255,0.15)' }}>
+                        <label style={{ fontSize: '10px', color: '#44aaff', fontWeight: 600, display: 'block', marginBottom: '4px' }}>
+                          🌍 Environment / Background
+                        </label>
+                        <input type="text" value={charEnvironment}
+                          onChange={e => setCharEnvironment(e.target.value)}
+                          placeholder="bedroom, dim lighting, silk sheets, window with moonlight..."
+                          style={{ width: '100%', padding: '6px 10px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#0a0a0a', color: '#fff', fontSize: '11px', outline: 'none', boxSizing: 'border-box' }} />
+                      </div>
+                      <div style={{ flex: 1, padding: '8px', borderRadius: '8px', backgroundColor: 'rgba(255,153,0,0.05)', border: '1px solid rgba(255,153,0,0.15)' }}>
+                        <label style={{ fontSize: '10px', color: '#ff9900', fontWeight: 600, display: 'block', marginBottom: '4px' }}>
+                          ✍ Clothing Text (if any has writing)
+                        </label>
+                        <input type="text" value={charClothingText}
+                          onChange={e => setCharClothingText(e.target.value)}
+                          placeholder='e.g. shirt says "LOVE", hat text "NYC"...'
+                          style={{ width: '100%', padding: '6px 10px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#0a0a0a', color: '#fff', fontSize: '11px', outline: 'none', boxSizing: 'border-box' }} />
+                      </div>
                     </div>
 
                     {/* Per-character entries */}
@@ -6713,6 +6742,7 @@ return (
                     <span style={{ color: '#aaa' }}>
                       Step {genProgress.current_step}/{genProgress.total_steps}
                       {genProgress.total_steps > 0 && ` (${Math.round(genProgress.current_step / genProgress.total_steps * 100)}%)`}
+                      {genProgress.message && <> | <span style={{ color: '#00cc88' }}>{genProgress.message}</span></>}
                     </span>
                   </div>
                   <div style={{ height: '4px', borderRadius: '2px', backgroundColor: '#1a1a2e', overflow: 'hidden' }}>
@@ -7048,6 +7078,7 @@ return (
                 </details>
               </div>
             )}
+          </div>
           </div>
 
           {/* Right panel: History */}

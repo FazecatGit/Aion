@@ -1390,41 +1390,69 @@ def _structure_multi_character_prompt(prompt: str, lora_paths: list[str] | None 
     positions = ["on the left", "on the right", "in the center", "in the background"]
     selected_outfits = selected_outfits or {}
 
-    # ── Step 1: Identify each character's primary trigger word ─────────────
-    char_info = []  # list of (lora_path, stem, primary_trigger, all_trigger_words)
+    # ── Step 1: Identify each character's trigger words ──────────────────
+    char_info = []  # list of (lora_path, stem, primary_trigger, all_trigger_words, all_trigger_codes)
     for lp in char_lora_paths[:4]:
         stem = Path(lp).stem
         words = tw_data.get(stem, [])
-        primary = parse_trigger_word_entry(words[0])["word"] if words else stem
+        parsed_groups = parse_outfit_groups(words)
+        primary = parsed_groups["primary"] or stem
+
+        # Collect ALL trigger code words (the first comma-separated token of
+        # each outfit entry).  These are the short codes like "Cec1l1aNwYrs",
+        # "GigiNwYrs", "GigiBase" etc. that users actually type in prompts.
+        trigger_codes = set()
+        trigger_codes.add(primary)
+        for _outfit_name, tags in parsed_groups.get("outfits", {}).items():
+            if tags:
+                code = tags[0]["word"] if isinstance(tags[0], dict) else str(tags[0])
+                if code:
+                    trigger_codes.add(code)
+        # Also add any simple string trigger words
         all_tw = [parse_trigger_word_entry(w)["word"] for w in words
                   if parse_trigger_word_entry(w)["word"] and parse_trigger_word_entry(w)["word"] != ";"]
-        char_info.append((lp, stem, primary, all_tw))
+        for tw_str in all_tw:
+            # For colon-format, extract just the trigger code (first token after colon)
+            colon_m = re.match(r'^[^:]+:\s*(\S+)', tw_str)
+            if colon_m:
+                trigger_codes.add(colon_m.group(1).rstrip(','))
+
+        char_info.append((lp, stem, primary, list(trigger_codes), all_tw))
 
     # ── Step 2: Extract parenthesized character blocks from the prompt ─────
-    # Users write e.g. "(h0l0r4t:1, black hair, short hair, ...)" to group a
-    # character's description.  We detect blocks containing a character's
-    # primary trigger and pull them out of the shared prompt.
+    # Users write e.g. "(Cec1l1aNwYrs:1, green eyes, short hair, ...)" to group
+    # a character's description.  We detect blocks containing ANY of the
+    # character's trigger codes (not just the primary) and pull them out.
     shared = prompt
     char_blocks: dict[str, str] = {}  # stem -> extracted block text
 
-    for _lp, stem, primary, _all_tw in char_info:
-        # Match a parenthesized block containing the primary trigger,
-        # optionally preceded by BREAK and/or followed by a position phrase.
-        # This captures the entire "BREAK (trigger:1, tags...), on the left" segment.
-        paren_pat = r'\(\s*' + re.escape(primary) + r'[^)]*\)'
-        full_pat = (r'(?:\s*BREAK\s+)?' + paren_pat +
-                    r'(?:\s*,\s*(?:on the left|on the right|in the center|in the background))?')
-        match = re.search(full_pat, shared, re.IGNORECASE)
-        if match:
-            # Extract just the parenthesized block for the character section
-            paren_match = re.search(paren_pat, match.group(0), re.IGNORECASE)
-            char_blocks[stem] = paren_match.group(0) if paren_match else match.group(0)
-            # Remove the ENTIRE matched segment (including BREAK + position) from shared
-            shared = shared[:match.start()] + shared[match.end():]
-            _log.info("[IMAGE GEN] Extracted character block for %s: %s", stem, char_blocks[stem])
+    for _lp, stem, _primary, trigger_codes, _all_tw in char_info:
+        # Try each trigger code until we find a match in a parenthesized block
+        found = False
+        for code in sorted(trigger_codes, key=len, reverse=True):  # longest first
+            paren_pat = r'\(\s*' + re.escape(code) + r'[^)]*\)'
+            full_pat = (r'(?:\s*BREAK\s+)?' + paren_pat +
+                        r'(?:\s*,\s*(?:on the left|on the right|in the center|in the background))?')
+            match = re.search(full_pat, shared, re.IGNORECASE)
+            if match:
+                paren_match = re.search(paren_pat, match.group(0), re.IGNORECASE)
+                char_blocks[stem] = paren_match.group(0) if paren_match else match.group(0)
+                shared = shared[:match.start()] + shared[match.end():]
+                _log.info("[IMAGE GEN] Extracted character block for %s (matched '%s'): %s",
+                          stem, code, char_blocks[stem])
+                found = True
+                break
+        if not found:
+            _log.info("[IMAGE GEN] No parenthesized block found for %s (tried: %s)",
+                      stem, trigger_codes)
 
     # ── Step 3: Strip any remaining standalone trigger words from shared ────
-    for _lp, stem, _primary, all_tw in char_info:
+    for _lp, stem, _primary, trigger_codes, all_tw in char_info:
+        # Strip trigger codes
+        for code in trigger_codes:
+            shared = re.sub(r'(?<![a-zA-Z0-9])' + re.escape(code) + r'(?![a-zA-Z0-9])',
+                            '', shared, flags=re.IGNORECASE)
+        # Strip full trigger word strings
         for tw_str in all_tw:
             # Use word boundary to avoid partial matches
             shared = re.sub(r'(?<![a-zA-Z])' + re.escape(tw_str) + r'(?![a-zA-Z])',
@@ -1448,7 +1476,7 @@ def _structure_multi_character_prompt(prompt: str, lora_paths: list[str] | None 
 
     # ── Step 4: Build BREAK-separated character sections ───────────────────
     parts = []
-    for i, (lp, stem, primary, all_tw) in enumerate(char_info):
+    for i, (lp, stem, primary, _trigger_codes, _all_tw) in enumerate(char_info):
         pos = positions[i] if i < len(positions) else positions[-1]
 
         if stem in char_blocks:
@@ -1508,53 +1536,60 @@ def _encode_single_sdxl(pipe, prompt: str, device: str = "cuda"):
 
 def _create_spatial_masks(regions: list[dict], latent_w: int, latent_h: int,
                           device: str = "cuda", dtype=torch.float16) -> list[torch.Tensor]:
-    """Create soft spatial masks for each character region.
+    """Create wide, soft Gaussian-blended spatial masks.
 
-    Masks are Gaussian-edged to prevent hard seams between character regions.
-    All masks together with a background fill sum to ~1.0 at every pixel.
+    Unlike hard box partitions, these masks use broad bell curves centered on
+    each character's position.  Every character's mask covers most of the canvas
+    but peaks at their designated position.  This produces ONE seamless image
+    instead of visibly separate panels.
+
+    After construction the masks are softmax-normalised so they sum to 1.0 at
+    every pixel — no hard edges, no gaps.
     """
+    import math
     n = len(regions)
-    masks = []
-    edge_width = max(2, latent_w // (n * 3))  # smooth transition zone
+    # Build a 1-D x-coordinate grid [0..1] across the latent width
+    xs = torch.linspace(0, 1, latent_w, device=device, dtype=dtype)
 
-    for r in regions:
-        pos = r["position"]
-        mask = torch.zeros(1, 1, latent_h, latent_w, device=device, dtype=dtype)
-
+    # Map each position keyword to a centre x-value
+    def _centre(pos: str, idx: int) -> float:
         if pos == "left":
-            boundary = latent_w // n
-            for x in range(latent_w):
-                if x < boundary:
-                    mask[0, 0, :, x] = 1.0
-                elif x < boundary + edge_width:
-                    mask[0, 0, :, x] = 1.0 - (x - boundary) / edge_width
-
+            return 0.25
         elif pos == "right":
-            boundary = latent_w - latent_w // n
-            for x in range(latent_w):
-                if x > boundary:
-                    mask[0, 0, :, x] = 1.0
-                elif x > boundary - edge_width:
-                    mask[0, 0, :, x] = (x - (boundary - edge_width)) / edge_width
-
+            return 0.75
         elif pos == "center":
-            left_b = latent_w // n
-            right_b = latent_w - latent_w // n
-            for x in range(latent_w):
-                if left_b <= x <= right_b:
-                    mask[0, 0, :, x] = 1.0
-                elif left_b - edge_width <= x < left_b:
-                    mask[0, 0, :, x] = (x - (left_b - edge_width)) / edge_width
-                elif right_b < x <= right_b + edge_width:
-                    mask[0, 0, :, x] = 1.0 - (x - right_b) / edge_width
-
+            return 0.5
         elif pos == "background":
-            mask.fill_(0.3)  # low-weight everywhere
-
+            return 0.5  # uniform — handled below
         else:
-            # Unknown position — equal weight
-            mask.fill_(1.0 / n)
+            # Even spread for unknown positions
+            return (idx + 0.5) / n
 
+    # Sigma controls how wide each bell curve is.  Larger = more overlap,
+    # softer blending, more seamless.  0.35 gives ~70 % overlap between
+    # neighbours which keeps character features distinct but prevents any
+    # visible boundary.
+    sigma = 0.35
+
+    raw_masks: list[torch.Tensor] = []
+    for idx, r in enumerate(regions):
+        if r["position"] == "background":
+            # Uniform low weight
+            weight = torch.ones(latent_w, device=device, dtype=dtype) * 0.5
+        else:
+            cx = _centre(r["position"], idx)
+            weight = torch.exp(-((xs - cx) ** 2) / (2 * sigma ** 2))
+        raw_masks.append(weight)
+
+    # Stack and softmax-normalise across characters at every x position
+    stacked = torch.stack(raw_masks, dim=0)  # (n, latent_w)
+    # Softmax gives smooth competition — dominant in their zone, fading elsewhere
+    normed = torch.softmax(stacked * 3.0, dim=0)  # temperature 3.0 sharpens slightly
+
+    masks = []
+    for i in range(n):
+        mask = normed[i].unsqueeze(0).unsqueeze(0).unsqueeze(0)  # (1, 1, 1, W)
+        mask = mask.expand(1, 1, latent_h, latent_w).contiguous()
         masks.append(mask)
 
     return masks
@@ -1639,9 +1674,6 @@ def _generate_regional(
     # Negative (shared across all regions)
     neg_embeds, neg_pooled = _encode_single_sdxl(pipe, negative_prompt, device)
 
-    # Shared scene prompt (for background / uncovered areas)
-    shared_embeds, shared_pooled = _encode_single_sdxl(pipe, shared_prompt, device)
-
     # Per-character prompts (include shared scene for context coherence)
     char_embeds_list = []
     for r in regions:
@@ -1651,10 +1683,7 @@ def _generate_regional(
 
     # ── Create spatial masks ───────────────────────────────────────────────
     masks = _create_spatial_masks(regions, latent_w, latent_h, device, dtype)
-
-    # Compute background mask (areas not strongly covered by any character)
-    mask_sum = torch.stack(masks).sum(dim=0).clamp(min=0)
-    bg_mask = (1.0 - mask_sum).clamp(min=0)
+    # Masks are softmax-normalised and sum to 1.0 — no separate background mask needed
 
     # ── Prepare time IDs (SDXL-specific conditioning) ──────────────────
     # Format: [original_h, original_w, crop_top, crop_left, target_h, target_w]
@@ -1674,15 +1703,22 @@ def _generate_regional(
     latents = latents * pipe.scheduler.init_noise_sigma
 
     # ── Regional denoising loop ────────────────────────────────────────────
+    step_start_time = time.time()
     for step_idx, t in enumerate(timesteps):
-        _update_progress(current_step=step_idx + 1)
+        now = time.time()
+        elapsed = now - step_start_time
+        its = (step_idx / elapsed) if elapsed > 0 and step_idx > 0 else 0.0
+        _update_progress(
+            current_step=step_idx + 1,
+            message=f"Regional: {n_chars} regions | {its:.2f} it/s" if step_idx > 0 else f"Regional: {n_chars} regions | starting...",
+        )
         if _cancel_event.is_set():
             _cancel_event.clear()
             raise InterruptedError("Generation cancelled by user")
 
         latent_input = pipe.scheduler.scale_model_input(latents, t)
 
-        # 1) Unconditional noise prediction
+        # 1) Unconditional noise prediction (shared negative for CFG)
         uncond_kwargs = {
             "text_embeds": neg_pooled,
             "time_ids": add_time_ids,
@@ -1694,20 +1730,11 @@ def _generate_regional(
                 added_cond_kwargs=uncond_kwargs,
             ).sample
 
-        # 2) Shared scene noise prediction (for background areas)
-        shared_kwargs = {
-            "text_embeds": shared_pooled,
-            "time_ids": add_time_ids,
-        }
-        with torch.no_grad():
-            noise_shared = pipe.unet(
-                latent_input, t,
-                encoder_hidden_states=shared_embeds,
-                added_cond_kwargs=shared_kwargs,
-            ).sample
-
-        # 3) Per-character noise predictions, blended by spatial masks
-        noise_cond = noise_shared * bg_mask  # background gets shared conditioning
+        # 2) Per-character conditional predictions, blended by soft masks
+        #    Each character's prompt includes the shared scene for coherence.
+        #    Masks are softmax-normalised and sum to 1.0, so the blended
+        #    result is one seamless noise prediction with no gaps or boxes.
+        noise_cond = torch.zeros_like(noise_uncond)
 
         for mask, (char_emb, char_pooled) in zip(masks, char_embeds_list):
             char_kwargs = {
@@ -1722,10 +1749,10 @@ def _generate_regional(
                 ).sample
             noise_cond = noise_cond + noise_char * mask
 
-        # 4) Classifier-Free Guidance
+        # 3) Classifier-Free Guidance
         noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
 
-        # 5) Scheduler step
+        # 4) Scheduler step
         latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
     # ── Decode latents to image ────────────────────────────────────────────
@@ -1783,6 +1810,8 @@ def _build_anti_bleed_negative(regions: list[dict]) -> str:
 
 DEFAULT_NEGATIVE = (
     "blurry, low quality, deformed, bad anatomy, watermark, bad hands, "
+    "missing fingers, extra fingers, fused fingers, too many fingers, mutated hands, "
+    "malformed hands, extra digit, fewer digits, ugly hands, poorly drawn hands, "
     "text, error, cropped, worst quality, bad quality, worst detail, sketch, "
     "censored, signature, watermark"
 )
@@ -1790,6 +1819,8 @@ DEFAULT_NEGATIVE = (
 EXPLICIT_NEGATIVE = (
     "score_4, score_3, score_2, score_1, "
     "blurry, low quality, deformed, bad anatomy, watermark, bad hands, "
+    "missing fingers, extra fingers, fused fingers, too many fingers, mutated hands, "
+    "malformed hands, extra digit, fewer digits, ugly hands, poorly drawn hands, "
     "text, error, cropped, worst quality, bad quality, worst detail, sketch, "
     "censored, artist name, signature, watermark, "
     "patreon username, patreon logo"
@@ -1990,9 +2021,16 @@ def generate_image(
                          total_steps=steps, current_frame=0, total_frames=1,
                          message="Generating image...")
 
+        _step_start_time = time.time()
+
         def _cancel_callback(pipe_self, step_index, timestep, callback_kwargs):
-            """Check cancel flag + update progress between diffusion steps."""
-            _update_progress(current_step=step_index + 1)
+            """Check cancel flag + update progress with it/s between diffusion steps."""
+            elapsed = time.time() - _step_start_time
+            its = (step_index / elapsed) if elapsed > 0 and step_index > 0 else 0.0
+            _update_progress(
+                current_step=step_index + 1,
+                message=f"{its:.2f} it/s" if step_index > 0 else "starting...",
+            )
             if _cancel_event.is_set():
                 _cancel_event.clear()
                 raise InterruptedError("Generation cancelled by user")
