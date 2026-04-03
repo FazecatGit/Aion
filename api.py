@@ -171,11 +171,28 @@ async def health_check():
             if resp.status_code == 200:
                 data = resp.json()
                 available = [m.get("name", "") for m in data.get("models", [])]
-                # Check if our configured model is available (handle tag suffixes)
                 llm_ok = any(LLM_MODEL in name for name in available)
     except Exception:
         pass
     return {"status": "ok", "llm_connected": llm_ok, "llm_model": llm_model}
+
+
+@app.post("/restart")
+async def restart_server():
+    """Restart the backend server process.
+
+    Sends SIGTERM to the current process so the process manager (uvicorn --reload
+    or the launcher script) can respawn it.
+    """
+    import threading
+
+    def _do_restart():
+        import time
+        time.sleep(0.5)  # give the HTTP response time to flush
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=_do_restart, daemon=True).start()
+    return {"status": "ok", "message": "Server restarting..."}
 
 
 @app.get("/system/gpu")

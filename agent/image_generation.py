@@ -2166,13 +2166,18 @@ def generate_image(
         prompt_lower = prompt.lower()
         selected_outfits = selected_outfits or {}
 
-        # Determine which LoRAs are character-type
+        # Determine which LoRAs are character-type and which are style-type
         char_dir = MODELS_DIR / "characters"
+        style_dir = MODELS_DIR / "styles"
         char_lora_stems = set()
+        style_lora_stems = set()
         for lp in lora_paths:
             try:
-                if Path(lp).parent.resolve() == char_dir.resolve():
+                parent = Path(lp).parent.resolve()
+                if parent == char_dir.resolve():
                     char_lora_stems.add(Path(lp).stem)
+                elif parent == style_dir.resolve():
+                    style_lora_stems.add(Path(lp).stem)
             except Exception:
                 pass
         multi_char_mode = len(char_lora_stems) >= 2
@@ -2181,6 +2186,10 @@ def generate_image(
             if not Path(lp).exists():
                 continue
             stem = Path(lp).stem
+            # Skip style LoRAs — they work via adapter weights, not prompt injection
+            if stem in style_lora_stems:
+                _log.info("[IMAGE GEN] Skipping auto-inject for style LoRA %s (works via adapter weights)", stem)
+                continue
             # Skip character LoRAs in multi-character mode — handled by BREAK structuring
             if multi_char_mode and stem in char_lora_stems:
                 _log.info("[IMAGE GEN] Skipping auto-inject for character LoRA %s (multi-char mode)", stem)

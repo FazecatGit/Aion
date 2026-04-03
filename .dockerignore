@@ -1,0 +1,32 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+venv/
+node_modules/
+.webpack/
+out/
+dist/
+*.egg-info/
+
+# Large model files — mount via volume instead
+models/*.safetensors
+models/*.ckpt
+models/Wan2.1-T2V-1.3B/
+models/Wan2.1-T2V-1.3B-Diffusers/
+
+# Generated outputs
+generated_images/
+cache/chroma_db/
+cache/session_memory_db/
+cache/chat_sessions_db/
+faiss_index/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

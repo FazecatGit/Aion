@@ -1,0 +1,50 @@
+# Aion — Python dependencies
+# Core server
+fastapi>=0.104
+uvicorn[standard]>=0.24
+pydantic>=2.0
+httpx>=0.25
+
+# Image generation (GPU)
+torch>=2.1
+torchvision>=0.16
+diffusers>=0.30
+transformers>=4.36
+compel>=2.0
+Pillow>=10.0
+numpy>=1.24
+opencv-python>=4.8
+peft>=0.7
+safetensors>=0.4
+huggingface-hub>=0.20
+accelerate>=0.25
+
+# RAG / LangChain
+langchain-ollama>=0.1
+langchain-chroma>=0.1
+langchain-core>=0.2
+langchain-community>=0.2
+langchain-text-splitters>=0.2
+chromadb>=0.4
+rank-bm25>=0.2
+
+# NLP
+nltk>=3.8
+
+# Voice I/O (optional)
+openai-whisper>=20231117
+pyttsx3>=2.90
+sounddevice>=0.4
+
+# TTS Kokoro (optional)
+kokoro-onnx>=0.3
+soundfile>=0.12
+
+# OCR (optional)
+easyocr>=1.7
+
+# PDF parsing
+pypdf>=3.17
+
+# Misc
+requests>=2.31
