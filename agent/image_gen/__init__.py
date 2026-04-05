@@ -62,7 +62,8 @@ from .prompts import (
 
 # ── history ───────────────────────────────────────────────────────────────
 from .history import (
-    record_generation, get_generation_history, delete_generation_history_entry,
+    record_generation, get_generation_history, get_generation_history_count,
+    delete_generation_history_entry,
     apply_feedback_learnings, apply_positive_learnings,
     save_custom_negative, save_custom_positive,
     get_feedback_learnings, clear_feedback_learnings,

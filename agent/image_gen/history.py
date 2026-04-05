@@ -67,6 +67,10 @@ def get_generation_history(last_n: int = 20) -> list[dict]:
     return _generation_history[-last_n:]
 
 
+def get_generation_history_count() -> int:
+    return len(_generation_history)
+
+
 def delete_generation_history_entry(index: int) -> dict:
     """Delete a generation history entry by reverse index (0 = newest)."""
     if not _generation_history:

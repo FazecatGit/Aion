@@ -2687,8 +2687,8 @@ async def search_characters_endpoint(q: str = ""):
 @app.get("/generate/history")
 async def image_gen_history(limit: int = 20):
     """Get recent image generation history with prompt analysis."""
-    from agent.image_gen import get_generation_history
-    return {"status": "ok", "history": get_generation_history(limit)}
+    from agent.image_gen import get_generation_history, get_generation_history_count
+    return {"status": "ok", "history": get_generation_history(limit), "total": get_generation_history_count()}
 
 
 @app.delete("/generate/history/{index}")

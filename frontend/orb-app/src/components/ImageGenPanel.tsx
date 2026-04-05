@@ -117,6 +117,14 @@ export const ImageGenPanel: React.FC<ImageGenPanelProps> = ({ setMode, onOpenLig
 
   const [vramFlushing, setVramFlushing] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  // ── Left panel resize ──────────────────────────────────────────────────────
+  const [leftPanelWidth, setLeftPanelWidth] = useState(() => {
+    try { return parseInt(localStorage.getItem('aion_leftPanelWidth') || '340', 10); } catch { return 340; }
+  });
+  const leftResizing = useRef(false);
+  // ── History pagination ─────────────────────────────────────────────────────
+  const [historyLimit, setHistoryLimit] = useState(20);
+  const [historyTotal, setHistoryTotal] = useState<number | null>(null);
 
   // ── GPU monitor + generation progress polling ─────────────────────────────
   useEffect(() => {
@@ -184,6 +192,9 @@ export const ImageGenPanel: React.FC<ImageGenPanelProps> = ({ setMode, onOpenLig
   useEffect(() => {
     try { localStorage.setItem('aion_imageGenArtStyle', imageGenArtStyle); } catch {}
   }, [imageGenArtStyle]);
+  useEffect(() => {
+    try { localStorage.setItem('aion_leftPanelWidth', String(leftPanelWidth)); } catch {}
+  }, [leftPanelWidth]);
 
 // ── Fast noisy preview ──────────────────────────────────────────────────
 const handleImagePreview = async () => {
@@ -431,12 +442,21 @@ const fetchImageModels = async () => {
 };
 
 // Fetch image generation history
-const fetchImageHistory = async () => {
+const fetchImageHistory = async (limit?: number) => {
   try {
-    const res = await fetch('http://localhost:8000/generate/history?limit=20');
+    const lim = limit ?? historyLimit;
+    const res = await fetch(`http://localhost:8000/generate/history?limit=${lim}`);
     const data = await res.json();
-    if (data.status === 'ok') setImageGenHistory(data.history || []);
+    if (data.status === 'ok') {
+      setImageGenHistory(data.history || []);
+      if (data.total != null) setHistoryTotal(data.total);
+    }
   } catch {}
+};
+
+// Refresh all data (models, history, styles, jobs, loras)
+const refreshAllData = async () => {
+  await Promise.all([fetchImageModels(), fetchImageHistory(), fetchArtStyles(), fetchAnimJobs(), fetchLoraCategories()]);
 };
 
 // Submit feedback for a generation
@@ -895,17 +915,22 @@ const handleCancelGeneration = async () => {
   return (
     <div style={{
       position: 'fixed', top: '60px', left: '16px', right: '16px',
-      bottom: '30px',
-      display: 'flex', gap: '16px', color: '#fff', zIndex: 30,
+      bottom: '60px',
+      display: 'flex', gap: '0px', color: '#fff', zIndex: 30,
     }}>
       {/* Left panel: Settings */}
       <div style={{
-        width: '300px', flexShrink: 0,
+        width: `${leftPanelWidth}px`, minWidth: '260px', maxWidth: '500px', flexShrink: 0,
         backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '14px',
         border: '1px solid rgba(179,136,255,0.2)', backdropFilter: 'blur(16px)',
         overflowY: 'auto', padding: '16px', display: 'flex', flexDirection: 'column', gap: '14px',
       }}>
-        <h3 style={{ margin: 0, fontSize: '15px', color: '#b388ff', display: 'flex', alignItems: 'center', gap: '8px' }}>🎨 ImageStudio</h3>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <h3 style={{ margin: 0, fontSize: '15px', color: '#b388ff', display: 'flex', alignItems: 'center', gap: '8px' }}>🎨 ImageStudio</h3>
+          <button onClick={refreshAllData} title="Refresh all data" style={{
+            background: 'none', border: '1px solid #333', borderRadius: '6px', color: '#888', cursor: 'pointer', fontSize: '12px', padding: '2px 8px',
+          }}>⟳ Refresh</button>
+        </div>
 
         {/* Sub-tab selector */}
         <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
@@ -1932,6 +1957,31 @@ const handleCancelGeneration = async () => {
         </div>
       </div>
 
+      {/* Resize handle for left panel */}
+      <div
+        style={{
+          width: '6px', cursor: 'col-resize', flexShrink: 0,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          zIndex: 2,
+        }}
+        onMouseDown={(e) => {
+          e.preventDefault();
+          leftResizing.current = true;
+          const startX = e.clientX;
+          const startW = leftPanelWidth;
+          const onMove = (ev: MouseEvent) => {
+            if (!leftResizing.current) return;
+            const newW = Math.max(260, Math.min(500, startW + (ev.clientX - startX)));
+            setLeftPanelWidth(newW);
+          };
+          const onUp = () => { leftResizing.current = false; document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); };
+          document.addEventListener('mousemove', onMove);
+          document.addEventListener('mouseup', onUp);
+        }}
+      >
+        <div style={{ width: '2px', height: '32px', borderRadius: '2px', backgroundColor: 'rgba(179,136,255,0.25)', transition: 'background 0.2s' }} />
+      </div>
+
       {/* Center panel: Prompt + Result */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '12px', minWidth: 0 }}>
        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '12px', overflowY: 'auto', overflowX: 'hidden', minHeight: 0 }}>
@@ -2703,11 +2753,11 @@ const handleCancelGeneration = async () => {
         width: '280px', flexShrink: 0,
         backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '14px',
         border: '1px solid rgba(179,136,255,0.2)', backdropFilter: 'blur(16px)',
-        overflowY: 'auto', padding: '12px', display: 'flex', flexDirection: 'column', gap: '8px',
+        overflowY: 'auto', padding: '12px', paddingBottom: '20px', display: 'flex', flexDirection: 'column', gap: '8px',
       }}>
         <h4 style={{ margin: 0, fontSize: '13px', color: '#888', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          Recent Generations ({imageGenHistory.length})
-          <button onClick={fetchImageHistory} style={{ background: 'none', border: 'none', color: '#555', cursor: 'pointer', fontSize: '12px' }}>⟳</button>
+          Recent Generations ({imageGenHistory.length}{historyTotal != null && historyTotal > imageGenHistory.length ? ` / ${historyTotal}` : ''})
+          <button onClick={() => fetchImageHistory()} title="Refresh history" style={{ background: 'none', border: '1px solid #333', borderRadius: '4px', color: '#888', cursor: 'pointer', fontSize: '12px', padding: '1px 6px' }}>⟳</button>
         </h4>
         {imageGenHistory.length === 0 && <div style={{ color: '#444', fontSize: '11px', textAlign: 'center', padding: '20px 0' }}>No history yet — generate an image to see it here</div>}
         {imageGenHistory.slice().reverse().map((h, i) => {
@@ -2853,6 +2903,23 @@ const handleCancelGeneration = async () => {
           </div>
         );
         })}
+        {/* Show More button */}
+        {(historyTotal == null || imageGenHistory.length < historyTotal) && imageGenHistory.length >= historyLimit && (
+          <button
+            onClick={() => {
+              const newLimit = historyLimit + 20;
+              setHistoryLimit(newLimit);
+              fetchImageHistory(newLimit);
+            }}
+            style={{
+              padding: '6px 12px', borderRadius: '8px', border: '1px solid rgba(179,136,255,0.3)',
+              backgroundColor: 'rgba(179,136,255,0.08)', color: '#b388ff', cursor: 'pointer',
+              fontSize: '11px', textAlign: 'center', marginTop: '4px',
+            }}
+          >
+            Show More...
+          </button>
+        )}
       </div>
     </div>
   );
